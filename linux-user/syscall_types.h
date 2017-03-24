@@ -103,10 +103,11 @@ STRUCT(loop_info64,
        TYPE_ULONGLONG,           /* lo_inode */
        TYPE_ULONGLONG,           /* lo_rdevice */
        TYPE_ULONGLONG,           /* lo_offset */
-       TYPE_ULONG,               /* lo_number */
-       TYPE_ULONG,               /* lo_encrypt_type */
-       TYPE_ULONG,               /* lo_encrypt_key_size */
-       TYPE_ULONG,               /* lo_flags */
+       TYPE_ULONGLONG,           /* lo_sizelimit */
+       TYPE_INT,                 /* lo_number */
+       TYPE_INT,                 /* lo_encrypt_type */
+       TYPE_INT,                 /* lo_encrypt_key_size */
+       TYPE_INT,                 /* lo_flags */
        MK_ARRAY(TYPE_CHAR, 64),  /* lo_name */
        MK_ARRAY(TYPE_CHAR, 64),  /* lo_crypt_name */
        MK_ARRAY(TYPE_CHAR, 32),  /* lo_encrypt_key */
@@ -252,4 +253,4 @@ STRUCT(blkpg_ioctl_arg,
        TYPE_INT, /* op */
        TYPE_INT, /* flags */
        TYPE_INT, /* datalen */
-       MK_PTR(MK_STRUCT(STRUCT_blkpg_partition))) /* data */
+       TYPE_PTRVOID) /* data */

@@ -4,6 +4,14 @@
 # Set SRC_PATH for in-tree builds without configuration.
 SRC_PATH=..
 
+# The default target must come before any include statements.
+all:
+
+.PHONY:	all build clean install update
+
+%.mo: %.po
+	$(call quiet-command, msgfmt -o $@ $<, "  GEN   $@")
+
 -include ../config-host.mak
 include $(SRC_PATH)/rules.mak
 
@@ -24,7 +32,7 @@ update: $(SRCS)
 build: $(OBJS)
 
 clean:
-	$(RM) $(OBJS)
+	rm -f $(OBJS)
 
 install: $(OBJS)
 	for obj in $(OBJS); do \
@@ -32,9 +40,6 @@ install: $(OBJS)
 	    $(INSTALL) -d $(DESTDIR)$(prefix)/share/locale/$$base/LC_MESSAGES; \
 	    $(INSTALL) -m644 $$obj $(DESTDIR)$(prefix)/share/locale/$$base/LC_MESSAGES/qemu.mo; \
 	done
-
-%.mo: %.po
-	$(call quiet-command, msgfmt -o $@ $<, "  GEN   $@")
 
 $(PO_PATH)/messages.po: $(SRC_PATH)/ui/gtk.c
 	$(call quiet-command, ( cd $(SRC_PATH) && \
@@ -45,5 +50,3 @@ $(PO_PATH)/messages.po: $(SRC_PATH)/ui/gtk.c
 
 $(PO_PATH)/%.po: $(PO_PATH)/messages.po
 	$(call quiet-command, msgmerge -q $@ $< > $@.bak && mv $@.bak $@, "  GEN   $@")
-
-.PHONY: clean all

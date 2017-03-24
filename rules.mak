@@ -1,4 +1,6 @@
 
+COMMA := ,
+
 # Don't use implicit rules or variables
 # we have explicit rules for everything
 MAKEFLAGS += -rR
@@ -17,10 +19,36 @@ MAKEFLAGS += -rR
 QEMU_CXXFLAGS = -D__STDC_LIMIT_MACROS $(filter-out -Wstrict-prototypes -Wmissing-prototypes -Wnested-externs -Wold-style-declaration -Wold-style-definition -Wredundant-decls, $(QEMU_CFLAGS))
 
 # Flags for dependency generation
-QEMU_DGFLAGS += -MMD -MP -MT $@ -MF $(*D)/$(*F).d
+QEMU_DGFLAGS += -MMD -MP -MT $@ -MF $(@D)/$(*F).d
 
 # Same as -I$(SRC_PATH) -I., but for the nested source/object directories
 QEMU_INCLUDES += -I$(<D) -I$(@D)
+
+WL_U := -Wl,-u,
+find-symbols = $(if $1, $(sort $(shell $(NM) -P -g $1 | $2)))
+defined-symbols = $(call find-symbols,$1,awk '$$2!="U"{print $$1}')
+undefined-symbols = $(call find-symbols,$1,awk '$$2=="U"{print $$1}')
+
+# All the .mo objects in -m variables are also added into corresponding -y
+# variable in unnest-vars, but filtered out here, when LINK is called.
+#
+# The .mo objects are supposed to be linked as a DSO, for module build. So here
+# they are only used as a placeholders to generate those "archive undefined"
+# symbol options (-Wl,-u,$symbol_name), which are the archive functions
+# referenced by the code in the DSO.
+#
+# Also the presence in -y variables will also guarantee they are built before
+# linking executables that will load them. So we can look up symbol reference
+# in LINK.
+#
+# This is necessary because the exectuable itself may not use the function, in
+# which case the function would not be linked in. Then the DSO loading will
+# fail because of the missing symbol.
+process-archive-undefs = $(filter-out %.a %.mo,$1) \
+                $(addprefix $(WL_U), \
+                     $(filter $(call defined-symbols,$(filter %.a, $1)), \
+                              $(call undefined-symbols,$(filter %.mo,$1)))) \
+                $(filter %.a,$1)
 
 extract-libs = $(strip $(foreach o,$1,$($o-libs)))
 expand-objs = $(strip $(sort $(filter %.o,$1)) \
@@ -36,31 +64,12 @@ expand-objs = $(strip $(sort $(filter %.o,$1)) \
 # must link with the C++ compiler, not the plain C compiler.
 LINKPROG = $(or $(CXX),$(CC))
 
-ifeq ($(LIBTOOL),)
 LINK = $(call quiet-command, $(LINKPROG) $(QEMU_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ \
-       $1 $(version-obj-y) $(call extract-libs,$1) $(LIBS),"  LINK  $(TARGET_DIR)$@")
-else
-LIBTOOL += $(if $(V),,--quiet)
-%.lo: %.c
-	$(call quiet-command,$(LIBTOOL) --mode=compile --tag=CC $(CC) $(QEMU_INCLUDES) $(QEMU_CFLAGS) $(QEMU_DGFLAGS) $(CFLAGS) $($*.o-cflags) -c -o $@ $<,"  lt CC $@")
-%.lo: %.rc
-	$(call quiet-command,$(LIBTOOL) --mode=compile --tag=RC $(WINDRES) -I. -o $@ $<,"lt RC   $(TARGET_DIR)$@")
-%.lo: %.dtrace
-	$(call quiet-command,$(LIBTOOL) --mode=compile --tag=CC dtrace -o $@ -G -s $<, " lt GEN $(TARGET_DIR)$@")
+       $(call process-archive-undefs, $1) \
+       $(version-obj-y) $(call extract-libs,$1) $(LIBS),"  LINK  $(TARGET_DIR)$@")
 
-LINK = $(call quiet-command,\
-       $(if $(filter %.lo %.la,$1),$(LIBTOOL) --mode=link --tag=CC \
-       )$(LINKPROG) $(QEMU_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $1 \
-       $(if $(filter %.lo %.la,$1),$(version-lobj-y),$(version-obj-y)) \
-       $(if $(filter %.lo %.la,$1),$(LIBTOOLFLAGS)) \
-       $(call extract-libs,$(1:.lo=.o)) $(LIBS),$(if $(filter %.lo %.la,$1),"lt LINK ", "  LINK  ")"$(TARGET_DIR)$@")
-endif
-
-%.asm: %.S
-	$(call quiet-command,$(CPP) $(QEMU_INCLUDES) $(QEMU_CFLAGS) $(QEMU_DGFLAGS) $(CFLAGS) -o $@ $<,"  CPP   $(TARGET_DIR)$@")
-
-%.o: %.asm
-	$(call quiet-command,$(AS) $(ASFLAGS) -o $@ $<,"  AS    $(TARGET_DIR)$@")
+%.o: %.S
+	$(call quiet-command,$(CCAS) $(QEMU_INCLUDES) $(QEMU_CFLAGS) $(QEMU_DGFLAGS) $(CFLAGS) -c -o $@ $<,"  CCAS  $(TARGET_DIR)$@")
 
 %.o: %.cc
 	$(call quiet-command,$(CXX) $(QEMU_INCLUDES) $(QEMU_CXXFLAGS) $(QEMU_DGFLAGS) $(CFLAGS) $($@-cflags) -c -o $@ $<,"  CXX   $(TARGET_DIR)$@")
@@ -74,18 +83,25 @@ endif
 %.o: %.dtrace
 	$(call quiet-command,dtrace -o $@ -G -s $<, "  GEN   $(TARGET_DIR)$@")
 
-%$(DSOSUF): CFLAGS += -fPIC -DBUILD_DSO
+DSO_OBJ_CFLAGS := -fPIC -DBUILD_DSO
+module-common.o: CFLAGS += $(DSO_OBJ_CFLAGS)
 %$(DSOSUF): LDFLAGS += $(LDFLAGS_SHARED)
-%$(DSOSUF):
+%$(DSOSUF): %.mo
 	$(call LINK,$^)
 	@# Copy to build root so modules can be loaded when program started without install
 	$(if $(findstring /,$@),$(call quiet-command,cp $@ $(subst /,-,$@), "  CP    $(subst /,-,$@)"))
+
+
+LD_REL := $(CC) -nostdlib -r $(LD_REL_FLAGS)
+
+%.mo:
+	$(call quiet-command,$(LD_REL) -o $@ $^,"  LD -r $(TARGET_DIR)$@")
 
 .PHONY: modules
 modules:
 
 %$(EXESUF): %.o
-	$(call LINK,$^)
+	$(call LINK,$(filter %.o %.a %.mo, $^))
 
 %.a:
 	$(call quiet-command,rm -f $@ && $(AR) rcs $@ $^,"  AR    $(TARGET_DIR)$@")
@@ -97,6 +113,8 @@ quiet-command = $(if $(V),$1,$(if $(2),@echo $2 && $1, @$1))
 
 cc-option = $(if $(shell $(CC) $1 $2 -S -o /dev/null -xc /dev/null \
               >/dev/null 2>&1 && echo OK), $2, $3)
+cc-c-option = $(if $(shell $(CC) $1 $2 -c -o /dev/null -xc /dev/null \
+                >/dev/null 2>&1 && echo OK), $2, $3)
 
 VPATH_SUFFIXES = %.c %.h %.S %.cc %.cpp %.m %.mak %.texi %.sh %.rc
 set-vpath = $(if $1,$(foreach PATTERN,$(VPATH_SUFFIXES),$(eval vpath $(PATTERN) $1)))
@@ -153,7 +171,7 @@ TRACETOOL=$(PYTHON) $(SRC_PATH)/scripts/tracetool.py
 config-%.h: config-%.h-timestamp
 	@cmp $< $@ >/dev/null 2>&1 || cp $< $@
 
-config-%.h-timestamp: config-%.mak
+config-%.h-timestamp: config-%.mak $(SRC_PATH)/scripts/create_config
 	$(call quiet-command, sh $(SRC_PATH)/scripts/create_config < $< > $@, "  GEN   $(TARGET_DIR)config-$*.h")
 
 .PHONY: clean-timestamp
@@ -292,7 +310,17 @@ define unnest-vars
     $(if $1,$(call fix-paths,$1/,,$2))
 
     # Descend and include every subdir Makefile.objs
-    $(foreach v, $2, $(call unnest-var-recursive,$1,$2,$v))
+    $(foreach v, $2,
+        $(call unnest-var-recursive,$1,$2,$v)
+        # Pass the .mo-cflags and .mo-libs along to its member objects
+        $(foreach o, $(filter %.mo,$($v)),
+            $(foreach p,$($o-objs),
+                $(if $($o-cflags), $(eval $p-cflags += $($o-cflags)))
+                $(if $($o-libs), $(eval $p-libs += $($o-libs))))))
+
+    # For all %.mo objects that are directly added into -y, just expand them
+    $(foreach v,$(filter %-y,$2),
+        $(eval $v := $(foreach o,$($v),$(if $($o-objs),$($o-objs),$o))))
 
     $(foreach v,$(filter %-m,$2),
         # All .o found in *-m variables are single object modules, create .mo
@@ -306,6 +334,10 @@ define unnest-vars
         # For module build, build shared libraries during "make modules"
         # For non-module build, add -m to -y
         $(if $(CONFIG_MODULES),
+             $(foreach o,$($v),
+                   $(eval $($o-objs): CFLAGS += $(DSO_OBJ_CFLAGS))
+                   $(eval $o: $($o-objs)))
+             $(eval $(patsubst %-m,%-y,$v) += $($v))
              $(eval modules: $($v:%.mo=%$(DSOSUF))),
              $(eval $(patsubst %-m,%-y,$v) += $(call expand-objs, $($v)))))
 
@@ -316,13 +348,9 @@ define unnest-vars
             # according to .mo-objs. Report error if not set
             $(if $($o-objs),
                 $(eval $(o:%.mo=%$(DSOSUF)): module-common.o $($o-objs)),
-                $(error $o added in $v but $o-objs is not set))
-            # Pass the .mo-cflags and .mo-libs along to member objects
-            $(foreach p,$($o-objs),
-                $(if $($o-cflags), $(eval $p-cflags += $($o-cflags)))
-                $(if $($o-libs), $(eval $p-libs += $($o-libs)))))
+                $(error $o added in $v but $o-objs is not set)))
         $(shell mkdir -p ./ $(sort $(dir $($v))))
         # Include all the .d files
-        $(eval -include $(addsuffix *.d, $(sort $(dir $($v)))))
+        $(eval -include $(patsubst %.o,%.d,$(patsubst %.mo,%.d,$($v))))
         $(eval $v := $(filter-out %/,$($v))))
 endef

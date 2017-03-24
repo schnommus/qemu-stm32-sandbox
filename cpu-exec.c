@@ -16,37 +16,135 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
-#include "config.h"
+#include "qemu/osdep.h"
 #include "cpu.h"
+#include "trace.h"
 #include "disas/disas.h"
+#include "exec/exec-all.h"
 #include "tcg.h"
 #include "qemu/atomic.h"
 #include "sysemu/qtest.h"
-
-void cpu_loop_exit(CPUState *cpu)
-{
-    cpu->current_tb = NULL;
-    siglongjmp(cpu->jmp_env, 1);
-}
-
-/* exit the current TB from a signal handler. The host registers are
-   restored in a state compatible with the CPU emulator
- */
-#if defined(CONFIG_SOFTMMU)
-void cpu_resume_from_signal(CPUState *cpu, void *puc)
-{
-    /* XXX: restore cpu registers saved in host registers */
-
-    cpu->exception_index = -1;
-    siglongjmp(cpu->jmp_env, 1);
-}
+#include "qemu/timer.h"
+#include "exec/address-spaces.h"
+#include "qemu/rcu.h"
+#include "exec/tb-hash.h"
+#include "exec/log.h"
+#if defined(TARGET_I386) && !defined(CONFIG_USER_ONLY)
+#include "hw/i386/apic.h"
 #endif
+#include "sysemu/replay.h"
+
+/* -icount align implementation. */
+
+typedef struct SyncClocks {
+    int64_t diff_clk;
+    int64_t last_cpu_icount;
+    int64_t realtime_clock;
+} SyncClocks;
+
+#if !defined(CONFIG_USER_ONLY)
+/* Allow the guest to have a max 3ms advance.
+ * The difference between the 2 clocks could therefore
+ * oscillate around 0.
+ */
+#define VM_CLOCK_ADVANCE 3000000
+#define THRESHOLD_REDUCE 1.5
+#define MAX_DELAY_PRINT_RATE 2000000000LL
+#define MAX_NB_PRINTS 100
+
+static void align_clocks(SyncClocks *sc, const CPUState *cpu)
+{
+    int64_t cpu_icount;
+
+    if (!icount_align_option) {
+        return;
+    }
+
+    cpu_icount = cpu->icount_extra + cpu->icount_decr.u16.low;
+    sc->diff_clk += cpu_icount_to_ns(sc->last_cpu_icount - cpu_icount);
+    sc->last_cpu_icount = cpu_icount;
+
+    if (sc->diff_clk > VM_CLOCK_ADVANCE) {
+#ifndef _WIN32
+        struct timespec sleep_delay, rem_delay;
+        sleep_delay.tv_sec = sc->diff_clk / 1000000000LL;
+        sleep_delay.tv_nsec = sc->diff_clk % 1000000000LL;
+        if (nanosleep(&sleep_delay, &rem_delay) < 0) {
+            sc->diff_clk = rem_delay.tv_sec * 1000000000LL + rem_delay.tv_nsec;
+        } else {
+            sc->diff_clk = 0;
+        }
+#else
+        Sleep(sc->diff_clk / SCALE_MS);
+        sc->diff_clk = 0;
+#endif
+    }
+}
+
+static void print_delay(const SyncClocks *sc)
+{
+    static float threshold_delay;
+    static int64_t last_realtime_clock;
+    static int nb_prints;
+
+    if (icount_align_option &&
+        sc->realtime_clock - last_realtime_clock >= MAX_DELAY_PRINT_RATE &&
+        nb_prints < MAX_NB_PRINTS) {
+        if ((-sc->diff_clk / (float)1000000000LL > threshold_delay) ||
+            (-sc->diff_clk / (float)1000000000LL <
+             (threshold_delay - THRESHOLD_REDUCE))) {
+            threshold_delay = (-sc->diff_clk / 1000000000LL) + 1;
+            printf("Warning: The guest is now late by %.1f to %.1f seconds\n",
+                   threshold_delay - 1,
+                   threshold_delay);
+            nb_prints++;
+            last_realtime_clock = sc->realtime_clock;
+        }
+    }
+}
+
+static void init_delay_params(SyncClocks *sc,
+                              const CPUState *cpu)
+{
+    if (!icount_align_option) {
+        return;
+    }
+    sc->realtime_clock = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT);
+    sc->diff_clk = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - sc->realtime_clock;
+    sc->last_cpu_icount = cpu->icount_extra + cpu->icount_decr.u16.low;
+    if (sc->diff_clk < max_delay) {
+        max_delay = sc->diff_clk;
+    }
+    if (sc->diff_clk > max_advance) {
+        max_advance = sc->diff_clk;
+    }
+
+    /* Print every 2s max if the guest is late. We limit the number
+       of printed messages to NB_PRINT_MAX(currently 100) */
+    print_delay(sc);
+}
+#else
+static void align_clocks(SyncClocks *sc, const CPUState *cpu)
+{
+}
+
+static void init_delay_params(SyncClocks *sc, const CPUState *cpu)
+{
+}
+#endif /* CONFIG USER ONLY */
 
 /* Execute a TB, and fix up the CPU state afterwards if necessary */
-static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, uint8_t *tb_ptr)
+static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
 {
     CPUArchState *env = cpu->env_ptr;
-    uintptr_t next_tb;
+    uintptr_t ret;
+    TranslationBlock *last_tb;
+    int tb_exit;
+    uint8_t *tb_ptr = itb->tc_ptr;
+
+    qemu_log_mask_and_addr(CPU_LOG_EXEC, itb->pc,
+                           "Trace %p [" TARGET_FMT_lx "] %s\n",
+                           itb->tc_ptr, itb->pc, lookup_symbol(itb->pc));
 
 #if defined(DEBUG_DISAS)
     if (qemu_loglevel_mask(CPU_LOG_TB_CPU)) {
@@ -64,139 +162,231 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, uint8_t *tb_ptr)
     }
 #endif /* DEBUG_DISAS */
 
-    next_tb = tcg_qemu_tb_exec(env, tb_ptr);
-    if ((next_tb & TB_EXIT_MASK) > TB_EXIT_IDX1) {
+    cpu->can_do_io = !use_icount;
+    ret = tcg_qemu_tb_exec(env, tb_ptr);
+    cpu->can_do_io = 1;
+    last_tb = (TranslationBlock *)(ret & ~TB_EXIT_MASK);
+    tb_exit = ret & TB_EXIT_MASK;
+    trace_exec_tb_exit(last_tb, tb_exit);
+
+    if (tb_exit > TB_EXIT_IDX1) {
         /* We didn't start executing this TB (eg because the instruction
          * counter hit zero); we must restore the guest PC to the address
          * of the start of the TB.
          */
         CPUClass *cc = CPU_GET_CLASS(cpu);
-        TranslationBlock *tb = (TranslationBlock *)(next_tb & ~TB_EXIT_MASK);
+        qemu_log_mask_and_addr(CPU_LOG_EXEC, last_tb->pc,
+                               "Stopped execution of TB chain before %p ["
+                               TARGET_FMT_lx "] %s\n",
+                               last_tb->tc_ptr, last_tb->pc,
+                               lookup_symbol(last_tb->pc));
         if (cc->synchronize_from_tb) {
-            cc->synchronize_from_tb(cpu, tb);
+            cc->synchronize_from_tb(cpu, last_tb);
         } else {
             assert(cc->set_pc);
-            cc->set_pc(cpu, tb->pc);
+            cc->set_pc(cpu, last_tb->pc);
         }
     }
-    if ((next_tb & TB_EXIT_MASK) == TB_EXIT_REQUESTED) {
+    if (tb_exit == TB_EXIT_REQUESTED) {
         /* We were asked to stop executing TBs (probably a pending
          * interrupt. We've now stopped, so clear the flag.
          */
         cpu->tcg_exit_req = 0;
     }
-    return next_tb;
+    return ret;
 }
 
+#ifndef CONFIG_USER_ONLY
 /* Execute the code without caching the generated code. An interpreter
    could be used if available. */
-static void cpu_exec_nocache(CPUArchState *env, int max_cycles,
-                             TranslationBlock *orig_tb)
+static void cpu_exec_nocache(CPUState *cpu, int max_cycles,
+                             TranslationBlock *orig_tb, bool ignore_icount)
 {
-    CPUState *cpu = ENV_GET_CPU(env);
     TranslationBlock *tb;
+    bool old_tb_flushed;
 
     /* Should never happen.
        We only end up here when an existing TB is too long.  */
     if (max_cycles > CF_COUNT_MASK)
         max_cycles = CF_COUNT_MASK;
 
+    old_tb_flushed = cpu->tb_flushed;
+    cpu->tb_flushed = false;
     tb = tb_gen_code(cpu, orig_tb->pc, orig_tb->cs_base, orig_tb->flags,
-                     max_cycles);
-    cpu->current_tb = tb;
+                     max_cycles | CF_NOCACHE
+                         | (ignore_icount ? CF_IGNORE_ICOUNT : 0));
+    tb->orig_tb = cpu->tb_flushed ? NULL : orig_tb;
+    cpu->tb_flushed |= old_tb_flushed;
     /* execute the generated code */
-    cpu_tb_exec(cpu, tb->tc_ptr);
-    cpu->current_tb = NULL;
+    trace_exec_tb_nocache(tb, tb->pc);
+    cpu_tb_exec(cpu, tb);
     tb_phys_invalidate(tb, -1);
     tb_free(tb);
 }
+#endif
 
-static TranslationBlock *tb_find_slow(CPUArchState *env,
-                                      target_ulong pc,
-                                      target_ulong cs_base,
-                                      uint64_t flags)
+struct tb_desc {
+    target_ulong pc;
+    target_ulong cs_base;
+    CPUArchState *env;
+    tb_page_addr_t phys_page1;
+    uint32_t flags;
+};
+
+static bool tb_cmp(const void *p, const void *d)
 {
-    CPUState *cpu = ENV_GET_CPU(env);
-    TranslationBlock *tb, **ptb1;
-    unsigned int h;
-    tb_page_addr_t phys_pc, phys_page1;
-    target_ulong virt_page2;
+    const TranslationBlock *tb = p;
+    const struct tb_desc *desc = d;
 
-    tcg_ctx.tb_ctx.tb_invalidated_flag = 0;
+    if (tb->pc == desc->pc &&
+        tb->page_addr[0] == desc->phys_page1 &&
+        tb->cs_base == desc->cs_base &&
+        tb->flags == desc->flags) {
+        /* check next page if needed */
+        if (tb->page_addr[1] == -1) {
+            return true;
+        } else {
+            tb_page_addr_t phys_page2;
+            target_ulong virt_page2;
 
-    /* find translated block using physical mappings */
-    phys_pc = get_page_addr_code(env, pc);
-    phys_page1 = phys_pc & TARGET_PAGE_MASK;
-    h = tb_phys_hash_func(phys_pc);
-    ptb1 = &tcg_ctx.tb_ctx.tb_phys_hash[h];
-    for(;;) {
-        tb = *ptb1;
-        if (!tb)
-            goto not_found;
-        if (tb->pc == pc &&
-            tb->page_addr[0] == phys_page1 &&
-            tb->cs_base == cs_base &&
-            tb->flags == flags) {
-            /* check next page if needed */
-            if (tb->page_addr[1] != -1) {
-                tb_page_addr_t phys_page2;
-
-                virt_page2 = (pc & TARGET_PAGE_MASK) +
-                    TARGET_PAGE_SIZE;
-                phys_page2 = get_page_addr_code(env, virt_page2);
-                if (tb->page_addr[1] == phys_page2)
-                    goto found;
-            } else {
-                goto found;
+            virt_page2 = (desc->pc & TARGET_PAGE_MASK) + TARGET_PAGE_SIZE;
+            phys_page2 = get_page_addr_code(desc->env, virt_page2);
+            if (tb->page_addr[1] == phys_page2) {
+                return true;
             }
         }
-        ptb1 = &tb->phys_hash_next;
     }
- not_found:
-   /* if no translated code available, then translate it now */
+    return false;
+}
+
+static TranslationBlock *tb_find_physical(CPUState *cpu,
+                                          target_ulong pc,
+                                          target_ulong cs_base,
+                                          uint32_t flags)
+{
+    tb_page_addr_t phys_pc;
+    struct tb_desc desc;
+    uint32_t h;
+
+    desc.env = (CPUArchState *)cpu->env_ptr;
+    desc.cs_base = cs_base;
+    desc.flags = flags;
+    desc.pc = pc;
+    phys_pc = get_page_addr_code(desc.env, pc);
+    desc.phys_page1 = phys_pc & TARGET_PAGE_MASK;
+    h = tb_hash_func(phys_pc, pc, flags);
+    return qht_lookup(&tcg_ctx.tb_ctx.htable, tb_cmp, &desc, h);
+}
+
+static TranslationBlock *tb_find_slow(CPUState *cpu,
+                                      target_ulong pc,
+                                      target_ulong cs_base,
+                                      uint32_t flags)
+{
+    TranslationBlock *tb;
+
+    tb = tb_find_physical(cpu, pc, cs_base, flags);
+    if (tb) {
+        goto found;
+    }
+
+#ifdef CONFIG_USER_ONLY
+    /* mmap_lock is needed by tb_gen_code, and mmap_lock must be
+     * taken outside tb_lock.  Since we're momentarily dropping
+     * tb_lock, there's a chance that our desired tb has been
+     * translated.
+     */
+    tb_unlock();
+    mmap_lock();
+    tb_lock();
+    tb = tb_find_physical(cpu, pc, cs_base, flags);
+    if (tb) {
+        mmap_unlock();
+        goto found;
+    }
+#endif
+
+    /* if no translated code available, then translate it now */
     tb = tb_gen_code(cpu, pc, cs_base, flags, 0);
 
- found:
-    /* Move the last found TB to the head of the list */
-    if (likely(*ptb1)) {
-        *ptb1 = tb->phys_hash_next;
-        tb->phys_hash_next = tcg_ctx.tb_ctx.tb_phys_hash[h];
-        tcg_ctx.tb_ctx.tb_phys_hash[h] = tb;
-    }
+#ifdef CONFIG_USER_ONLY
+    mmap_unlock();
+#endif
+
+found:
     /* we add the TB in the virtual pc hash table */
     cpu->tb_jmp_cache[tb_jmp_cache_hash_func(pc)] = tb;
     return tb;
 }
 
-static inline TranslationBlock *tb_find_fast(CPUArchState *env)
+static inline TranslationBlock *tb_find_fast(CPUState *cpu,
+                                             TranslationBlock **last_tb,
+                                             int tb_exit)
 {
-    CPUState *cpu = ENV_GET_CPU(env);
+    CPUArchState *env = (CPUArchState *)cpu->env_ptr;
     TranslationBlock *tb;
     target_ulong cs_base, pc;
-    int flags;
+    uint32_t flags;
 
     /* we record a subset of the CPU state. It will
        always be the same before a given translated block
        is executed. */
     cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
+    tb_lock();
     tb = cpu->tb_jmp_cache[tb_jmp_cache_hash_func(pc)];
     if (unlikely(!tb || tb->pc != pc || tb->cs_base != cs_base ||
                  tb->flags != flags)) {
-        tb = tb_find_slow(env, pc, cs_base, flags);
+        tb = tb_find_slow(cpu, pc, cs_base, flags);
     }
+    if (cpu->tb_flushed) {
+        /* Ensure that no TB jump will be modified as the
+         * translation buffer has been flushed.
+         */
+        *last_tb = NULL;
+        cpu->tb_flushed = false;
+    }
+#ifndef CONFIG_USER_ONLY
+    /* We don't take care of direct jumps when address mapping changes in
+     * system emulation. So it's not safe to make a direct jump to a TB
+     * spanning two pages because the mapping for the second page can change.
+     */
+    if (tb->page_addr[1] != -1) {
+        *last_tb = NULL;
+    }
+#endif
+    /* See if we can patch the calling TB. */
+    if (*last_tb && !qemu_loglevel_mask(CPU_LOG_TB_NOCHAIN)) {
+        tb_add_jump(*last_tb, tb_exit, tb);
+    }
+    tb_unlock();
     return tb;
 }
 
-static CPUDebugExcpHandler *debug_excp_handler;
-
-void cpu_set_debug_excp_handler(CPUDebugExcpHandler *handler)
+static inline bool cpu_handle_halt(CPUState *cpu)
 {
-    debug_excp_handler = handler;
+    if (cpu->halted) {
+#if defined(TARGET_I386) && !defined(CONFIG_USER_ONLY)
+        if ((cpu->interrupt_request & CPU_INTERRUPT_POLL)
+            && replay_interrupt()) {
+            X86CPU *x86_cpu = X86_CPU(cpu);
+            apic_poll_irq(x86_cpu->apic_state);
+            cpu_reset_interrupt(cpu, CPU_INTERRUPT_POLL);
+        }
+#endif
+        if (!cpu_has_work(cpu)) {
+            current_cpu = NULL;
+            return true;
+        }
+
+        cpu->halted = 0;
+    }
+
+    return false;
 }
 
-static void cpu_handle_debug_exception(CPUArchState *env)
+static inline void cpu_handle_debug_exception(CPUState *cpu)
 {
-    CPUState *cpu = ENV_GET_CPU(env);
+    CPUClass *cc = CPU_GET_CLASS(cpu);
     CPUWatchpoint *wp;
 
     if (!cpu->watchpoint_hit) {
@@ -204,539 +394,264 @@ static void cpu_handle_debug_exception(CPUArchState *env)
             wp->flags &= ~BP_WATCHPOINT_HIT;
         }
     }
-    if (debug_excp_handler) {
-        debug_excp_handler(env);
+
+    cc->debug_excp_handler(cpu);
+}
+
+static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
+{
+    if (cpu->exception_index >= 0) {
+        if (cpu->exception_index >= EXCP_INTERRUPT) {
+            /* exit request from the cpu execution loop */
+            *ret = cpu->exception_index;
+            if (*ret == EXCP_DEBUG) {
+                cpu_handle_debug_exception(cpu);
+            }
+            cpu->exception_index = -1;
+            return true;
+        } else {
+#if defined(CONFIG_USER_ONLY)
+            /* if user mode only, we simulate a fake exception
+               which will be handled outside the cpu execution
+               loop */
+#if defined(TARGET_I386)
+            CPUClass *cc = CPU_GET_CLASS(cpu);
+            cc->do_interrupt(cpu);
+#endif
+            *ret = cpu->exception_index;
+            cpu->exception_index = -1;
+            return true;
+#else
+            if (replay_exception()) {
+                CPUClass *cc = CPU_GET_CLASS(cpu);
+                cc->do_interrupt(cpu);
+                cpu->exception_index = -1;
+            } else if (!replay_has_interrupt()) {
+                /* give a chance to iothread in replay mode */
+                *ret = EXCP_INTERRUPT;
+                return true;
+            }
+#endif
+        }
+#ifndef CONFIG_USER_ONLY
+    } else if (replay_has_exception()
+               && cpu->icount_decr.u16.low + cpu->icount_extra == 0) {
+        /* try to cause an exception pending in the log */
+        TranslationBlock *last_tb = NULL; /* Avoid chaining TBs */
+        cpu_exec_nocache(cpu, 1, tb_find_fast(cpu, &last_tb, 0), true);
+        *ret = -1;
+        return true;
+#endif
+    }
+
+    return false;
+}
+
+static inline void cpu_handle_interrupt(CPUState *cpu,
+                                        TranslationBlock **last_tb)
+{
+    CPUClass *cc = CPU_GET_CLASS(cpu);
+    int interrupt_request = cpu->interrupt_request;
+
+    if (unlikely(interrupt_request)) {
+        if (unlikely(cpu->singlestep_enabled & SSTEP_NOIRQ)) {
+            /* Mask out external interrupts for this step. */
+            interrupt_request &= ~CPU_INTERRUPT_SSTEP_MASK;
+        }
+        if (interrupt_request & CPU_INTERRUPT_DEBUG) {
+            cpu->interrupt_request &= ~CPU_INTERRUPT_DEBUG;
+            cpu->exception_index = EXCP_DEBUG;
+            cpu_loop_exit(cpu);
+        }
+        if (replay_mode == REPLAY_MODE_PLAY && !replay_has_interrupt()) {
+            /* Do nothing */
+        } else if (interrupt_request & CPU_INTERRUPT_HALT) {
+            replay_interrupt();
+            cpu->interrupt_request &= ~CPU_INTERRUPT_HALT;
+            cpu->halted = 1;
+            cpu->exception_index = EXCP_HLT;
+            cpu_loop_exit(cpu);
+        }
+#if defined(TARGET_I386)
+        else if (interrupt_request & CPU_INTERRUPT_INIT) {
+            X86CPU *x86_cpu = X86_CPU(cpu);
+            CPUArchState *env = &x86_cpu->env;
+            replay_interrupt();
+            cpu_svm_check_intercept_param(env, SVM_EXIT_INIT, 0);
+            do_cpu_init(x86_cpu);
+            cpu->exception_index = EXCP_HALTED;
+            cpu_loop_exit(cpu);
+        }
+#else
+        else if (interrupt_request & CPU_INTERRUPT_RESET) {
+            replay_interrupt();
+            cpu_reset(cpu);
+            cpu_loop_exit(cpu);
+        }
+#endif
+        /* The target hook has 3 exit conditions:
+           False when the interrupt isn't processed,
+           True when it is, and we should restart on a new TB,
+           and via longjmp via cpu_loop_exit.  */
+        else {
+            replay_interrupt();
+            if (cc->cpu_exec_interrupt(cpu, interrupt_request)) {
+                *last_tb = NULL;
+            }
+            /* The target hook may have updated the 'cpu->interrupt_request';
+             * reload the 'interrupt_request' value */
+            interrupt_request = cpu->interrupt_request;
+        }
+        if (interrupt_request & CPU_INTERRUPT_EXITTB) {
+            cpu->interrupt_request &= ~CPU_INTERRUPT_EXITTB;
+            /* ensure that no TB jump will be modified as
+               the program flow was changed */
+            *last_tb = NULL;
+        }
+    }
+    if (unlikely(cpu->exit_request || replay_has_interrupt())) {
+        cpu->exit_request = 0;
+        cpu->exception_index = EXCP_INTERRUPT;
+        cpu_loop_exit(cpu);
+    }
+}
+
+static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
+                                    TranslationBlock **last_tb, int *tb_exit,
+                                    SyncClocks *sc)
+{
+    uintptr_t ret;
+
+    if (unlikely(cpu->exit_request)) {
+        return;
+    }
+
+    trace_exec_tb(tb, tb->pc);
+    ret = cpu_tb_exec(cpu, tb);
+    *last_tb = (TranslationBlock *)(ret & ~TB_EXIT_MASK);
+    *tb_exit = ret & TB_EXIT_MASK;
+    switch (*tb_exit) {
+    case TB_EXIT_REQUESTED:
+        /* Something asked us to stop executing
+         * chained TBs; just continue round the main
+         * loop. Whatever requested the exit will also
+         * have set something else (eg exit_request or
+         * interrupt_request) which we will handle
+         * next time around the loop.  But we need to
+         * ensure the tcg_exit_req read in generated code
+         * comes before the next read of cpu->exit_request
+         * or cpu->interrupt_request.
+         */
+        smp_rmb();
+        *last_tb = NULL;
+        break;
+    case TB_EXIT_ICOUNT_EXPIRED:
+    {
+        /* Instruction counter expired.  */
+#ifdef CONFIG_USER_ONLY
+        abort();
+#else
+        int insns_left = cpu->icount_decr.u32;
+        if (cpu->icount_extra && insns_left >= 0) {
+            /* Refill decrementer and continue execution.  */
+            cpu->icount_extra += insns_left;
+            insns_left = MIN(0xffff, cpu->icount_extra);
+            cpu->icount_extra -= insns_left;
+            cpu->icount_decr.u16.low = insns_left;
+        } else {
+            if (insns_left > 0) {
+                /* Execute remaining instructions.  */
+                cpu_exec_nocache(cpu, insns_left, *last_tb, false);
+                align_clocks(sc, cpu);
+            }
+            cpu->exception_index = EXCP_INTERRUPT;
+            *last_tb = NULL;
+            cpu_loop_exit(cpu);
+        }
+        break;
+#endif
+    }
+    default:
+        break;
     }
 }
 
 /* main execution loop */
 
-volatile sig_atomic_t exit_request;
-
-int cpu_exec(CPUArchState *env)
+int cpu_exec(CPUState *cpu)
 {
-    CPUState *cpu = ENV_GET_CPU(env);
-#if !(defined(CONFIG_USER_ONLY) && \
-      (defined(TARGET_M68K) || defined(TARGET_PPC) || defined(TARGET_S390X)))
     CPUClass *cc = CPU_GET_CLASS(cpu);
-#endif
-#ifdef TARGET_I386
-    X86CPU *x86_cpu = X86_CPU(cpu);
-#endif
-    int ret, interrupt_request;
-    TranslationBlock *tb;
-    uint8_t *tc_ptr;
-    uintptr_t next_tb;
-    /* This must be volatile so it is not trashed by longjmp() */
-    volatile bool have_tb_lock = false;
+    int ret;
+    SyncClocks sc;
 
-    if (cpu->halted) {
-        if (!cpu_has_work(cpu)) {
-            return EXCP_HALTED;
-        }
-
-        cpu->halted = 0;
-    }
-
+    /* replay_interrupt may need current_cpu */
     current_cpu = cpu;
 
-    /* As long as current_cpu is null, up to the assignment just above,
-     * requests by other threads to exit the execution loop are expected to
-     * be issued using the exit_request global. We must make sure that our
-     * evaluation of the global value is performed past the current_cpu
-     * value transition point, which requires a memory barrier as well as
-     * an instruction scheduling constraint on modern architectures.  */
-    smp_mb();
+    if (cpu_handle_halt(cpu)) {
+        return EXCP_HALTED;
+    }
 
-    if (unlikely(exit_request)) {
+    atomic_mb_set(&tcg_current_cpu, cpu);
+    rcu_read_lock();
+
+    if (unlikely(atomic_mb_read(&exit_request))) {
         cpu->exit_request = 1;
     }
 
-#if defined(TARGET_I386)
-    /* put eflags in CPU temporary format */
-    CC_SRC = env->eflags & (CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
-    env->df = 1 - (2 * ((env->eflags >> 10) & 1));
-    CC_OP = CC_OP_EFLAGS;
-    env->eflags &= ~(DF_MASK | CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
-#elif defined(TARGET_SPARC)
-#elif defined(TARGET_M68K)
-    env->cc_op = CC_OP_FLAGS;
-    env->cc_dest = env->sr & 0xf;
-    env->cc_x = (env->sr >> 4) & 1;
-#elif defined(TARGET_ALPHA)
-#elif defined(TARGET_ARM)
-#elif defined(TARGET_UNICORE32)
-#elif defined(TARGET_PPC)
-    env->reserve_addr = -1;
-#elif defined(TARGET_LM32)
-#elif defined(TARGET_MICROBLAZE)
-#elif defined(TARGET_MIPS)
-#elif defined(TARGET_MOXIE)
-#elif defined(TARGET_OPENRISC)
-#elif defined(TARGET_SH4)
-#elif defined(TARGET_CRIS)
-#elif defined(TARGET_S390X)
-#elif defined(TARGET_XTENSA)
-    /* XXXXX */
-#else
-#error unsupported target CPU
-#endif
-    cpu->exception_index = -1;
+    cc->cpu_exec_enter(cpu);
 
-    /* prepare setjmp context for exception handling */
+    /* Calculate difference between guest clock and host clock.
+     * This delay includes the delay of the last cycle, so
+     * what we have to do is sleep until it is 0. As for the
+     * advance/delay we gain here, we try to fix it next time.
+     */
+    init_delay_params(&sc, cpu);
+
     for(;;) {
+        /* prepare setjmp context for exception handling */
         if (sigsetjmp(cpu->jmp_env, 0) == 0) {
+            TranslationBlock *tb, *last_tb = NULL;
+            int tb_exit = 0;
+
             /* if an exception is pending, we execute it here */
-            if (cpu->exception_index >= 0) {
-                if (cpu->exception_index >= EXCP_INTERRUPT) {
-                    /* exit request from the cpu execution loop */
-                    ret = cpu->exception_index;
-                    if (ret == EXCP_DEBUG) {
-                        cpu_handle_debug_exception(env);
-                    }
-                    break;
-                } else {
-#if defined(CONFIG_USER_ONLY)
-                    /* if user mode only, we simulate a fake exception
-                       which will be handled outside the cpu execution
-                       loop */
-#if defined(TARGET_I386)
-                    cc->do_interrupt(cpu);
-#endif
-                    ret = cpu->exception_index;
-                    break;
-#else
-                    cc->do_interrupt(cpu);
-                    cpu->exception_index = -1;
-#endif
-                }
+            if (cpu_handle_exception(cpu, &ret)) {
+                break;
             }
 
-            next_tb = 0; /* force lookup of first TB */
+            cpu->tb_flushed = false; /* reset before first TB lookup */
             for(;;) {
-                interrupt_request = cpu->interrupt_request;
-                if (unlikely(interrupt_request)) {
-                    if (unlikely(cpu->singlestep_enabled & SSTEP_NOIRQ)) {
-                        /* Mask out external interrupts for this step. */
-                        interrupt_request &= ~CPU_INTERRUPT_SSTEP_MASK;
-                    }
-                    if (interrupt_request & CPU_INTERRUPT_DEBUG) {
-                        cpu->interrupt_request &= ~CPU_INTERRUPT_DEBUG;
-                        cpu->exception_index = EXCP_DEBUG;
-                        cpu_loop_exit(cpu);
-                    }
-#if defined(TARGET_ARM) || defined(TARGET_SPARC) || defined(TARGET_MIPS) || \
-    defined(TARGET_PPC) || defined(TARGET_ALPHA) || defined(TARGET_CRIS) || \
-    defined(TARGET_MICROBLAZE) || defined(TARGET_LM32) || defined(TARGET_UNICORE32)
-                    if (interrupt_request & CPU_INTERRUPT_HALT) {
-                        cpu->interrupt_request &= ~CPU_INTERRUPT_HALT;
-                        cpu->halted = 1;
-                        cpu->exception_index = EXCP_HLT;
-                        cpu_loop_exit(cpu);
-                    }
-#endif
-#if defined(TARGET_I386)
-                    if (interrupt_request & CPU_INTERRUPT_INIT) {
-                        cpu_svm_check_intercept_param(env, SVM_EXIT_INIT, 0);
-                        do_cpu_init(x86_cpu);
-                        cpu->exception_index = EXCP_HALTED;
-                        cpu_loop_exit(cpu);
-                    }
-#else
-                    if (interrupt_request & CPU_INTERRUPT_RESET) {
-                        cpu_reset(cpu);
-                    }
-#endif
-#if defined(TARGET_I386)
-#if !defined(CONFIG_USER_ONLY)
-                    if (interrupt_request & CPU_INTERRUPT_POLL) {
-                        cpu->interrupt_request &= ~CPU_INTERRUPT_POLL;
-                        apic_poll_irq(x86_cpu->apic_state);
-                    }
-#endif
-                    if (interrupt_request & CPU_INTERRUPT_SIPI) {
-                            do_cpu_sipi(x86_cpu);
-                    } else if (env->hflags2 & HF2_GIF_MASK) {
-                        if ((interrupt_request & CPU_INTERRUPT_SMI) &&
-                            !(env->hflags & HF_SMM_MASK)) {
-                            cpu_svm_check_intercept_param(env, SVM_EXIT_SMI,
-                                                          0);
-                            cpu->interrupt_request &= ~CPU_INTERRUPT_SMI;
-                            do_smm_enter(x86_cpu);
-                            next_tb = 0;
-                        } else if ((interrupt_request & CPU_INTERRUPT_NMI) &&
-                                   !(env->hflags2 & HF2_NMI_MASK)) {
-                            cpu->interrupt_request &= ~CPU_INTERRUPT_NMI;
-                            env->hflags2 |= HF2_NMI_MASK;
-                            do_interrupt_x86_hardirq(env, EXCP02_NMI, 1);
-                            next_tb = 0;
-                        } else if (interrupt_request & CPU_INTERRUPT_MCE) {
-                            cpu->interrupt_request &= ~CPU_INTERRUPT_MCE;
-                            do_interrupt_x86_hardirq(env, EXCP12_MCHK, 0);
-                            next_tb = 0;
-                        } else if ((interrupt_request & CPU_INTERRUPT_HARD) &&
-                                   (((env->hflags2 & HF2_VINTR_MASK) && 
-                                     (env->hflags2 & HF2_HIF_MASK)) ||
-                                    (!(env->hflags2 & HF2_VINTR_MASK) && 
-                                     (env->eflags & IF_MASK && 
-                                      !(env->hflags & HF_INHIBIT_IRQ_MASK))))) {
-                            int intno;
-                            cpu_svm_check_intercept_param(env, SVM_EXIT_INTR,
-                                                          0);
-                            cpu->interrupt_request &= ~(CPU_INTERRUPT_HARD |
-                                                        CPU_INTERRUPT_VIRQ);
-                            intno = cpu_get_pic_interrupt(env);
-                            qemu_log_mask(CPU_LOG_TB_IN_ASM, "Servicing hardware INT=0x%02x\n", intno);
-                            do_interrupt_x86_hardirq(env, intno, 1);
-                            /* ensure that no TB jump will be modified as
-                               the program flow was changed */
-                            next_tb = 0;
-#if !defined(CONFIG_USER_ONLY)
-                        } else if ((interrupt_request & CPU_INTERRUPT_VIRQ) &&
-                                   (env->eflags & IF_MASK) && 
-                                   !(env->hflags & HF_INHIBIT_IRQ_MASK)) {
-                            int intno;
-                            /* FIXME: this should respect TPR */
-                            cpu_svm_check_intercept_param(env, SVM_EXIT_VINTR,
-                                                          0);
-                            intno = ldl_phys(cpu->as,
-                                             env->vm_vmcb
-                                             + offsetof(struct vmcb,
-                                                        control.int_vector));
-                            qemu_log_mask(CPU_LOG_TB_IN_ASM, "Servicing virtual hardware INT=0x%02x\n", intno);
-                            do_interrupt_x86_hardirq(env, intno, 1);
-                            cpu->interrupt_request &= ~CPU_INTERRUPT_VIRQ;
-                            next_tb = 0;
-#endif
-                        }
-                    }
-#elif defined(TARGET_PPC)
-                    if (interrupt_request & CPU_INTERRUPT_HARD) {
-                        ppc_hw_interrupt(env);
-                        if (env->pending_interrupts == 0) {
-                            cpu->interrupt_request &= ~CPU_INTERRUPT_HARD;
-                        }
-                        next_tb = 0;
-                    }
-#elif defined(TARGET_LM32)
-                    if ((interrupt_request & CPU_INTERRUPT_HARD)
-                        && (env->ie & IE_IE)) {
-                        cpu->exception_index = EXCP_IRQ;
-                        cc->do_interrupt(cpu);
-                        next_tb = 0;
-                    }
-#elif defined(TARGET_MICROBLAZE)
-                    if ((interrupt_request & CPU_INTERRUPT_HARD)
-                        && (env->sregs[SR_MSR] & MSR_IE)
-                        && !(env->sregs[SR_MSR] & (MSR_EIP | MSR_BIP))
-                        && !(env->iflags & (D_FLAG | IMM_FLAG))) {
-                        cpu->exception_index = EXCP_IRQ;
-                        cc->do_interrupt(cpu);
-                        next_tb = 0;
-                    }
-#elif defined(TARGET_MIPS)
-                    if ((interrupt_request & CPU_INTERRUPT_HARD) &&
-                        cpu_mips_hw_interrupts_pending(env)) {
-                        /* Raise it */
-                        cpu->exception_index = EXCP_EXT_INTERRUPT;
-                        env->error_code = 0;
-                        cc->do_interrupt(cpu);
-                        next_tb = 0;
-                    }
-#elif defined(TARGET_OPENRISC)
-                    {
-                        int idx = -1;
-                        if ((interrupt_request & CPU_INTERRUPT_HARD)
-                            && (env->sr & SR_IEE)) {
-                            idx = EXCP_INT;
-                        }
-                        if ((interrupt_request & CPU_INTERRUPT_TIMER)
-                            && (env->sr & SR_TEE)) {
-                            idx = EXCP_TICK;
-                        }
-                        if (idx >= 0) {
-                            cpu->exception_index = idx;
-                            cc->do_interrupt(cpu);
-                            next_tb = 0;
-                        }
-                    }
-#elif defined(TARGET_SPARC)
-                    if (interrupt_request & CPU_INTERRUPT_HARD) {
-                        if (cpu_interrupts_enabled(env) &&
-                            env->interrupt_index > 0) {
-                            int pil = env->interrupt_index & 0xf;
-                            int type = env->interrupt_index & 0xf0;
-
-                            if (((type == TT_EXTINT) &&
-                                  cpu_pil_allowed(env, pil)) ||
-                                  type != TT_EXTINT) {
-                                cpu->exception_index = env->interrupt_index;
-                                cc->do_interrupt(cpu);
-                                next_tb = 0;
-                            }
-                        }
-                    }
-#elif defined(TARGET_ARM)
-                    if (interrupt_request & CPU_INTERRUPT_FIQ
-                        && !(env->daif & PSTATE_F)) {
-                        cpu->exception_index = EXCP_FIQ;
-                        cc->do_interrupt(cpu);
-                        next_tb = 0;
-                    }
-                    /* ARMv7-M interrupt return works by loading a magic value
-                       into the PC.  On real hardware the load causes the
-                       return to occur.  The qemu implementation performs the
-                       jump normally, then does the exception return when the
-                       CPU tries to execute code at the magic address.
-                       This will cause the magic PC value to be pushed to
-                       the stack if an interrupt occurred at the wrong time.
-                       We avoid this by disabling interrupts when
-                       pc contains a magic address.  */
-                    if (interrupt_request & CPU_INTERRUPT_HARD
-                        && ((IS_M(env) && env->regs[15] < 0xfffffff0)
-                            || !(env->daif & PSTATE_I))) {
-                        cpu->exception_index = EXCP_IRQ;
-                        cc->do_interrupt(cpu);
-                        next_tb = 0;
-                    }
-#elif defined(TARGET_UNICORE32)
-                    if (interrupt_request & CPU_INTERRUPT_HARD
-                        && !(env->uncached_asr & ASR_I)) {
-                        cpu->exception_index = UC32_EXCP_INTR;
-                        cc->do_interrupt(cpu);
-                        next_tb = 0;
-                    }
-#elif defined(TARGET_SH4)
-                    if (interrupt_request & CPU_INTERRUPT_HARD) {
-                        cc->do_interrupt(cpu);
-                        next_tb = 0;
-                    }
-#elif defined(TARGET_ALPHA)
-                    {
-                        int idx = -1;
-                        /* ??? This hard-codes the OSF/1 interrupt levels.  */
-                        switch (env->pal_mode ? 7 : env->ps & PS_INT_MASK) {
-                        case 0 ... 3:
-                            if (interrupt_request & CPU_INTERRUPT_HARD) {
-                                idx = EXCP_DEV_INTERRUPT;
-                            }
-                            /* FALLTHRU */
-                        case 4:
-                            if (interrupt_request & CPU_INTERRUPT_TIMER) {
-                                idx = EXCP_CLK_INTERRUPT;
-                            }
-                            /* FALLTHRU */
-                        case 5:
-                            if (interrupt_request & CPU_INTERRUPT_SMP) {
-                                idx = EXCP_SMP_INTERRUPT;
-                            }
-                            /* FALLTHRU */
-                        case 6:
-                            if (interrupt_request & CPU_INTERRUPT_MCHK) {
-                                idx = EXCP_MCHK;
-                            }
-                        }
-                        if (idx >= 0) {
-                            cpu->exception_index = idx;
-                            env->error_code = 0;
-                            cc->do_interrupt(cpu);
-                            next_tb = 0;
-                        }
-                    }
-#elif defined(TARGET_CRIS)
-                    if (interrupt_request & CPU_INTERRUPT_HARD
-                        && (env->pregs[PR_CCS] & I_FLAG)
-                        && !env->locked_irq) {
-                        cpu->exception_index = EXCP_IRQ;
-                        cc->do_interrupt(cpu);
-                        next_tb = 0;
-                    }
-                    if (interrupt_request & CPU_INTERRUPT_NMI) {
-                        unsigned int m_flag_archval;
-                        if (env->pregs[PR_VR] < 32) {
-                            m_flag_archval = M_FLAG_V10;
-                        } else {
-                            m_flag_archval = M_FLAG_V32;
-                        }
-                        if ((env->pregs[PR_CCS] & m_flag_archval)) {
-                            cpu->exception_index = EXCP_NMI;
-                            cc->do_interrupt(cpu);
-                            next_tb = 0;
-                        }
-                    }
-#elif defined(TARGET_M68K)
-                    if (interrupt_request & CPU_INTERRUPT_HARD
-                        && ((env->sr & SR_I) >> SR_I_SHIFT)
-                            < env->pending_level) {
-                        /* Real hardware gets the interrupt vector via an
-                           IACK cycle at this point.  Current emulated
-                           hardware doesn't rely on this, so we
-                           provide/save the vector when the interrupt is
-                           first signalled.  */
-                        cpu->exception_index = env->pending_vector;
-                        do_interrupt_m68k_hardirq(env);
-                        next_tb = 0;
-                    }
-#elif defined(TARGET_S390X) && !defined(CONFIG_USER_ONLY)
-                    if ((interrupt_request & CPU_INTERRUPT_HARD) &&
-                        (env->psw.mask & PSW_MASK_EXT)) {
-                        cc->do_interrupt(cpu);
-                        next_tb = 0;
-                    }
-#elif defined(TARGET_XTENSA)
-                    if (interrupt_request & CPU_INTERRUPT_HARD) {
-                        cpu->exception_index = EXC_IRQ;
-                        cc->do_interrupt(cpu);
-                        next_tb = 0;
-                    }
-#endif
-                   /* Don't use the cached interrupt_request value,
-                      do_interrupt may have updated the EXITTB flag. */
-                    if (cpu->interrupt_request & CPU_INTERRUPT_EXITTB) {
-                        cpu->interrupt_request &= ~CPU_INTERRUPT_EXITTB;
-                        /* ensure that no TB jump will be modified as
-                           the program flow was changed */
-                        next_tb = 0;
-                    }
-                }
-                if (unlikely(cpu->exit_request)) {
-                    cpu->exit_request = 0;
-                    cpu->exception_index = EXCP_INTERRUPT;
-                    cpu_loop_exit(cpu);
-                }
-                spin_lock(&tcg_ctx.tb_ctx.tb_lock);
-                have_tb_lock = true;
-                tb = tb_find_fast(env);
-                /* Note: we do it here to avoid a gcc bug on Mac OS X when
-                   doing it in tb_find_slow */
-                if (tcg_ctx.tb_ctx.tb_invalidated_flag) {
-                    /* as some TB could have been invalidated because
-                       of memory exceptions while generating the code, we
-                       must recompute the hash index here */
-                    next_tb = 0;
-                    tcg_ctx.tb_ctx.tb_invalidated_flag = 0;
-                }
-                if (qemu_loglevel_mask(CPU_LOG_EXEC)) {
-                    qemu_log("Trace %p [" TARGET_FMT_lx "] %s\n",
-                             tb->tc_ptr, tb->pc, lookup_symbol(tb->pc));
-                }
-                /* see if we can patch the calling TB. When the TB
-                   spans two pages, we cannot safely do a direct
-                   jump. */
-                if (next_tb != 0 && tb->page_addr[1] == -1) {
-                    tb_add_jump((TranslationBlock *)(next_tb & ~TB_EXIT_MASK),
-                                next_tb & TB_EXIT_MASK, tb);
-                }
-                have_tb_lock = false;
-                spin_unlock(&tcg_ctx.tb_ctx.tb_lock);
-
-                /* cpu_interrupt might be called while translating the
-                   TB, but before it is linked into a potentially
-                   infinite loop and becomes env->current_tb. Avoid
-                   starting execution if there is a pending interrupt. */
-                cpu->current_tb = tb;
-                barrier();
-                if (likely(!cpu->exit_request)) {
-                    tc_ptr = tb->tc_ptr;
-                    /* execute the generated code */
-                    next_tb = cpu_tb_exec(cpu, tc_ptr);
-                    switch (next_tb & TB_EXIT_MASK) {
-                    case TB_EXIT_REQUESTED:
-                        /* Something asked us to stop executing
-                         * chained TBs; just continue round the main
-                         * loop. Whatever requested the exit will also
-                         * have set something else (eg exit_request or
-                         * interrupt_request) which we will handle
-                         * next time around the loop.
-                         */
-                        tb = (TranslationBlock *)(next_tb & ~TB_EXIT_MASK);
-                        next_tb = 0;
-                        break;
-                    case TB_EXIT_ICOUNT_EXPIRED:
-                    {
-                        /* Instruction counter expired.  */
-                        int insns_left;
-                        tb = (TranslationBlock *)(next_tb & ~TB_EXIT_MASK);
-                        insns_left = cpu->icount_decr.u32;
-                        if (cpu->icount_extra && insns_left >= 0) {
-                            /* Refill decrementer and continue execution.  */
-                            cpu->icount_extra += insns_left;
-                            if (cpu->icount_extra > 0xffff) {
-                                insns_left = 0xffff;
-                            } else {
-                                insns_left = cpu->icount_extra;
-                            }
-                            cpu->icount_extra -= insns_left;
-                            cpu->icount_decr.u16.low = insns_left;
-                        } else {
-                            if (insns_left > 0) {
-                                /* Execute remaining instructions.  */
-                                cpu_exec_nocache(env, insns_left, tb);
-                            }
-                            cpu->exception_index = EXCP_INTERRUPT;
-                            next_tb = 0;
-                            cpu_loop_exit(cpu);
-                        }
-                        break;
-                    }
-                    default:
-                        break;
-                    }
-                }
-                cpu->current_tb = NULL;
-                /* reset soft MMU for next block (it can currently
-                   only be set by a memory fault) */
+                cpu_handle_interrupt(cpu, &last_tb);
+                tb = tb_find_fast(cpu, &last_tb, tb_exit);
+                cpu_loop_exec_tb(cpu, tb, &last_tb, &tb_exit, &sc);
+                /* Try to align the host and virtual clocks
+                   if the guest is in advance */
+                align_clocks(&sc, cpu);
             } /* for(;;) */
         } else {
-            /* Reload env after longjmp - the compiler may have smashed all
-             * local variables as longjmp is marked 'noreturn'. */
+#if defined(__clang__) || !QEMU_GNUC_PREREQ(4, 6)
+            /* Some compilers wrongly smash all local variables after
+             * siglongjmp. There were bug reports for gcc 4.5.0 and clang.
+             * Reload essential local variables here for those compilers.
+             * Newer versions of gcc would complain about this code (-Wclobbered). */
             cpu = current_cpu;
-            env = cpu->env_ptr;
-#if !(defined(CONFIG_USER_ONLY) && \
-      (defined(TARGET_M68K) || defined(TARGET_PPC) || defined(TARGET_S390X)))
             cc = CPU_GET_CLASS(cpu);
-#endif
-#ifdef TARGET_I386
-            x86_cpu = X86_CPU(cpu);
-#endif
-            if (have_tb_lock) {
-                spin_unlock(&tcg_ctx.tb_ctx.tb_lock);
-                have_tb_lock = false;
-            }
+#else /* buggy compiler */
+            /* Assert that the compiler does not smash local variables. */
+            g_assert(cpu == current_cpu);
+            g_assert(cc == CPU_GET_CLASS(cpu));
+#endif /* buggy compiler */
+            cpu->can_do_io = 1;
+            tb_lock_reset();
         }
     } /* for(;;) */
 
-
-#if defined(TARGET_I386)
-    /* restore flags in standard format */
-    env->eflags = env->eflags | cpu_cc_compute_all(env, CC_OP)
-        | (env->df & DF_MASK);
-#elif defined(TARGET_ARM)
-    /* XXX: Save/restore host fpu exception state?.  */
-#elif defined(TARGET_UNICORE32)
-#elif defined(TARGET_SPARC)
-#elif defined(TARGET_PPC)
-#elif defined(TARGET_LM32)
-#elif defined(TARGET_M68K)
-    cpu_m68k_flush_flags(env, env->cc_op);
-    env->cc_op = CC_OP_FLAGS;
-    env->sr = (env->sr & 0xffe0)
-              | env->cc_dest | (env->cc_x << 4);
-#elif defined(TARGET_MICROBLAZE)
-#elif defined(TARGET_MIPS)
-#elif defined(TARGET_MOXIE)
-#elif defined(TARGET_OPENRISC)
-#elif defined(TARGET_SH4)
-#elif defined(TARGET_ALPHA)
-#elif defined(TARGET_CRIS)
-#elif defined(TARGET_S390X)
-#elif defined(TARGET_XTENSA)
-    /* XXXXX */
-#else
-#error unsupported target CPU
-#endif
+    cc->cpu_exec_exit(cpu);
+    rcu_read_unlock();
 
     /* fail safe : never use current_cpu outside cpu_exec() */
     current_cpu = NULL;
+
+    /* Does not need atomic_mb_set because a spurious wakeup is okay.  */
+    atomic_set(&tcg_current_cpu, NULL);
     return ret;
 }

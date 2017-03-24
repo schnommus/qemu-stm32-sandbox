@@ -17,6 +17,10 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, see <http://www.gnu.org/licenses/>
  */
+#include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "qemu-common.h"
+#include "cpu.h"
 #include "hw/i386/apic.h"
 #include "hw/i386/apic_internal.h"
 #include "trace.h"
@@ -177,12 +181,14 @@ bool apic_next_timer(APICCommonState *s, int64_t current_time)
 
 void apic_init_reset(DeviceState *dev)
 {
-    APICCommonState *s = APIC_COMMON(dev);
+    APICCommonState *s;
+    APICCommonClass *info;
     int i;
 
-    if (!s) {
+    if (!dev) {
         return;
     }
+    s = APIC_COMMON(dev);
     s->tpr = 0;
     s->spurious_vec = 0xff;
     s->log_dest = 0;
@@ -206,41 +212,40 @@ void apic_init_reset(DeviceState *dev)
         timer_del(s->timer);
     }
     s->timer_expiry = -1;
+
+    info = APIC_COMMON_GET_CLASS(s);
+    if (info->reset) {
+        info->reset(s);
+    }
 }
 
-void apic_designate_bsp(DeviceState *dev)
+void apic_designate_bsp(DeviceState *dev, bool bsp)
 {
     if (dev == NULL) {
         return;
     }
 
     APICCommonState *s = APIC_COMMON(dev);
-    s->apicbase |= MSR_IA32_APICBASE_BSP;
+    if (bsp) {
+        s->apicbase |= MSR_IA32_APICBASE_BSP;
+    } else {
+        s->apicbase &= ~MSR_IA32_APICBASE_BSP;
+    }
 }
 
 static void apic_reset_common(DeviceState *dev)
 {
     APICCommonState *s = APIC_COMMON(dev);
     APICCommonClass *info = APIC_COMMON_GET_CLASS(s);
-    bool bsp;
+    uint32_t bsp;
 
-    bsp = cpu_is_bsp(s->cpu);
-    s->apicbase = APIC_DEFAULT_ADDRESS |
-        (bsp ? MSR_IA32_APICBASE_BSP : 0) | MSR_IA32_APICBASE_ENABLE;
+    bsp = s->apicbase & MSR_IA32_APICBASE_BSP;
+    s->apicbase = APIC_DEFAULT_ADDRESS | bsp | MSR_IA32_APICBASE_ENABLE;
 
     s->vapic_paddr = 0;
     info->vapic_base_update(s);
 
     apic_init_reset(dev);
-
-    if (bsp) {
-        /*
-         * LINT0 delivery mode on CPU #0 is set to ExtInt at initialization
-         * time typically by BIOS, so PIC interrupt can be delivered to the
-         * processor when local APIC is enabled.
-         */
-        s->lvt[APIC_LVT_LINT0] = 0x700;
-    }
 }
 
 /* This function is only used for old state version 1 and 2 */
@@ -289,28 +294,17 @@ static int apic_load_old(QEMUFile *f, void *opaque, int version_id)
     return 0;
 }
 
+static const VMStateDescription vmstate_apic_common;
+
 static void apic_common_realize(DeviceState *dev, Error **errp)
 {
     APICCommonState *s = APIC_COMMON(dev);
     APICCommonClass *info;
     static DeviceState *vapic;
-    static int apic_no;
-    static bool mmio_registered;
-
-    if (apic_no >= MAX_APICS) {
-        error_setg(errp, "%s initialization failed.",
-                   object_get_typename(OBJECT(dev)));
-        return;
-    }
-    s->idx = apic_no++;
+    int instance_id = s->id;
 
     info = APIC_COMMON_GET_CLASS(s);
     info->realize(dev, errp);
-    if (!mmio_registered) {
-        ICCBus *b = ICC_BUS(qdev_get_parent_bus(dev));
-        memory_region_add_subregion(b->apic_address_space, 0, &s->io_memory);
-        mmio_registered = true;
-    }
 
     /* Note: We need at least 1M to map the VAPIC option ROM */
     if (!vapic && s->vapic_control & VAPIC_ENABLE_MASK &&
@@ -322,6 +316,37 @@ static void apic_common_realize(DeviceState *dev, Error **errp)
         info->enable_tpr_reporting(s, true);
     }
 
+    if (s->legacy_instance_id) {
+        instance_id = -1;
+    }
+    vmstate_register_with_alias_id(NULL, instance_id, &vmstate_apic_common,
+                                   s, -1, 0);
+}
+
+static void apic_common_unrealize(DeviceState *dev, Error **errp)
+{
+    APICCommonState *s = APIC_COMMON(dev);
+    APICCommonClass *info = APIC_COMMON_GET_CLASS(s);
+
+    vmstate_unregister(NULL, &vmstate_apic_common, s);
+    info->unrealize(dev, errp);
+
+    if (apic_report_tpr_access && info->enable_tpr_reporting) {
+        info->enable_tpr_reporting(s, false);
+    }
+}
+
+static int apic_pre_load(void *opaque)
+{
+    APICCommonState *s = APIC_COMMON(opaque);
+
+    /* The default is !cpu_is_bsp(s->cpu), but the common value is 0
+     * so that's what apic_common_sipi_needed checks for.  Reset to
+     * the value that is assumed when the apic_sipi subsection is
+     * absent.
+     */
+    s->wait_for_sipi = 0;
+    return 0;
 }
 
 static void apic_dispatch_pre_save(void *opaque)
@@ -345,12 +370,31 @@ static int apic_dispatch_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static bool apic_common_sipi_needed(void *opaque)
+{
+    APICCommonState *s = APIC_COMMON(opaque);
+    return s->wait_for_sipi != 0;
+}
+
+static const VMStateDescription vmstate_apic_common_sipi = {
+    .name = "apic_sipi",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = apic_common_sipi_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_INT32(sipi_vector, APICCommonState),
+        VMSTATE_INT32(wait_for_sipi, APICCommonState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_apic_common = {
     .name = "apic",
     .version_id = 3,
     .minimum_version_id = 3,
     .minimum_version_id_old = 1,
     .load_state_old = apic_load_old,
+    .pre_load = apic_pre_load,
     .pre_save = apic_dispatch_pre_save,
     .post_load = apic_dispatch_post_load,
     .fields = (VMStateField[]) {
@@ -375,6 +419,10 @@ static const VMStateDescription vmstate_apic_common = {
         VMSTATE_INT64(timer_expiry,
                       APICCommonState), /* open-coded timer state */
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription*[]) {
+        &vmstate_apic_common_sipi,
+        NULL
     }
 };
 
@@ -383,18 +431,19 @@ static Property apic_properties_common[] = {
     DEFINE_PROP_UINT8("version", APICCommonState, version, 0x14),
     DEFINE_PROP_BIT("vapic", APICCommonState, vapic_control, VAPIC_ENABLE_BIT,
                     true),
+    DEFINE_PROP_BOOL("legacy-instance-id", APICCommonState, legacy_instance_id,
+                     false),
     DEFINE_PROP_END_OF_LIST(),
 };
 
 static void apic_common_class_init(ObjectClass *klass, void *data)
 {
-    ICCDeviceClass *idc = ICC_DEVICE_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->vmsd = &vmstate_apic_common;
     dc->reset = apic_reset_common;
     dc->props = apic_properties_common;
-    idc->realize = apic_common_realize;
+    dc->realize = apic_common_realize;
+    dc->unrealize = apic_common_unrealize;
     /*
      * Reason: APIC and CPU need to be wired up by
      * x86_cpu_apic_create()
@@ -404,7 +453,7 @@ static void apic_common_class_init(ObjectClass *klass, void *data)
 
 static const TypeInfo apic_common_type = {
     .name = TYPE_APIC_COMMON,
-    .parent = TYPE_ICC_DEVICE,
+    .parent = TYPE_DEVICE,
     .instance_size = sizeof(APICCommonState),
     .class_size = sizeof(APICCommonClass),
     .class_init = apic_common_class_init,

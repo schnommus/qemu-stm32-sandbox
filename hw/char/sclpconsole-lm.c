@@ -13,6 +13,7 @@
  *
  */
 
+#include "qemu/osdep.h"
 #include "hw/qdev.h"
 #include "qemu/thread.h"
 #include "qemu/error-report.h"
@@ -43,6 +44,10 @@ typedef struct SCLPConsoleLM {
     uint8_t buf[SIZE_CONSOLE_BUFFER];
 } SCLPConsoleLM;
 
+#define TYPE_SCLPLM_CONSOLE "sclplmconsole"
+#define SCLPLM_CONSOLE(obj) \
+    OBJECT_CHECK(SCLPConsoleLM, (obj), TYPE_SCLPLM_CONSOLE)
+
 /*
 *  Character layer call-back functions
  *
@@ -52,7 +57,8 @@ typedef struct SCLPConsoleLM {
  * event_pending is set when a newline character is encountered
  *
  * The maximum command line length is limited by the maximum
- * space available in an SCCB
+ * space available in an SCCB. Line mode console input is sent
+ * truncated to the guest in case it doesn't fit into the SCCB.
  */
 
 static int chr_can_read(void *opaque)
@@ -61,10 +67,8 @@ static int chr_can_read(void *opaque)
 
     if (scon->event.event_pending) {
         return 0;
-    } else if (SIZE_CONSOLE_BUFFER - scon->length) {
-        return 1;
     }
-    return 0;
+    return 1;
 }
 
 static void chr_read(void *opaque, const uint8_t *buf, int size)
@@ -76,6 +80,10 @@ static void chr_read(void *opaque, const uint8_t *buf, int size)
     if (*buf == '\r' || *buf == '\n') {
         scon->event.event_pending = true;
         sclp_service_interrupt(0);
+        return;
+    }
+    if (scon->length == SIZE_CONSOLE_BUFFER) {
+        /* Eat the character, but still process CR and LF.  */
         return;
     }
     scon->buf[scon->length] = *buf;
@@ -112,7 +120,7 @@ static int get_console_data(SCLPEvent *event, uint8_t *buf, size_t *size,
 {
     int len;
 
-    SCLPConsoleLM *cons = DO_UPCAST(SCLPConsoleLM, event, event);
+    SCLPConsoleLM *cons = SCLPLM_CONSOLE(event);
 
     len = cons->length;
     /* data need to fit into provided SCLP buffer */
@@ -125,6 +133,7 @@ static int get_console_data(SCLPEvent *event, uint8_t *buf, size_t *size,
     cons->length = 0;
     /* data provided and no more data pending */
     event->event_pending = false;
+    qemu_notify_event();
     return 0;
 }
 
@@ -185,7 +194,7 @@ static int write_console_data(SCLPEvent *event, const uint8_t *buf, int len)
     int ret = 0;
     const uint8_t *buf_offset;
 
-    SCLPConsoleLM *scon = DO_UPCAST(SCLPConsoleLM, event, event);
+    SCLPConsoleLM *scon = SCLPLM_CONSOLE(event);
 
     if (!scon->chr) {
         /* If there's no backend, we can just say we consumed all data. */
@@ -239,7 +248,7 @@ static int write_event_data(SCLPEvent *event, EventBufferHeader *ebh)
     int errors = 0;
     MDBO *mdbo;
     SclpMsg *data = (SclpMsg *) ebh;
-    SCLPConsoleLM *scon = DO_UPCAST(SCLPConsoleLM, event, event);
+    SCLPConsoleLM *scon = SCLPLM_CONSOLE(event);
 
     len = be16_to_cpu(data->mdb.header.length);
     if (len < sizeof(data->mdb.header)) {
@@ -308,7 +317,7 @@ static int console_init(SCLPEvent *event)
 {
     static bool console_available;
 
-    SCLPConsoleLM *scon = DO_UPCAST(SCLPConsoleLM, event, event);
+    SCLPConsoleLM *scon = SCLPLM_CONSOLE(event);
 
     if (console_available) {
         error_report("Multiple line-mode operator consoles are not supported");
@@ -331,7 +340,7 @@ static int console_exit(SCLPEvent *event)
 static void console_reset(DeviceState *dev)
 {
    SCLPEvent *event = SCLP_EVENT(dev);
-   SCLPConsoleLM *scon = DO_UPCAST(SCLPConsoleLM, event, event);
+   SCLPConsoleLM *scon = SCLPLM_CONSOLE(event);
 
    event->event_pending = false;
    scon->length = 0;
@@ -360,6 +369,7 @@ static void console_class_init(ObjectClass *klass, void *data)
     ec->can_handle_event = can_handle_event;
     ec->read_event_data = read_event_data;
     ec->write_event_data = write_event_data;
+    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
 }
 
 static const TypeInfo sclp_console_info = {

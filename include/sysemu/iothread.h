@@ -33,8 +33,8 @@ typedef struct {
 #define IOTHREAD(obj) \
    OBJECT_CHECK(IOThread, obj, TYPE_IOTHREAD)
 
-IOThread *iothread_find(const char *id);
 char *iothread_get_id(IOThread *iothread);
 AioContext *iothread_get_aio_context(IOThread *iothread);
+void iothread_stop_all(void);
 
 #endif /* IOTHREAD_H */

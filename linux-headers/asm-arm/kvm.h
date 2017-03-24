@@ -25,6 +25,7 @@
 
 #define __KVM_HAVE_GUEST_DEBUG
 #define __KVM_HAVE_IRQ_LINE
+#define __KVM_HAVE_READONLY_MEM
 
 #define KVM_REG_SIZE(id)						\
 	(1U << (((id) & KVM_REG_SIZE_MASK) >> KVM_REG_SIZE_SHIFT))
@@ -138,8 +139,8 @@ struct kvm_arch_memory_slot {
 #define ARM_CP15_REG64(...) __ARM_CP15_REG64(__VA_ARGS__)
 
 #define KVM_REG_ARM_TIMER_CTL		ARM_CP15_REG32(0, 14, 3, 1)
-#define KVM_REG_ARM_TIMER_CNT		ARM_CP15_REG64(1, 14) 
-#define KVM_REG_ARM_TIMER_CVAL		ARM_CP15_REG64(3, 14) 
+#define KVM_REG_ARM_TIMER_CNT		ARM_CP15_REG64(1, 14)
+#define KVM_REG_ARM_TIMER_CVAL		ARM_CP15_REG64(3, 14)
 
 /* Normal registers are mapped as coprocessor 16. */
 #define KVM_REG_ARM_CORE		(0x0010 << KVM_REG_ARM_COPROC_SHIFT)
@@ -173,6 +174,9 @@ struct kvm_arch_memory_slot {
 #define   KVM_DEV_ARM_VGIC_CPUID_MASK	(0xffULL << KVM_DEV_ARM_VGIC_CPUID_SHIFT)
 #define   KVM_DEV_ARM_VGIC_OFFSET_SHIFT	0
 #define   KVM_DEV_ARM_VGIC_OFFSET_MASK	(0xffffffffULL << KVM_DEV_ARM_VGIC_OFFSET_SHIFT)
+#define KVM_DEV_ARM_VGIC_GRP_NR_IRQS	3
+#define KVM_DEV_ARM_VGIC_GRP_CTRL       4
+#define   KVM_DEV_ARM_VGIC_CTRL_INIT    0
 
 /* KVM_IRQ_LINE irq field index values */
 #define KVM_ARM_IRQ_TYPE_SHIFT		24
@@ -191,8 +195,15 @@ struct kvm_arch_memory_slot {
 #define KVM_ARM_IRQ_CPU_IRQ		0
 #define KVM_ARM_IRQ_CPU_FIQ		1
 
-/* Highest supported SPI, from VGIC_NR_IRQS */
+/*
+ * This used to hold the highest supported SPI, but it is now obsolete
+ * and only here to provide source code level compatibility with older
+ * userland. The highest SPI number can be set via KVM_DEV_ARM_VGIC_GRP_NR_IRQS.
+ */
 #define KVM_ARM_IRQ_GIC_MAX		127
+
+/* One single KVM irqchip, ie. the VGIC */
+#define KVM_NR_IRQCHIPS          1
 
 /* PSCI interface */
 #define KVM_PSCI_FN_BASE		0x95c1ba5e

@@ -11,16 +11,17 @@
  * GNU GPL, version 2 or (at your option) any later version.
  */
 
+#include "qemu/osdep.h"
 #include "hw/hw.h"
 #include "hw/arm/pxa.h"
 #include "hw/arm/arm.h"
 #include "hw/devices.h"
 #include "hw/i2c/i2c.h"
-#include "hw/ssi.h"
+#include "hw/ssi/ssi.h"
 #include "hw/boards.h"
 #include "sysemu/sysemu.h"
 #include "hw/block/flash.h"
-#include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
 #include "ui/console.h"
 #include "audio/audio.h"
 #include "exec/address-spaces.h"
@@ -150,14 +151,12 @@ static void z2_lcd_cs(void *opaque, int line, int level)
     z2_lcd->selected = !level;
 }
 
-static int zipit_lcd_init(SSISlave *dev)
+static void zipit_lcd_realize(SSISlave *dev, Error **errp)
 {
     ZipitLCD *z = FROM_SSI_SLAVE(ZipitLCD, dev);
     z->selected = 0;
     z->enabled = 0;
     z->pos = 0;
-
-    return 0;
 }
 
 static VMStateDescription vmstate_zipit_lcd_state = {
@@ -180,7 +179,7 @@ static void zipit_lcd_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     SSISlaveClass *k = SSI_SLAVE_CLASS(klass);
 
-    k->init = zipit_lcd_init;
+    k->realize = zipit_lcd_realize;
     k->transfer = zipit_lcd_transfer;
     dc->vmsd = &vmstate_zipit_lcd_state;
 }
@@ -336,9 +335,9 @@ static void z2_init(MachineState *machine)
 
     if (!pflash_cfi01_register(Z2_FLASH_BASE,
                                NULL, "z2.flash0", Z2_FLASH_SIZE,
-                               dinfo ? dinfo->bdrv : NULL, sector_len,
-                               Z2_FLASH_SIZE / sector_len, 4, 0, 0, 0, 0,
-                               be)) {
+                               dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
+                               sector_len, Z2_FLASH_SIZE / sector_len,
+                               4, 0, 0, 0, 0, be)) {
         fprintf(stderr, "qemu: Error registering flash memory.\n");
         exit(1);
     }
@@ -372,15 +371,10 @@ static void z2_init(MachineState *machine)
     arm_load_kernel(mpu->cpu, &z2_binfo);
 }
 
-static QEMUMachine z2_machine = {
-    .name = "z2",
-    .desc = "Zipit Z2 (PXA27x)",
-    .init = z2_init,
-};
-
-static void z2_machine_init(void)
+static void z2_machine_init(MachineClass *mc)
 {
-    qemu_register_machine(&z2_machine);
+    mc->desc = "Zipit Z2 (PXA27x)";
+    mc->init = z2_init;
 }
 
-machine_init(z2_machine_init);
+DEFINE_MACHINE("z2", z2_machine_init)

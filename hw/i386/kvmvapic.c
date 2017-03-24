@@ -8,6 +8,10 @@
  * (at your option) any later version. See the COPYING file in the
  * top-level directory.
  */
+#include "qemu/osdep.h"
+#include "qemu-common.h"
+#include "cpu.h"
+#include "exec/exec-all.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/cpus.h"
 #include "sysemu/kvm.h"
@@ -59,6 +63,7 @@ typedef struct VAPICROMState {
     GuestROMState rom_state;
     size_t rom_size;
     bool rom_mapped_writable;
+    VMChangeStateEntry *vmsentry;
 } VAPICROMState;
 
 #define TYPE_VAPIC "kvmvapic"
@@ -392,10 +397,10 @@ static void patch_instruction(VAPICROMState *s, X86CPU *cpu, target_ulong ip)
     CPUX86State *env = &cpu->env;
     VAPICHandlers *handlers;
     uint8_t opcode[2];
-    uint32_t imm32;
+    uint32_t imm32 = 0;
     target_ulong current_pc = 0;
     target_ulong current_cs_base = 0;
-    int current_flags = 0;
+    uint32_t current_flags = 0;
 
     if (smp_cpus == 1) {
         handlers = &s->rom_state.up;
@@ -404,7 +409,6 @@ static void patch_instruction(VAPICROMState *s, X86CPU *cpu, target_ulong ip)
     }
 
     if (!kvm_enabled()) {
-        cpu_restore_state(cs, cs->mem_io_pc);
         cpu_get_tb_cpu_state(env, &current_pc, &current_cs_base,
                              &current_flags);
     }
@@ -445,9 +449,8 @@ static void patch_instruction(VAPICROMState *s, X86CPU *cpu, target_ulong ip)
     resume_all_vcpus();
 
     if (!kvm_enabled()) {
-        cs->current_tb = NULL;
         tb_gen_code(cs, current_pc, current_cs_base, current_flags, 1);
-        cpu_resume_from_signal(cs, NULL);
+        cpu_loop_exit_noexc(cs);
     }
 }
 
@@ -584,7 +587,7 @@ static int vapic_map_rom_writable(VAPICROMState *s)
 
     if (s->rom_mapped_writable) {
         memory_region_del_subregion(as, &s->rom);
-        memory_region_destroy(&s->rom);
+        object_unparent(OBJECT(&s->rom));
     }
 
     /* grab RAM memory region (region @rom_paddr may still be pc.rom) */
@@ -634,13 +637,18 @@ static int vapic_prepare(VAPICROMState *s)
 static void vapic_write(void *opaque, hwaddr addr, uint64_t data,
                         unsigned int size)
 {
-    CPUState *cs = current_cpu;
-    X86CPU *cpu = X86_CPU(cs);
-    CPUX86State *env = &cpu->env;
-    hwaddr rom_paddr;
     VAPICROMState *s = opaque;
+    X86CPU *cpu;
+    CPUX86State *env;
+    hwaddr rom_paddr;
 
-    cpu_synchronize_state(cs);
+    if (!current_cpu) {
+        return;
+    }
+
+    cpu_synchronize_state(current_cpu);
+    cpu = X86_CPU(current_cpu);
+    env = &cpu->env;
 
     /*
      * The VAPIC supports two PIO-based hypercalls, both via port 0x7E.
@@ -731,13 +739,40 @@ static void do_vapic_enable(void *data)
     VAPICROMState *s = data;
     X86CPU *cpu = X86_CPU(first_cpu);
 
-    vapic_enable(s, cpu);
+    static const uint8_t enabled = 1;
+    cpu_physical_memory_write(s->vapic_paddr + offsetof(VAPICState, enabled),
+                              &enabled, sizeof(enabled));
+    apic_enable_vapic(cpu->apic_state, s->vapic_paddr);
+    s->state = VAPIC_ACTIVE;
+}
+
+static void kvmvapic_vm_state_change(void *opaque, int running,
+                                     RunState state)
+{
+    VAPICROMState *s = opaque;
+    uint8_t *zero;
+
+    if (!running) {
+        return;
+    }
+
+    if (s->state == VAPIC_ACTIVE) {
+        if (smp_cpus == 1) {
+            run_on_cpu(first_cpu, do_vapic_enable, s);
+        } else {
+            zero = g_malloc0(s->rom_state.vapic_size);
+            cpu_physical_memory_write(s->vapic_paddr, zero,
+                                      s->rom_state.vapic_size);
+            g_free(zero);
+        }
+    }
+
+    qemu_del_vm_change_state_handler(s->vmsentry);
 }
 
 static int vapic_post_load(void *opaque, int version_id)
 {
     VAPICROMState *s = opaque;
-    uint8_t *zero;
 
     /*
      * The old implementation of qemu-kvm did not provide the state
@@ -752,17 +787,11 @@ static int vapic_post_load(void *opaque, int version_id)
             return -1;
         }
     }
-    if (s->state == VAPIC_ACTIVE) {
-        if (smp_cpus == 1) {
-            run_on_cpu(first_cpu, do_vapic_enable, s);
-        } else {
-            zero = g_malloc0(s->rom_state.vapic_size);
-            cpu_physical_memory_write(s->vapic_paddr, zero,
-                                      s->rom_state.vapic_size);
-            g_free(zero);
-        }
-    }
 
+    if (!s->vmsentry) {
+        s->vmsentry =
+            qemu_add_vm_change_state_handler(kvmvapic_vm_state_change, s);
+    }
     return 0;
 }
 

@@ -20,10 +20,12 @@
  * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/osdep.h"
 #include "hw/pci/pci_ids.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/pcie.h"
 #include "ioh3420.h"
+#include "qapi/error.h"
 
 #define PCI_DEVICE_ID_IOH_EPORT         0x3420  /* D0:F0 express mode */
 #define PCI_DEVICE_ID_IOH_REV           0x2
@@ -85,6 +87,7 @@ static void ioh3420_reset(DeviceState *qdev)
     pcie_cap_root_reset(d);
     pcie_cap_deverr_reset(d);
     pcie_cap_slot_reset(d);
+    pcie_cap_arifwd_reset(d);
     pcie_aer_root_reset(d);
     pci_bridge_reset(qdev);
     pci_bridge_disable_base_limit(d);
@@ -95,12 +98,10 @@ static int ioh3420_initfn(PCIDevice *d)
     PCIEPort *p = PCIE_PORT(d);
     PCIESlot *s = PCIE_SLOT(d);
     int rc;
+    Error *err = NULL;
 
-    rc = pci_bridge_initfn(d, TYPE_PCIE_BUS);
-    if (rc < 0) {
-        return rc;
-    }
-
+    pci_config_set_interrupt_pin(d->config, 1);
+    pci_bridge_initfn(d, TYPE_PCIE_BUS);
     pcie_port_init_reg(d);
 
     rc = pci_bridge_ssvid_init(d, IOH_EP_SSVID_OFFSET,
@@ -108,30 +109,39 @@ static int ioh3420_initfn(PCIDevice *d)
     if (rc < 0) {
         goto err_bridge;
     }
+
     rc = msi_init(d, IOH_EP_MSI_OFFSET, IOH_EP_MSI_NR_VECTOR,
                   IOH_EP_MSI_SUPPORTED_FLAGS & PCI_MSI_FLAGS_64BIT,
-                  IOH_EP_MSI_SUPPORTED_FLAGS & PCI_MSI_FLAGS_MASKBIT);
+                  IOH_EP_MSI_SUPPORTED_FLAGS & PCI_MSI_FLAGS_MASKBIT, &err);
     if (rc < 0) {
+        assert(rc == -ENOTSUP);
+        error_report_err(err);
         goto err_bridge;
     }
+
     rc = pcie_cap_init(d, IOH_EP_EXP_OFFSET, PCI_EXP_TYPE_ROOT_PORT, p->port);
     if (rc < 0) {
         goto err_msi;
     }
+
+    pcie_cap_arifwd_init(d);
     pcie_cap_deverr_init(d);
     pcie_cap_slot_init(d, s->slot);
+    pcie_cap_root_init(d);
+
     pcie_chassis_create(s->chassis);
     rc = pcie_chassis_add_slot(s);
     if (rc < 0) {
         goto err_pcie_cap;
     }
-    pcie_cap_root_init(d);
-    rc = pcie_aer_init(d, IOH_EP_AER_OFFSET);
+
+    rc = pcie_aer_init(d, IOH_EP_AER_OFFSET, PCI_ERR_SIZEOF);
     if (rc < 0) {
         goto err;
     }
     pcie_aer_root_init(d);
     ioh3420_aer_vector_update(d);
+
     return 0;
 
 err:
@@ -154,30 +164,6 @@ static void ioh3420_exitfn(PCIDevice *d)
     pcie_cap_exit(d);
     msi_uninit(d);
     pci_bridge_exitfn(d);
-}
-
-PCIESlot *ioh3420_init(PCIBus *bus, int devfn, bool multifunction,
-                         const char *bus_name, pci_map_irq_fn map_irq,
-                         uint8_t port, uint8_t chassis, uint16_t slot)
-{
-    PCIDevice *d;
-    PCIBridge *br;
-    DeviceState *qdev;
-
-    d = pci_create_multifunction(bus, devfn, multifunction, "ioh3420");
-    if (!d) {
-        return NULL;
-    }
-    br = PCI_BRIDGE(d);
-
-    qdev = DEVICE(d);
-    pci_bridge_map_irq(br, bus_name, map_irq);
-    qdev_prop_set_uint8(qdev, "port", port);
-    qdev_prop_set_uint8(qdev, "chassis", chassis);
-    qdev_prop_set_uint16(qdev, "slot", slot);
-    qdev_init_nofail(qdev);
-
-    return PCIE_SLOT(d);
 }
 
 static Property ioh3420_props[] = {
@@ -231,12 +217,3 @@ static void ioh3420_register_types(void)
 }
 
 type_init(ioh3420_register_types)
-
-/*
- * Local variables:
- *  c-indent-level: 4
- *  c-basic-offset: 4
- *  tab-width: 8
- *  indent-tab-mode: nil
- * End:
- */

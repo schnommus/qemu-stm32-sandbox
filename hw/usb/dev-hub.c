@@ -21,6 +21,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "qemu-common.h"
 #include "trace.h"
 #include "hw/usb.h"
@@ -40,6 +42,9 @@ typedef struct USBHubState {
     USBEndpoint *intr;
     USBHubPort ports[NUM_PORTS];
 } USBHubState;
+
+#define TYPE_USB_HUB "usb-hub"
+#define USB_HUB(obj) OBJECT_CHECK(USBHubState, (obj), TYPE_USB_HUB)
 
 #define ClearHubFeature		(0x2000 | USB_REQ_CLEAR_FEATURE)
 #define ClearPortFeature	(0x2300 | USB_REQ_CLEAR_FEATURE)
@@ -227,7 +232,7 @@ static void usb_hub_complete(USBPort *port, USBPacket *packet)
 
 static USBDevice *usb_hub_find_device(USBDevice *dev, uint8_t addr)
 {
-    USBHubState *s = DO_UPCAST(USBHubState, dev, dev);
+    USBHubState *s = USB_HUB(dev);
     USBHubPort *port;
     USBDevice *downstream;
     int i;
@@ -247,7 +252,7 @@ static USBDevice *usb_hub_find_device(USBDevice *dev, uint8_t addr)
 
 static void usb_hub_handle_reset(USBDevice *dev)
 {
-    USBHubState *s = DO_UPCAST(USBHubState, dev, dev);
+    USBHubState *s = USB_HUB(dev);
     USBHubPort *port;
     int i;
 
@@ -511,15 +516,15 @@ static USBPortOps usb_hub_port_ops = {
     .complete = usb_hub_complete,
 };
 
-static int usb_hub_initfn(USBDevice *dev)
+static void usb_hub_realize(USBDevice *dev, Error **errp)
 {
-    USBHubState *s = DO_UPCAST(USBHubState, dev, dev);
+    USBHubState *s = USB_HUB(dev);
     USBHubPort *port;
     int i;
 
     if (dev->port->hubcount == 5) {
-        error_report("usb hub chain too deep");
-        return -1;
+        error_setg(errp, "usb hub chain too deep");
+        return;
     }
 
     usb_desc_create_serial(dev);
@@ -533,7 +538,6 @@ static int usb_hub_initfn(USBDevice *dev)
         usb_port_location(&port->port, dev->port, i+1);
     }
     usb_hub_handle_reset(dev);
-    return 0;
 }
 
 static const VMStateDescription vmstate_usb_hub_port = {
@@ -564,7 +568,7 @@ static void usb_hub_class_initfn(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
 
-    uc->init           = usb_hub_initfn;
+    uc->realize        = usb_hub_realize;
     uc->product_desc   = "QEMU USB Hub";
     uc->usb_desc       = &desc_hub;
     uc->find_device    = usb_hub_find_device;
@@ -578,7 +582,7 @@ static void usb_hub_class_initfn(ObjectClass *klass, void *data)
 }
 
 static const TypeInfo hub_info = {
-    .name          = "usb-hub",
+    .name          = TYPE_USB_HUB,
     .parent        = TYPE_USB_DEVICE,
     .instance_size = sizeof(USBHubState),
     .class_init    = usb_hub_class_initfn,

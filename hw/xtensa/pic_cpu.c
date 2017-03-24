@@ -25,20 +25,22 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "qemu/osdep.h"
+#include "cpu.h"
 #include "hw/hw.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
 
 void xtensa_advance_ccount(CPUXtensaState *env, uint32_t d)
 {
-    uint32_t old_ccount = env->sregs[CCOUNT];
+    uint32_t old_ccount = env->sregs[CCOUNT] + 1;
 
     env->sregs[CCOUNT] += d;
 
     if (xtensa_option_enabled(env->config, XTENSA_OPTION_TIMER_INTERRUPT)) {
         int i;
         for (i = 0; i < env->config->nccompare; ++i) {
-            if (env->sregs[CCOMPARE + i] - old_ccount <= d) {
+            if (env->sregs[CCOMPARE + i] - old_ccount < d) {
                 xtensa_timer_irq(env, i, 1);
             }
         }
@@ -120,8 +122,8 @@ void xtensa_rearm_ccompare_timer(CPUXtensaState *env)
     }
     env->wake_ccount = wake_ccount;
     timer_mod(env->ccompare_timer, env->halt_clock +
-            muldiv64(wake_ccount - env->sregs[CCOUNT],
-                1000000, env->config->clock_freq_khz));
+            (uint64_t)(wake_ccount - env->sregs[CCOUNT]) *
+            1000000 / env->config->clock_freq_khz);
 }
 
 static void xtensa_ccompare_cb(void *opaque)

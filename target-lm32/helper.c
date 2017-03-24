@@ -17,9 +17,13 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/osdep.h"
 #include "cpu.h"
+#include "exec/exec-all.h"
 #include "qemu/host-utils.h"
 #include "sysemu/sysemu.h"
+#include "exec/semihost.h"
+#include "exec/log.h"
 
 int lm32_cpu_handle_mmu_fault(CPUState *cs, vaddr address, int rw,
                               int mmu_idx)
@@ -80,7 +84,7 @@ void lm32_watchpoint_insert(CPULM32State *env, int idx, target_ulong address,
 
     switch (wp_type) {
     case LM32_WP_DISABLED:
-        /* nothing to to */
+        /* nothing to do */
         break;
     case LM32_WP_READ:
         flags = BP_CPU | BP_STOP_BEFORE_ACCESS | BP_MEM_READ;
@@ -125,9 +129,10 @@ static bool check_watchpoints(CPULM32State *env)
     return false;
 }
 
-void lm32_debug_excp_handler(CPULM32State *env)
+void lm32_debug_excp_handler(CPUState *cs)
 {
-    CPUState *cs = CPU(lm32_env_get_cpu(env));
+    LM32CPU *cpu = LM32_CPU(cs);
+    CPULM32State *env = &cpu->env;
     CPUBreakpoint *bp;
 
     if (cs->watchpoint_hit) {
@@ -136,7 +141,7 @@ void lm32_debug_excp_handler(CPULM32State *env)
             if (check_watchpoints(env)) {
                 raise_exception(env, EXCP_WATCHPOINT);
             } else {
-                cpu_resume_from_signal(cs, NULL);
+                cpu_loop_exit_noexc(cs);
             }
         }
     } else {
@@ -161,7 +166,7 @@ void lm32_cpu_do_interrupt(CPUState *cs)
 
     switch (cs->exception_index) {
     case EXCP_SYSTEMCALL:
-        if (unlikely(semihosting_enabled)) {
+        if (unlikely(semihosting_enabled())) {
             /* do_semicall() returns true if call was handled. Otherwise
              * do the normal exception handling. */
             if (lm32_cpu_do_semihosting(cs)) {
@@ -199,6 +204,19 @@ void lm32_cpu_do_interrupt(CPUState *cs)
                   cs->exception_index);
         break;
     }
+}
+
+bool lm32_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+{
+    LM32CPU *cpu = LM32_CPU(cs);
+    CPULM32State *env = &cpu->env;
+
+    if ((interrupt_request & CPU_INTERRUPT_HARD) && (env->ie & IE_IE)) {
+        cs->exception_index = EXCP_IRQ;
+        lm32_cpu_do_interrupt(cs);
+        return true;
+    }
+    return false;
 }
 
 LM32CPU *cpu_lm32_init(const char *cpu_model)
