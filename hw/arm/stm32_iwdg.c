@@ -18,6 +18,7 @@
  *
  */
 
+#include "qemu/osdep.h"
 #include "hw/sysbus.h"
 #include "hw/arm/stm32.h"
 #include "qemu/timer.h"
@@ -292,7 +293,7 @@ static const VMStateDescription vmstate_iwdg = {
     .fields = (VMStateField[]) {
         VMSTATE_INT32(reboot_enabled, Stm32Iwdg),
         VMSTATE_INT32(enabled, Stm32Iwdg),
-        VMSTATE_TIMER(timer, Stm32Iwdg),
+        VMSTATE_TIMER_PTR(timer, Stm32Iwdg),
         VMSTATE_UINT32(timer_reload, Stm32Iwdg),
         VMSTATE_INT32(unlock_state, Stm32Iwdg),
         VMSTATE_INT32(previous_reboot_flag, Stm32Iwdg),

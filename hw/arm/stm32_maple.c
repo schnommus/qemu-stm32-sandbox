@@ -22,6 +22,7 @@
  * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/osdep.h"
 #include "hw/arm/stm32.h"
 #include "hw/sysbus.h"
 #include "hw/arm/arm.h"
@@ -160,16 +161,10 @@ static void stm32_maple_init(MachineState *machine)
                         serial_hds[1], STM32_USART2_NO_REMAP);
 }
 
-static QEMUMachine stm32_maple_machine = {
-        .name = "stm32-maple",
-        .desc = "OPEN SOURCE HARDWARE MAPLE / ARDUINO LIKE DEVELOPMENT BOARD",
-        .init = stm32_maple_init,
-};
-
-
-static void stm32_maple_machine_init(void)
+static void stm32_maple_machine_init(MachineClass *mc)
 {
-        qemu_register_machine(&stm32_maple_machine);
+    mc->desc = "OPEN SOURCE HARDWARE MAPLE / ARDUINO LIKE DEVELOPMENT BOARD";
+    mc->init = stm32_maple_init;
 }
 
-machine_init(stm32_maple_machine_init);
+DEFINE_MACHINE("stm32-maple", stm32_maple_machine_init)

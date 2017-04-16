@@ -20,6 +20,7 @@
  * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/osdep.h"
 #include "hw/arm/stm32.h"
 #include "hw/arm/stm32_clktree.h"
 #include "qemu/bitops.h"
@@ -691,6 +692,16 @@ static void stm32_rcc_write(void *opaque, hwaddr offset,
         case 4:
             stm32_rcc_writew(opaque, offset, value);
             break;
+		case 1:
+			if(offset % 4 == 0)
+			{
+				stm32_rcc_writew(opaque, offset, value);
+			}
+			else
+			{
+				STM32_NOT_IMPL_REG(offset, size);
+			}
+			break;
         default:
             STM32_NOT_IMPL_REG(offset, size);
             break;
@@ -734,8 +745,8 @@ static void stm32_rcc_hclk_upd_irq_handler(void *opaque, int n, int level)
          * (which is an unchanging number independent of the CPU frequency) to
          * system/external clock ticks.
          */
-        system_clock_scale = get_ticks_per_sec() / hclk_freq;
-        external_ref_clock_scale = get_ticks_per_sec() / ext_ref_freq;
+        system_clock_scale = NANOSECONDS_PER_SECOND / hclk_freq;
+        external_ref_clock_scale = NANOSECONDS_PER_SECOND / ext_ref_freq;
     }
 
 #ifdef DEBUG_STM32_RCC

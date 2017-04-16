@@ -19,6 +19,8 @@
  * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "hw/arm/stm32.h"
 #include "exec/address-spaces.h"
 #include "exec/gdbstub.h"
@@ -53,12 +55,20 @@ const char *stm32_periph_name_arr[] =
      "GPIOE",
      "GPIOF",
      "GPIOG",
+	 "GPIOH",
+	 "GPIOI",
+	 "GPIOJ",
+	 "GPIOK",
+	 "SYSCFG",
      "AFIO",
      "UART1",
      "UART2",
      "UART3",
      "UART4",
      "UART5",
+	 "UART6",
+	 "UART7",
+	 "UART8",
      "ADC1",
      "ADC2",
      "ADC3",
@@ -71,14 +81,21 @@ const char *stm32_periph_name_arr[] =
      "TIM6",
      "TIM7",
      "TIM8",
+	 "TIM9",
+	 "TIM10",
+	 "TIM11",
+	 "TIM12",
+	 "TIM13",
+	 "TIM14",
      "BKP",
      "PWR",
      "I2C1",
      "I2C2",
+	 "I2C3",
      "I2S1",
      "I2S2",
-     "IWDG"
-     "WWDG",
+     "WWDG"
+     "IWDG",
      "CAN1",
      "CAN2",
      "CAN",
@@ -148,10 +165,8 @@ static void stm32_create_timer_dev(
         DeviceState **gpio_dev,
         DeviceState *afio_dev,
         hwaddr addr,
-        qemu_irq *irq,
-        int num_irqs)
+        qemu_irq irq)
 {
-    int i;
     char child_name[9];
     DeviceState *timer_dev = qdev_create(NULL, "stm32-timer");
     QDEV_PROP_SET_PERIPH_T(timer_dev, "periph", periph);
@@ -161,11 +176,7 @@ static void stm32_create_timer_dev(
     snprintf(child_name, sizeof(child_name), "timer[%i]", timer_num);
     object_property_add_child(stm32_container, child_name, OBJECT(timer_dev), NULL);
     stm32_init_periph(timer_dev, periph, addr, NULL);
-    for (i = 0; i < num_irqs; i++) {
-      if (irq[i]) {
-        sysbus_connect_irq(SYS_BUS_DEVICE(timer_dev), 0, irq[i]);
-      }
-    }
+    sysbus_connect_irq(SYS_BUS_DEVICE(timer_dev), 0, irq);
 }
 
 static void stm32_create_adc_dev(
@@ -233,21 +244,18 @@ void stm32_init(
             uint32_t osc_freq,
             uint32_t osc32_freq)
 {
-    MemoryRegion *address_space_mem = get_system_memory();
-    MemoryRegion *flash_alias_mem = g_malloc(sizeof(MemoryRegion));
-    qemu_irq *pic;
+    MemoryRegion *system_memory = get_system_memory();
+    MemoryRegion *sram = g_new(MemoryRegion, 1);
+    MemoryRegion *flash = g_new(MemoryRegion, 1);
+    MemoryRegion *flash_alias = g_new(MemoryRegion, 1);
+
+    DeviceState *nvic;
     int i;
 
     Object *stm32_container = container_get(qdev_get_machine(), "/stm32");
 
-    pic = armv7m_init(
-              stm32_container,
-              address_space_mem,
-              flash_size,
-              ram_size,
-              kernel_filename,
-              "cortex-m3");
-
+    memory_region_init_ram(flash, NULL, "stm32-flash", flash_size,
+                           &error_fatal);
     /* The STM32 family stores its Flash memory at some base address in memory
      * (0x08000000 for medium density devices), and then aliases it to the
      * boot memory space, which starts at 0x00000000 (the "System Memory" can also
@@ -259,19 +267,39 @@ void stm32_init(
      * 0x08000000, but it works the same either way. */
     /* TODO: Parameterize the base address of the aliased memory. */
     memory_region_init_alias(
-            flash_alias_mem,
+            flash_alias,
             NULL,
             "stm32-flash-alias-mem",
-            address_space_mem,
+            system_memory,
             0,
             flash_size);
-    memory_region_add_subregion(address_space_mem, 0x08000000, flash_alias_mem);
+	
+	vmstate_register_ram_global(flash);
+	
+	memory_region_set_readonly(flash, true);
+    memory_region_set_readonly(flash_alias, true);
+	
+	memory_region_add_subregion(system_memory, 0, flash);
+    memory_region_add_subregion(system_memory, 0x08000000, flash_alias);
+	
+	memory_region_init_ram(sram, NULL, "stm32-sram", ram_size,
+                           &error_fatal);
+    vmstate_register_ram_global(sram);
+    memory_region_add_subregion(system_memory, 0x20000000, sram);
+	
+	nvic = armv7m_init(
+              stm32_container,
+              system_memory,
+              flash_size,
+              64,
+              kernel_filename,
+              "cortex-m3");
 
     DeviceState *rcc_dev = qdev_create(NULL, "stm32-rcc");
     qdev_prop_set_uint32(rcc_dev, "osc_freq", osc_freq);
     qdev_prop_set_uint32(rcc_dev, "osc32_freq", osc32_freq);
     object_property_add_child(stm32_container, "rcc", OBJECT(rcc_dev), NULL);
-    stm32_init_periph(rcc_dev, STM32_RCC_PERIPH, 0x40021000, pic[STM32_RCC_IRQ]);
+    stm32_init_periph(rcc_dev, STM32_RCC_PERIPH, 0x40021000, qdev_get_gpio_in(nvic, STM32_RCC_IRQ));
 
     DeviceState **gpio_dev = (DeviceState **)g_malloc0(sizeof(DeviceState *) * STM32_GPIO_COUNT);
     for(i = 0; i < STM32_GPIO_COUNT; i++) {
@@ -289,16 +317,16 @@ void stm32_init(
     object_property_add_child(stm32_container, "exti", OBJECT(exti_dev), NULL);
     stm32_init_periph(exti_dev, STM32_EXTI_PERIPH, 0x40010400, NULL);
     SysBusDevice *exti_busdev = SYS_BUS_DEVICE(exti_dev);
-    sysbus_connect_irq(exti_busdev, 0, pic[STM32_EXTI0_IRQ]);
-    sysbus_connect_irq(exti_busdev, 1, pic[STM32_EXTI1_IRQ]);
-    sysbus_connect_irq(exti_busdev, 2, pic[STM32_EXTI2_IRQ]);
-    sysbus_connect_irq(exti_busdev, 3, pic[STM32_EXTI3_IRQ]);
-    sysbus_connect_irq(exti_busdev, 4, pic[STM32_EXTI4_IRQ]);
-    sysbus_connect_irq(exti_busdev, 5, pic[STM32_EXTI9_5_IRQ]);
-    sysbus_connect_irq(exti_busdev, 6, pic[STM32_EXTI15_10_IRQ]);
-    sysbus_connect_irq(exti_busdev, 7, pic[STM32_PVD_IRQ]);
-    sysbus_connect_irq(exti_busdev, 8, pic[STM32_RTCAlarm_IRQ]);
-    sysbus_connect_irq(exti_busdev, 9, pic[STM32_OTG_FS_WKUP_IRQ]);
+    sysbus_connect_irq(exti_busdev, 0, qdev_get_gpio_in(nvic, STM32_EXTI0_IRQ));
+    sysbus_connect_irq(exti_busdev, 1, qdev_get_gpio_in(nvic, STM32_EXTI1_IRQ));
+    sysbus_connect_irq(exti_busdev, 2, qdev_get_gpio_in(nvic, STM32_EXTI2_IRQ));
+    sysbus_connect_irq(exti_busdev, 3, qdev_get_gpio_in(nvic, STM32_EXTI3_IRQ));
+    sysbus_connect_irq(exti_busdev, 4, qdev_get_gpio_in(nvic, STM32_EXTI4_IRQ));
+    sysbus_connect_irq(exti_busdev, 5, qdev_get_gpio_in(nvic, STM32_EXTI9_5_IRQ));
+    sysbus_connect_irq(exti_busdev, 6, qdev_get_gpio_in(nvic, STM32_EXTI15_10_IRQ));
+    sysbus_connect_irq(exti_busdev, 7, qdev_get_gpio_in(nvic, STM32_PVD_IRQ));
+    sysbus_connect_irq(exti_busdev, 8, qdev_get_gpio_in(nvic, STM32_RTCAlarm_IRQ));
+    sysbus_connect_irq(exti_busdev, 9, qdev_get_gpio_in(nvic, STM32_OTG_FS_WKUP_IRQ));
 
     DeviceState *afio_dev = qdev_create(NULL, TYPE_STM32_AFIO);
     qdev_prop_set_ptr(afio_dev, "stm32_rcc", rcc_dev);
@@ -313,22 +341,22 @@ void stm32_init(
     object_property_add_child(stm32_container, "afio", OBJECT(afio_dev), NULL);
     stm32_init_periph(afio_dev, STM32_AFIO_PERIPH, 0x40010000, NULL);
 
-    stm32_create_uart_dev(stm32_container, STM32_UART1, 1, rcc_dev, gpio_dev, afio_dev, 0x40013800, pic[STM32_UART1_IRQ]);
-    stm32_create_uart_dev(stm32_container, STM32_UART2, 2, rcc_dev, gpio_dev, afio_dev, 0x40004400, pic[STM32_UART2_IRQ]);
-    stm32_create_uart_dev(stm32_container, STM32_UART3, 3, rcc_dev, gpio_dev, afio_dev, 0x40004800, pic[STM32_UART3_IRQ]);
-    stm32_create_uart_dev(stm32_container, STM32_UART4, 4, rcc_dev, gpio_dev, afio_dev, 0x40004c00, pic[STM32_UART4_IRQ]);
-    stm32_create_uart_dev(stm32_container, STM32_UART5, 5, rcc_dev, gpio_dev, afio_dev, 0x40005000, pic[STM32_UART5_IRQ]);
+    stm32_create_uart_dev(stm32_container, STM32_UART1, 1, rcc_dev, gpio_dev, afio_dev, 0x40013800, qdev_get_gpio_in(nvic, STM32_UART1_IRQ));
+    stm32_create_uart_dev(stm32_container, STM32_UART2, 2, rcc_dev, gpio_dev, afio_dev, 0x40004400, qdev_get_gpio_in(nvic, STM32_UART2_IRQ));
+    stm32_create_uart_dev(stm32_container, STM32_UART3, 3, rcc_dev, gpio_dev, afio_dev, 0x40004800, qdev_get_gpio_in(nvic, STM32_UART3_IRQ));
+    stm32_create_uart_dev(stm32_container, STM32_UART4, 4, rcc_dev, gpio_dev, afio_dev, 0x40004c00, qdev_get_gpio_in(nvic, STM32_UART4_IRQ));
+    stm32_create_uart_dev(stm32_container, STM32_UART5, 5, rcc_dev, gpio_dev, afio_dev, 0x40005000, qdev_get_gpio_in(nvic, STM32_UART5_IRQ));
 
     /* Timer 1 has four interrupts but only the TIM1 Update interrupt is implemented. */
     /*qemu_irq tim1_irqs[] = { pic[TIM1_BRK_IRQn], pic[TIM1_UP_IRQn], pic[TIM1_TRG_COM_IRQn], pic[TIM1_CC_IRQn]};*/
-    stm32_create_timer_dev(stm32_container, STM32_TIM1, 1, rcc_dev, gpio_dev, afio_dev, 0x40012C00, &pic[TIM1_UP_IRQn], 1);
+    stm32_create_timer_dev(stm32_container, STM32_TIM1, 1, rcc_dev, gpio_dev, afio_dev, 0x40012C00, qdev_get_gpio_in(nvic, TIM1_UP_IRQn));
 
-    stm32_create_timer_dev(stm32_container, STM32_TIM2, 1, rcc_dev, gpio_dev, afio_dev, 0x40000000, &pic[TIM2_IRQn], 1);
-    stm32_create_timer_dev(stm32_container, STM32_TIM3, 1, rcc_dev, gpio_dev, afio_dev, 0x40000400, &pic[TIM3_IRQn], 1);
-    stm32_create_timer_dev(stm32_container, STM32_TIM4, 1, rcc_dev, gpio_dev, afio_dev, 0x40000800, &pic[TIM4_IRQn], 1);
-    stm32_create_timer_dev(stm32_container, STM32_TIM5, 1, rcc_dev, gpio_dev, afio_dev, 0x40000C00, &pic[TIM5_IRQn], 1);
+    stm32_create_timer_dev(stm32_container, STM32_TIM2, 1, rcc_dev, gpio_dev, afio_dev, 0x40000000, qdev_get_gpio_in(nvic, TIM2_IRQn));
+    stm32_create_timer_dev(stm32_container, STM32_TIM3, 1, rcc_dev, gpio_dev, afio_dev, 0x40000400, qdev_get_gpio_in(nvic, TIM3_IRQn));
+    stm32_create_timer_dev(stm32_container, STM32_TIM4, 1, rcc_dev, gpio_dev, afio_dev, 0x40000800, qdev_get_gpio_in(nvic, TIM4_IRQn));
+    stm32_create_timer_dev(stm32_container, STM32_TIM5, 1, rcc_dev, gpio_dev, afio_dev, 0x40000C00, qdev_get_gpio_in(nvic, TIM5_IRQn));
     stm32_create_adc_dev(stm32_container, STM32_ADC1, 1, rcc_dev, gpio_dev, 0x40012400,0 );
-    stm32_create_rtc_dev(stm32_container,STM32_RTC, 1, rcc_dev, 0x40002800,pic[STM32_RTC_IRQ]);
+    stm32_create_rtc_dev(stm32_container,STM32_RTC, 1, rcc_dev, 0x40002800, qdev_get_gpio_in(nvic, STM32_RTC_IRQ));
     stm32_create_dac_dev(stm32_container,STM32_DAC, rcc_dev,gpio_dev, 0x40007400,0);
     
     /* IWDG */

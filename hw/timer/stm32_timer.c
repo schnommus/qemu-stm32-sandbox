@@ -19,6 +19,7 @@
  * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/osdep.h"
 #include "hw/sysbus.h"
 #include "qemu/timer.h"
 #include "sysemu/sysemu.h"
@@ -470,7 +471,7 @@ static void stm32_timer_pre_save(void *opaque)
     /* tick_offset is base_time - rtc_clock base time.  Instead, we want to
      * store the base time relative to the vm_clock for backwards-compatibility.  */
     //int64_t delta = qemu_get_clock_ns(rtc_clock) - qemu_get_clock_ns(vm_clock);
-    //s->tick_offset_vmstate = s->tick_offset + delta / get_ticks_per_sec();
+    //s->tick_offset_vmstate = s->tick_offset + delta / NANOSECONDS_PER_SECOND;
 }
 
 static int stm32_timer_post_load(void *opaque, int version_id)
@@ -478,7 +479,7 @@ static int stm32_timer_post_load(void *opaque, int version_id)
     //Stm32Timer *s = opaque;
 
     //int64_t delta = qemu_get_clock_ns(rtc_clock) - qemu_get_clock_ns(vm_clock);
-    //s->tick_offset = s->tick_offset_vmstate - delta / get_ticks_per_sec();
+    //s->tick_offset = s->tick_offset_vmstate - delta / NANOSECONDS_PER_SECOND;
     //stm32_timer_set_alarm(s);
     return 0;
 }

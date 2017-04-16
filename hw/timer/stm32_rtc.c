@@ -20,6 +20,7 @@
  * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/osdep.h"
 #include "hw/arm/stm32.h"
 #include "hw/arm/stm32_clktree.h"
 #include "qemu/bitops.h"
@@ -31,7 +32,7 @@
 /* DEFINITIONS*/
 
 /* See README for DEBUG details. */
-//#define DEBUG_STM32_RCC
+//#define DEBUG_STM32_RTC
 
 #ifdef DEBUG_STM32_RTC
 #define DPRINTF(fmt, ...)                                       \
@@ -228,7 +229,6 @@ static uint64_t stm32_rtc_read(void *opaque, hwaddr offset,
 static void stm32_rtc_write(void *opaque, hwaddr offset,
                        uint64_t value, unsigned size)
 { 
-
 
       Stm32Rtc *s = (Stm32Rtc *)opaque;
     /* software can only write in (PRL,ALR,CNT)
