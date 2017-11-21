@@ -95,16 +95,15 @@ static void stm32_p103_key_event(void *opaque, int keycode)
 
 static void stm32_p103_init(MachineState *machine)
 {
-    const char* kernel_filename = machine->kernel_filename;
     qemu_irq *led_irq;
     Stm32P103 *s;
 	int i;
 
     s = (Stm32P103 *)g_malloc0(sizeof(Stm32P103));
 
-    stm32_init(/*flash_size*/0x0001ffff,
+    stm32_init(machine,
+               /*flash_size*/0x0001ffff,
                /*ram_size*/0x00004fff,
-               kernel_filename,
                8000000,
                32768);
     
@@ -134,7 +133,7 @@ static void stm32_p103_init(MachineState *machine)
     {
         stm32_uart_connect(
                 (Stm32Uart *)uarts[i],
-                i < MAX_SERIAL_PORTS ? serial_hds[i] : NULL,
+                i < MAX_SERIAL_PORTS ? serial_hds[i]->be : NULL,
                 STM32_USART1_NO_REMAP);
     }
  }

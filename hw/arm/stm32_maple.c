@@ -118,14 +118,13 @@ static void stm32_maple_key_event(void *opaque, int keycode)
 
 static void stm32_maple_init(MachineState *machine)
 {
-        const char *kernel_filename = machine->kernel_filename;
         qemu_irq *led_irq, *led_err_irq;
         Stm32Maple *s;
 
         s = (Stm32Maple *) g_malloc0(sizeof(Stm32Maple));
 
         /* flash, then ram */
-        stm32_init(0x0001ffff, 0x00004fff, kernel_filename, 8000000, 32768);
+        stm32_init(machine, 0x0001ffff, 0x00004fff, 8000000, 32768);
 
 
         DeviceState *gpio_a = DEVICE(object_resolve_path("/machine/stm32/gpio[a]", NULL));
@@ -154,11 +153,11 @@ static void stm32_maple_init(MachineState *machine)
 
         /* Connect RS232 to UART */
         stm32_uart_connect((Stm32Uart *) uart1, 
-                        serial_hds[0], STM32_USART1_NO_REMAP);
+                        serial_hds[0]->be, STM32_USART1_NO_REMAP);
 
         /* useful for debugging */
         stm32_uart_connect((Stm32Uart *) uart2, 
-                        serial_hds[1], STM32_USART2_NO_REMAP);
+                        serial_hds[1]->be, STM32_USART2_NO_REMAP);
 }
 
 static void stm32_maple_machine_init(MachineClass *mc)

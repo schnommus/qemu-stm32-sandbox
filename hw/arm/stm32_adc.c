@@ -23,7 +23,7 @@
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
 #include "hw/arm/stm32.h"
-#include "sysemu/char.h"
+#include "chardev/char-fe.h"
 #include "qemu/bitops.h"
 #include <math.h>       // for the sine wave generation
 #include <inttypes.h>
@@ -630,7 +630,7 @@ struct Stm32Adc {
 
     struct QEMUTimer *conv_timer;
 
-    CharDriverState *chr;
+    CharBackend *chr;
 
     uint32_t afio_board_map;
 

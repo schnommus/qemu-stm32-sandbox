@@ -22,6 +22,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "hw/arm/stm32.h"
+#include "hw/boards.h"
 #include "exec/address-spaces.h"
 #include "exec/gdbstub.h"
 
@@ -238,9 +239,9 @@ static void stm32_create_dac_dev(
 
 
 void stm32_init(
+            MachineState *ms,
             ram_addr_t flash_size,
             ram_addr_t ram_size,
-            const char *kernel_filename,
             uint32_t osc_freq,
             uint32_t osc32_freq)
 {
@@ -288,11 +289,10 @@ void stm32_init(
     memory_region_add_subregion(system_memory, 0x20000000, sram);
 	
 	nvic = armv7m_init(
-              stm32_container,
               system_memory,
               flash_size,
               64,
-              kernel_filename,
+              ms->kernel_filename,
               "cortex-m3");
 
     DeviceState *rcc_dev = qdev_create(NULL, "stm32-rcc");

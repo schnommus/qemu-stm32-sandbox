@@ -375,9 +375,9 @@ typedef struct Stm32 Stm32;
 /* Initialize the STM32 microcontroller.  Returns arrays
  * of GPIOs and UARTs so that connections can be made. */
 void stm32_init(
+            MachineState *ms,
             ram_addr_t flash_size,
             ram_addr_t ram_size,
-            const char *kernel_filename,
             uint32_t osc_freq,
             uint32_t osc32_freq);
 
