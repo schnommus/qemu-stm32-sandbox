@@ -55,15 +55,6 @@ static void idebus_unrealize(BusState *bus, Error **errp)
     }
 }
 
-static void idebus_unrealize(DeviceState *qdev, Error **errp)
-{
-    IDEBus *bus = DO_UPCAST(IDEBus, qbus, qdev->parent_bus);
-
-    if (bus->vmstate) {
-        qemu_del_vm_change_state_handler(bus->vmstate);
-    }
-}
-
 static const TypeInfo ide_bus_info = {
     .name = TYPE_IDE_BUS,
     .parent = TYPE_BUS,
@@ -382,7 +373,6 @@ static void ide_device_class_init(ObjectClass *klass, void *data)
     k->realize = ide_qdev_realize;
     set_bit(DEVICE_CATEGORY_STORAGE, k->categories);
     k->bus_type = TYPE_IDE_BUS;
-    k->unrealize = idebus_unrealize;
     k->props = ide_props;
 }
 
