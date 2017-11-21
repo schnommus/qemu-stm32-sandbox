@@ -275,8 +275,6 @@ void stm32_init(
             0,
             flash_size);
 	
-	vmstate_register_ram_global(flash);
-	
 	memory_region_set_readonly(flash, true);
     memory_region_set_readonly(flash_alias, true);
 	
@@ -285,7 +283,7 @@ void stm32_init(
 	
 	memory_region_init_ram(sram, NULL, "stm32-sram", ram_size,
                            &error_fatal);
-    vmstate_register_ram_global(sram);
+
     memory_region_add_subregion(system_memory, 0x20000000, sram);
 	
 	nvic = armv7m_init(
@@ -293,7 +291,7 @@ void stm32_init(
               flash_size,
               64,
               ms->kernel_filename,
-              "cortex-m3");
+              ARM_CPU_TYPE_NAME("cortex-m3"));
 
     DeviceState *rcc_dev = qdev_create(NULL, "stm32-rcc");
     qdev_prop_set_uint32(rcc_dev, "osc_freq", osc_freq);

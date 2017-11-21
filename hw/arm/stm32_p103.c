@@ -131,6 +131,9 @@ static void stm32_p103_init(MachineState *machine)
     /* Connect RS232 to UART */
     for(i = 0; i < 3; i++)
     {
+        if(!serial_hds[i])
+            break;
+
         stm32_uart_connect(
                 (Stm32Uart *)uarts[i],
                 i < MAX_SERIAL_PORTS ? serial_hds[i]->be : NULL,
