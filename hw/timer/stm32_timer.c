@@ -445,7 +445,7 @@ static int stm32_timer_init(SysBusDevice *dev)
     stm32_rcc_set_periph_clk_irq(s->stm32_rcc, s->periph, clk_irq[0]);
 
     bh = qemu_bh_new(stm32_timer_tick, s);
-    s->timer = ptimer_init(bh);
+    s->timer = ptimer_init(bh, PTIMER_POLICY_DEFAULT);
 
     s->cr1   = 0;
     s->dier  = 0;
@@ -464,7 +464,7 @@ static int stm32_timer_init(SysBusDevice *dev)
     return 0;
 }
 
-static void stm32_timer_pre_save(void *opaque)
+static int stm32_timer_pre_save(void *opaque)
 {
     //Stm32Timer *s = opaque;
 
@@ -472,6 +472,8 @@ static void stm32_timer_pre_save(void *opaque)
      * store the base time relative to the vm_clock for backwards-compatibility.  */
     //int64_t delta = qemu_get_clock_ns(rtc_clock) - qemu_get_clock_ns(vm_clock);
     //s->tick_offset_vmstate = s->tick_offset + delta / NANOSECONDS_PER_SECOND;
+
+    return 0;
 }
 
 static int stm32_timer_post_load(void *opaque, int version_id)

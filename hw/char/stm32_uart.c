@@ -23,7 +23,7 @@
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
 #include "hw/arm/stm32.h"
-#include "sysemu/char.h"
+#include "chardev/char-fe.h"
 #include "qemu/bitops.h"
 
 
@@ -125,7 +125,7 @@ struct Stm32Uart {
     struct QEMUTimer *rx_timer;
     struct QEMUTimer *tx_timer;
 
-    CharDriverState *chr;
+    CharBackend *chr;
 
     /* Stores the USART pin mapping used by the board.  This is used to check
      * the AFIO's USARTx_REMAP register to make sure the software has set
@@ -713,17 +713,17 @@ static const MemoryRegionOps stm32_uart_ops = {
 
 /* PUBLIC FUNCTIONS */
 
-void stm32_uart_connect(Stm32Uart *s, CharDriverState *chr,
+void stm32_uart_connect(Stm32Uart *s, CharBackend *chr,
                         uint32_t afio_board_map)
 {
     s->chr = chr;
     if (chr) {
-        qemu_chr_add_handlers(
+        qemu_chr_fe_set_handlers(
                 s->chr,
                 stm32_uart_can_receive,
                 stm32_uart_receive,
                 stm32_uart_event,
-                (void *)s);
+                NULL, (void *)s, NULL, true);
     }
 
     s->afio_board_map = afio_board_map;

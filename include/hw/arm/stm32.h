@@ -24,6 +24,7 @@
 #define STM32_H
 
 #include "qemu/timer.h"
+#include "chardev/char-fe.h"
 #include "hw/arm/arm.h"
 #include "qemu-common.h"
 #include "hw/sysbus.h"
@@ -309,7 +310,7 @@ void stm32_RCC_CSR_write(
 
 typedef struct Stm32Adc Stm32Adc;
 
-void stm32_adc_connect(Stm32Adc *s, CharDriverState *chr,
+void stm32_adc_connect(Stm32Adc *s, CharBackend *chr,
                         uint32_t afio_board_map);
 
 #define TYPE_STM32_ADC "stm32-adc"
@@ -356,7 +357,7 @@ typedef struct Stm32Uart Stm32Uart;
  * board's pin mapping should be passed in.  This will be used to
  * verify the correct mapping is configured by the software.
  */
-void stm32_uart_connect(Stm32Uart *s, CharDriverState *chr,
+void stm32_uart_connect(Stm32Uart *s, CharBackend *chr,
                         uint32_t afio_board_map);
 
 
