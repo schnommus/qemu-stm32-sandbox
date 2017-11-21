@@ -40,6 +40,7 @@ static DeviceState *irq_intercept_dev = NULL;
 static FILE *qtest_log_fp;
 static CharBackend qtest_chr;
 static GString *inbuf;
+static int irq_levels[MAX_IRQ];
 static qemu_timeval start_time;
 static bool qtest_opened;
 
