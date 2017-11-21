@@ -22,6 +22,7 @@
 #include "crypto/aes.h"
 #include "crypto/desrfb.h"
 #include "crypto/xts.h"
+#include "cipherpriv.h"
 
 typedef struct QCryptoCipherBuiltinAESContext QCryptoCipherBuiltinAESContext;
 struct QCryptoCipherBuiltinAESContext {
@@ -235,22 +236,24 @@ static int qcrypto_cipher_setiv_aes(QCryptoCipher *cipher,
 
 
 
-static int qcrypto_cipher_init_aes(QCryptoCipher *cipher,
-                                   const uint8_t *key, size_t nkey,
-                                   Error **errp)
+static QCryptoCipherBuiltin *
+qcrypto_cipher_init_aes(QCryptoCipherMode mode,
+                        const uint8_t *key, size_t nkey,
+                        Error **errp)
 {
     QCryptoCipherBuiltin *ctxt;
 
-    if (cipher->mode != QCRYPTO_CIPHER_MODE_CBC &&
-        cipher->mode != QCRYPTO_CIPHER_MODE_ECB &&
-        cipher->mode != QCRYPTO_CIPHER_MODE_XTS) {
-        error_setg(errp, "Unsupported cipher mode %d", cipher->mode);
-        return -1;
+    if (mode != QCRYPTO_CIPHER_MODE_CBC &&
+        mode != QCRYPTO_CIPHER_MODE_ECB &&
+        mode != QCRYPTO_CIPHER_MODE_XTS) {
+        error_setg(errp, "Unsupported cipher mode %s",
+                   QCryptoCipherMode_str(mode));
+        return NULL;
     }
 
     ctxt = g_new0(QCryptoCipherBuiltin, 1);
 
-    if (cipher->mode == QCRYPTO_CIPHER_MODE_XTS) {
+    if (mode == QCRYPTO_CIPHER_MODE_XTS) {
         if (AES_set_encrypt_key(key, nkey * 4, &ctxt->state.aes.key.enc) != 0) {
             error_setg(errp, "Failed to set encryption key");
             goto error;
@@ -290,13 +293,11 @@ static int qcrypto_cipher_init_aes(QCryptoCipher *cipher,
     ctxt->encrypt = qcrypto_cipher_encrypt_aes;
     ctxt->decrypt = qcrypto_cipher_decrypt_aes;
 
-    cipher->opaque = ctxt;
-
-    return 0;
+    return ctxt;
 
  error:
     g_free(ctxt);
-    return -1;
+    return NULL;
 }
 
 
@@ -369,15 +370,17 @@ static int qcrypto_cipher_setiv_des_rfb(QCryptoCipher *cipher,
 }
 
 
-static int qcrypto_cipher_init_des_rfb(QCryptoCipher *cipher,
-                                       const uint8_t *key, size_t nkey,
-                                       Error **errp)
+static QCryptoCipherBuiltin *
+qcrypto_cipher_init_des_rfb(QCryptoCipherMode mode,
+                            const uint8_t *key, size_t nkey,
+                            Error **errp)
 {
     QCryptoCipherBuiltin *ctxt;
 
-    if (cipher->mode != QCRYPTO_CIPHER_MODE_ECB) {
-        error_setg(errp, "Unsupported cipher mode %d", cipher->mode);
-        return -1;
+    if (mode != QCRYPTO_CIPHER_MODE_ECB) {
+        error_setg(errp, "Unsupported cipher mode %s",
+                   QCryptoCipherMode_str(mode));
+        return NULL;
     }
 
     ctxt = g_new0(QCryptoCipherBuiltin, 1);
@@ -392,86 +395,94 @@ static int qcrypto_cipher_init_des_rfb(QCryptoCipher *cipher,
     ctxt->encrypt = qcrypto_cipher_encrypt_des_rfb;
     ctxt->decrypt = qcrypto_cipher_decrypt_des_rfb;
 
-    cipher->opaque = ctxt;
-
-    return 0;
+    return ctxt;
 }
 
 
-bool qcrypto_cipher_supports(QCryptoCipherAlgorithm alg)
+bool qcrypto_cipher_supports(QCryptoCipherAlgorithm alg,
+                             QCryptoCipherMode mode)
 {
     switch (alg) {
     case QCRYPTO_CIPHER_ALG_DES_RFB:
     case QCRYPTO_CIPHER_ALG_AES_128:
     case QCRYPTO_CIPHER_ALG_AES_192:
     case QCRYPTO_CIPHER_ALG_AES_256:
+        break;
+    default:
+        return false;
+    }
+
+    switch (mode) {
+    case QCRYPTO_CIPHER_MODE_ECB:
+    case QCRYPTO_CIPHER_MODE_CBC:
+    case QCRYPTO_CIPHER_MODE_XTS:
         return true;
+    case QCRYPTO_CIPHER_MODE_CTR:
+        return false;
     default:
         return false;
     }
 }
 
 
-QCryptoCipher *qcrypto_cipher_new(QCryptoCipherAlgorithm alg,
-                                  QCryptoCipherMode mode,
-                                  const uint8_t *key, size_t nkey,
-                                  Error **errp)
+static QCryptoCipherBuiltin *qcrypto_cipher_ctx_new(QCryptoCipherAlgorithm alg,
+                                                    QCryptoCipherMode mode,
+                                                    const uint8_t *key,
+                                                    size_t nkey,
+                                                    Error **errp)
 {
-    QCryptoCipher *cipher;
+    QCryptoCipherBuiltin *ctxt;
 
-    cipher = g_new0(QCryptoCipher, 1);
-    cipher->alg = alg;
-    cipher->mode = mode;
-
-    if (!qcrypto_cipher_validate_key_length(alg, mode, nkey, errp)) {
-        goto error;
+    switch (mode) {
+    case QCRYPTO_CIPHER_MODE_ECB:
+    case QCRYPTO_CIPHER_MODE_CBC:
+    case QCRYPTO_CIPHER_MODE_XTS:
+        break;
+    default:
+        error_setg(errp, "Unsupported cipher mode %s",
+                   QCryptoCipherMode_str(mode));
+        return NULL;
     }
 
-    switch (cipher->alg) {
+    if (!qcrypto_cipher_validate_key_length(alg, mode, nkey, errp)) {
+        return NULL;
+    }
+
+    switch (alg) {
     case QCRYPTO_CIPHER_ALG_DES_RFB:
-        if (qcrypto_cipher_init_des_rfb(cipher, key, nkey, errp) < 0) {
-            goto error;
-        }
+        ctxt = qcrypto_cipher_init_des_rfb(mode, key, nkey, errp);
         break;
     case QCRYPTO_CIPHER_ALG_AES_128:
     case QCRYPTO_CIPHER_ALG_AES_192:
     case QCRYPTO_CIPHER_ALG_AES_256:
-        if (qcrypto_cipher_init_aes(cipher, key, nkey, errp) < 0) {
-            goto error;
-        }
+        ctxt = qcrypto_cipher_init_aes(mode, key, nkey, errp);
         break;
     default:
         error_setg(errp,
-                   "Unsupported cipher algorithm %d", cipher->alg);
-        goto error;
+                   "Unsupported cipher algorithm %s",
+                   QCryptoCipherAlgorithm_str(alg));
+        return NULL;
     }
 
-    return cipher;
-
- error:
-    g_free(cipher);
-    return NULL;
+    return ctxt;
 }
 
-void qcrypto_cipher_free(QCryptoCipher *cipher)
+static void
+qcrypto_builtin_cipher_ctx_free(QCryptoCipher *cipher)
 {
     QCryptoCipherBuiltin *ctxt;
 
-    if (!cipher) {
-        return;
-    }
-
     ctxt = cipher->opaque;
     ctxt->free(cipher);
-    g_free(cipher);
 }
 
 
-int qcrypto_cipher_encrypt(QCryptoCipher *cipher,
-                           const void *in,
-                           void *out,
-                           size_t len,
-                           Error **errp)
+static int
+qcrypto_builtin_cipher_encrypt(QCryptoCipher *cipher,
+                               const void *in,
+                               void *out,
+                               size_t len,
+                               Error **errp)
 {
     QCryptoCipherBuiltin *ctxt = cipher->opaque;
 
@@ -485,11 +496,12 @@ int qcrypto_cipher_encrypt(QCryptoCipher *cipher,
 }
 
 
-int qcrypto_cipher_decrypt(QCryptoCipher *cipher,
-                           const void *in,
-                           void *out,
-                           size_t len,
-                           Error **errp)
+static int
+qcrypto_builtin_cipher_decrypt(QCryptoCipher *cipher,
+                               const void *in,
+                               void *out,
+                               size_t len,
+                               Error **errp)
 {
     QCryptoCipherBuiltin *ctxt = cipher->opaque;
 
@@ -503,11 +515,20 @@ int qcrypto_cipher_decrypt(QCryptoCipher *cipher,
 }
 
 
-int qcrypto_cipher_setiv(QCryptoCipher *cipher,
-                         const uint8_t *iv, size_t niv,
-                         Error **errp)
+static int
+qcrypto_builtin_cipher_setiv(QCryptoCipher *cipher,
+                             const uint8_t *iv, size_t niv,
+                             Error **errp)
 {
     QCryptoCipherBuiltin *ctxt = cipher->opaque;
 
     return ctxt->setiv(cipher, iv, niv, errp);
 }
+
+
+static struct QCryptoCipherDriver qcrypto_cipher_lib_driver = {
+    .cipher_encrypt = qcrypto_builtin_cipher_encrypt,
+    .cipher_decrypt = qcrypto_builtin_cipher_decrypt,
+    .cipher_setiv = qcrypto_builtin_cipher_setiv,
+    .cipher_free = qcrypto_builtin_cipher_ctx_free,
+};

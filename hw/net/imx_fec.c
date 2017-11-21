@@ -55,6 +55,8 @@
         } \
     } while (0)
 
+#define IMX_MAX_DESC    1024
+
 static const char *imx_default_reg_name(IMXFECState *s, uint32_t index)
 {
     static char tmp[20];
@@ -402,12 +404,12 @@ static void imx_eth_update(IMXFECState *s)
 
 static void imx_fec_do_tx(IMXFECState *s)
 {
-    int frame_size = 0;
+    int frame_size = 0, descnt = 0;
     uint8_t frame[ENET_MAX_FRAME_SIZE];
     uint8_t *ptr = frame;
     uint32_t addr = s->tx_descriptor;
 
-    while (1) {
+    while (descnt++ < IMX_MAX_DESC) {
         IMXFECBufDesc bd;
         int len;
 
@@ -429,7 +431,7 @@ static void imx_fec_do_tx(IMXFECState *s)
         frame_size += len;
         if (bd.flags & ENET_BD_L) {
             /* Last buffer in frame.  */
-            qemu_send_packet(qemu_get_queue(s->nic), frame, len);
+            qemu_send_packet(qemu_get_queue(s->nic), frame, frame_size);
             ptr = frame;
             frame_size = 0;
             s->regs[ENET_EIR] |= ENET_INT_TXF;
@@ -453,12 +455,12 @@ static void imx_fec_do_tx(IMXFECState *s)
 
 static void imx_enet_do_tx(IMXFECState *s)
 {
-    int frame_size = 0;
+    int frame_size = 0, descnt = 0;
     uint8_t frame[ENET_MAX_FRAME_SIZE];
     uint8_t *ptr = frame;
     uint32_t addr = s->tx_descriptor;
 
-    while (1) {
+    while (descnt++ < IMX_MAX_DESC) {
         IMXENETBufDesc bd;
         int len;
 

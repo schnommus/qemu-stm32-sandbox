@@ -23,11 +23,32 @@ requires()
 
 build_qemu()
 {
-    $QEMU_SRC/configure \
-        --enable-werror \
-        ${TARGET_LIST:+"--target-list=${TARGET_LIST}"} \
-        --prefix="$PWD/install" \
-        $EXTRA_CONFIGURE_OPTS \
-        "$@"
-    make $MAKEFLAGS
+    config_opts="--enable-werror \
+                 ${TARGET_LIST:+--target-list=${TARGET_LIST}} \
+                 --prefix=$INSTALL_DIR \
+                 $QEMU_CONFIGURE_OPTS $EXTRA_CONFIGURE_OPTS \
+                 $@"
+    echo "Configure options:"
+    echo $config_opts
+    $QEMU_SRC/configure $config_opts && make $MAKEFLAGS
+}
+
+test_fail()
+{
+    echo "$@"
+    exit 1
+}
+
+prep_fail()
+{
+    echo "$@"
+    exit 2
+}
+
+install_qemu()
+{
+    make install $MAKEFLAGS DESTDIR=$PWD/=destdir
+    ret=$?
+    rm -rf $PWD/=destdir
+    return $ret
 }

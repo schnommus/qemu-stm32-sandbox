@@ -27,6 +27,7 @@
 #include "block/block_int.h"
 #include "qapi/error.h"
 #include "qapi/qmp/qerror.h"
+#include "qapi/qmp/qstring.h"
 
 QemuOptsList internal_snapshot_opts = {
     .name = "snapshot",
@@ -180,23 +181,56 @@ int bdrv_snapshot_goto(BlockDriverState *bs,
 {
     BlockDriver *drv = bs->drv;
     int ret, open_ret;
+    int64_t len;
 
     if (!drv) {
         return -ENOMEDIUM;
     }
+
+    len = bdrv_getlength(bs);
+    if (len < 0) {
+        return len;
+    }
+    /* We should set all bits in all enabled dirty bitmaps, because dirty
+     * bitmaps reflect active state of disk and snapshot switch operation
+     * actually dirties active state.
+     * TODO: It may make sense not to set all bits but analyze block status of
+     * current state and destination snapshot and do not set bits corresponding
+     * to both-zero or both-unallocated areas. */
+    bdrv_set_dirty(bs, 0, len);
+
     if (drv->bdrv_snapshot_goto) {
         return drv->bdrv_snapshot_goto(bs, snapshot_id);
     }
 
     if (bs->file) {
+        BlockDriverState *file;
+        QDict *options = qdict_clone_shallow(bs->options);
+        QDict *file_options;
+
+        file = bs->file->bs;
+        /* Prevent it from getting deleted when detached from bs */
+        bdrv_ref(file);
+
+        qdict_extract_subqdict(options, &file_options, "file.");
+        QDECREF(file_options);
+        qdict_put_str(options, "file", bdrv_get_node_name(file));
+
         drv->bdrv_close(bs);
-        ret = bdrv_snapshot_goto(bs->file->bs, snapshot_id);
-        open_ret = drv->bdrv_open(bs, NULL, bs->open_flags, NULL);
+        bdrv_unref_child(bs, bs->file);
+        bs->file = NULL;
+
+        ret = bdrv_snapshot_goto(file, snapshot_id);
+        open_ret = drv->bdrv_open(bs, options, bs->open_flags, NULL);
+        QDECREF(options);
         if (open_ret < 0) {
-            bdrv_unref(bs->file->bs);
+            bdrv_unref(file);
             bs->drv = NULL;
             return open_ret;
         }
+
+        assert(bs->file->bs == file);
+        bdrv_unref(file);
         return ret;
     }
 
@@ -383,6 +417,7 @@ bool bdrv_all_can_snapshot(BlockDriverState **first_bad_bs)
         }
         aio_context_release(ctx);
         if (!ok) {
+            bdrv_next_cleanup(&it);
             goto fail;
         }
     }
@@ -410,6 +445,7 @@ int bdrv_all_delete_snapshot(const char *name, BlockDriverState **first_bad_bs,
         }
         aio_context_release(ctx);
         if (ret < 0) {
+            bdrv_next_cleanup(&it);
             goto fail;
         }
     }
@@ -435,6 +471,7 @@ int bdrv_all_goto_snapshot(const char *name, BlockDriverState **first_bad_bs)
         }
         aio_context_release(ctx);
         if (err < 0) {
+            bdrv_next_cleanup(&it);
             goto fail;
         }
     }
@@ -460,6 +497,7 @@ int bdrv_all_find_snapshot(const char *name, BlockDriverState **first_bad_bs)
         }
         aio_context_release(ctx);
         if (err < 0) {
+            bdrv_next_cleanup(&it);
             goto fail;
         }
     }
@@ -491,6 +529,7 @@ int bdrv_all_create_snapshot(QEMUSnapshotInfo *sn,
         }
         aio_context_release(ctx);
         if (err < 0) {
+            bdrv_next_cleanup(&it);
             goto fail;
         }
     }
@@ -514,6 +553,7 @@ BlockDriverState *bdrv_all_find_vmstate_bs(void)
         aio_context_release(ctx);
 
         if (found) {
+            bdrv_next_cleanup(&it);
             break;
         }
     }

@@ -1,6 +1,102 @@
 #ifndef HW_COMPAT_H
 #define HW_COMPAT_H
 
+#define HW_COMPAT_2_10 \
+    {\
+        .driver   = "virtio-mouse-device",\
+        .property = "wheel-axis",\
+        .value    = "false",\
+    },{\
+        .driver   = "virtio-tablet-device",\
+        .property = "wheel-axis",\
+        .value    = "false",\
+    },
+
+#define HW_COMPAT_2_9 \
+    {\
+        .driver   = "pci-bridge",\
+        .property = "shpc",\
+        .value    = "off",\
+    },{\
+        .driver   = "intel-iommu",\
+        .property = "pt",\
+        .value    = "off",\
+    },{\
+        .driver   = "virtio-net-device",\
+        .property = "x-mtu-bypass-backend",\
+        .value    = "off",\
+    },{\
+        .driver   = "pcie-root-port",\
+        .property = "x-migrate-msix",\
+        .value    = "false",\
+    },
+
+#define HW_COMPAT_2_8 \
+    {\
+        .driver   = "fw_cfg_mem",\
+        .property = "x-file-slots",\
+        .value    = stringify(0x10),\
+    },{\
+        .driver   = "fw_cfg_io",\
+        .property = "x-file-slots",\
+        .value    = stringify(0x10),\
+    },{\
+        .driver   = "pflash_cfi01",\
+        .property = "old-multiple-chip-handling",\
+        .value    = "on",\
+    },{\
+        .driver   = "pci-bridge",\
+        .property = "shpc",\
+        .value    = "on",\
+    },{\
+        .driver   = TYPE_PCI_DEVICE,\
+        .property = "x-pcie-extcap-init",\
+        .value    = "off",\
+    },{\
+        .driver   = "virtio-pci",\
+        .property = "x-pcie-deverr-init",\
+        .value    = "off",\
+    },{\
+        .driver   = "virtio-pci",\
+        .property = "x-pcie-lnkctl-init",\
+        .value    = "off",\
+    },{\
+        .driver   = "virtio-pci",\
+        .property = "x-pcie-pm-init",\
+        .value    = "off",\
+    },{\
+        .driver   = "cirrus-vga",\
+        .property = "vgamem_mb",\
+        .value    = "8",\
+    },{\
+        .driver   = "isa-cirrus-vga",\
+        .property = "vgamem_mb",\
+        .value    = "8",\
+    },
+
+#define HW_COMPAT_2_7 \
+    {\
+        .driver   = "virtio-pci",\
+        .property = "page-per-vq",\
+        .value    = "on",\
+    },{\
+        .driver   = "virtio-serial-device",\
+        .property = "emergency-write",\
+        .value    = "off",\
+    },{\
+        .driver   = "ioapic",\
+        .property = "version",\
+        .value    = "0x11",\
+    },{\
+        .driver   = "intel-iommu",\
+        .property = "x-buggy-eim",\
+        .value    = "true",\
+    },{\
+        .driver   = "virtio-pci",\
+        .property = "x-ignore-backend-features",\
+        .value    = "on",\
+    },
+
 #define HW_COMPAT_2_6 \
     {\
         .driver   = "virtio-mmio",\
@@ -91,6 +187,18 @@
     },{\
         .driver   = TYPE_PCI_DEVICE,\
         .property = "x-pcie-lnksta-dllla",\
+        .value    = "off",\
+    },{\
+        .driver   = "migration",\
+        .property = "send-configuration",\
+        .value    = "off",\
+    },{\
+        .driver   = "migration",\
+        .property = "send-section-footer",\
+        .value    = "off",\
+    },{\
+        .driver   = "migration",\
+        .property = "store-global-state",\
         .value    = "off",\
     },
 

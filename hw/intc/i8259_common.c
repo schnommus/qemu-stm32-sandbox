@@ -46,7 +46,7 @@ void pic_reset_common(PICCommonState *s)
     /* Note: ELCR is not reset */
 }
 
-static void pic_dispatch_pre_save(void *opaque)
+static int pic_dispatch_pre_save(void *opaque)
 {
     PICCommonState *s = opaque;
     PICCommonClass *info = PIC_COMMON_GET_CLASS(s);
@@ -54,6 +54,8 @@ static void pic_dispatch_pre_save(void *opaque)
     if (info->pre_save) {
         info->pre_save(s);
     }
+
+    return 0;
 }
 
 static int pic_dispatch_post_load(void *opaque, int version_id)
@@ -70,10 +72,11 @@ static int pic_dispatch_post_load(void *opaque, int version_id)
 static void pic_common_realize(DeviceState *dev, Error **errp)
 {
     PICCommonState *s = PIC_COMMON(dev);
+    ISADevice *isa = ISA_DEVICE(dev);
 
-    isa_register_ioport(NULL, &s->base_io, s->iobase);
+    isa_register_ioport(isa, &s->base_io, s->iobase);
     if (s->elcr_addr != -1) {
-        isa_register_ioport(NULL, &s->elcr_io, s->elcr_addr);
+        isa_register_ioport(isa, &s->elcr_io, s->elcr_addr);
     }
 
     qdev_set_legacy_instance_id(dev, s->iobase, 1);
@@ -143,7 +146,7 @@ static void pic_common_class_init(ObjectClass *klass, void *data)
      * wiring of the slave to the master is hard-coded in device model
      * code.
      */
-    dc->cannot_instantiate_with_device_add_yet = true;
+    dc->user_creatable = false;
 }
 
 static const TypeInfo pic_common_type = {

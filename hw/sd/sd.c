@@ -458,7 +458,7 @@ static bool sd_get_readonly(SDState *sd)
     return sd->wp_switch;
 }
 
-static void sd_cardchange(void *opaque, bool load)
+static void sd_cardchange(void *opaque, bool load, Error **errp)
 {
     SDState *sd = opaque;
     DeviceState *dev = DEVICE(sd);
@@ -1797,8 +1797,13 @@ uint8_t sd_read_data(SDState *sd)
         break;
 
     case 18:	/* CMD18:  READ_MULTIPLE_BLOCK */
-        if (sd->data_offset == 0)
+        if (sd->data_offset == 0) {
+            if (sd->data_start + io_len > sd->size) {
+                sd->card_status |= ADDRESS_ERROR;
+                return 0x00;
+            }
             BLK_READ_BLOCK(sd->data_start, io_len);
+        }
         ret = sd->data[sd->data_offset ++];
 
         if (sd->data_offset >= io_len) {
@@ -1811,11 +1816,6 @@ uint8_t sd_read_data(SDState *sd)
                     sd->state = sd_transfer_state;
                     break;
                 }
-            }
-
-            if (sd->data_start + io_len > sd->size) {
-                sd->card_status |= ADDRESS_ERROR;
-                break;
             }
         }
         break;
@@ -1876,9 +1876,18 @@ static void sd_instance_init(Object *obj)
     sd->ocr_power_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sd_ocr_powerup, sd);
 }
 
+static void sd_instance_finalize(Object *obj)
+{
+    SDState *sd = SD_CARD(obj);
+
+    timer_del(sd->ocr_power_timer);
+    timer_free(sd->ocr_power_timer);
+}
+
 static void sd_realize(DeviceState *dev, Error **errp)
 {
     SDState *sd = SD_CARD(dev);
+    int ret;
 
     if (sd->blk && blk_is_read_only(sd->blk)) {
         error_setg(errp, "Cannot use read-only drive as SD card");
@@ -1886,6 +1895,11 @@ static void sd_realize(DeviceState *dev, Error **errp)
     }
 
     if (sd->blk) {
+        ret = blk_set_perm(sd->blk, BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+                           BLK_PERM_ALL, errp);
+        if (ret < 0) {
+            return;
+        }
         blk_set_dev_ops(sd->blk, &sd_block_ops, sd);
     }
 }
@@ -1927,6 +1941,7 @@ static const TypeInfo sd_info = {
     .class_size = sizeof(SDCardClass),
     .class_init = sd_class_init,
     .instance_init = sd_instance_init,
+    .instance_finalize = sd_instance_finalize,
 };
 
 static void sd_register_types(void)

@@ -13,7 +13,6 @@
 # See the COPYING file in the top-level directory.
 
 from qapi import *
-import re
 
 
 def gen_command_decl(name, arg_type, boxed, ret_type):
@@ -22,7 +21,7 @@ def gen_command_decl(name, arg_type, boxed, ret_type):
 ''',
                  c_type=(ret_type and ret_type.c_type()) or 'void',
                  c_name=c_name(name),
-                 params=gen_params(arg_type, boxed, 'Error **errp'))
+                 params=build_params(arg_type, boxed, 'Error **errp'))
 
 
 def gen_call(name, arg_type, boxed, ret_type):
@@ -68,7 +67,7 @@ static void qmp_marshal_output_%(c_name)s(%(c_type)s ret_in, QObject **ret_out, 
     Error *err = NULL;
     Visitor *v;
 
-    v = qmp_output_visitor_new(ret_out);
+    v = qobject_output_visitor_new(ret_out);
     visit_type_%(c_name)s(v, "unused", &ret_in, &err);
     if (!err) {
         visit_complete(v, ret_out);
@@ -83,28 +82,28 @@ static void qmp_marshal_output_%(c_name)s(%(c_type)s ret_in, QObject **ret_out, 
                  c_type=ret_type.c_type(), c_name=ret_type.c_name())
 
 
-def gen_marshal_proto(name):
-    ret = 'void qmp_marshal_%s(QDict *args, QObject **ret, Error **errp)' % c_name(name)
-    if not middle_mode:
-        ret = 'static ' + ret
-    return ret
+def build_marshal_proto(name):
+    return ('void qmp_marshal_%s(QDict *args, QObject **ret, Error **errp)'
+            % c_name(name))
 
 
 def gen_marshal_decl(name):
     return mcgen('''
 %(proto)s;
 ''',
-                 proto=gen_marshal_proto(name))
+                 proto=build_marshal_proto(name))
 
 
 def gen_marshal(name, arg_type, boxed, ret_type):
+    have_args = arg_type and not arg_type.is_empty()
+
     ret = mcgen('''
 
 %(proto)s
 {
     Error *err = NULL;
 ''',
-                proto=gen_marshal_proto(name))
+                proto=build_marshal_proto(name))
 
     if ret_type:
         ret += mcgen('''
@@ -112,17 +111,31 @@ def gen_marshal(name, arg_type, boxed, ret_type):
 ''',
                      c_type=ret_type.c_type())
 
-    if arg_type and not arg_type.is_empty():
+    if have_args:
+        visit_members = ('visit_type_%s_members(v, &arg, &err);'
+                         % arg_type.c_name())
         ret += mcgen('''
     Visitor *v;
     %(c_name)s arg = {0};
 
-    v = qmp_input_visitor_new(QOBJECT(args), true);
+''',
+                     c_name=arg_type.c_name())
+    else:
+        visit_members = ''
+        ret += mcgen('''
+    Visitor *v = NULL;
+
+    if (args) {
+''')
+        push_indent()
+
+    ret += mcgen('''
+    v = qobject_input_visitor_new(QOBJECT(args));
     visit_start_struct(v, NULL, NULL, 0, &err);
     if (err) {
         goto out;
     }
-    visit_type_%(c_name)s_members(v, &arg, &err);
+    %(visit_members)s
     if (!err) {
         visit_check_struct(v, &err);
     }
@@ -131,35 +144,47 @@ def gen_marshal(name, arg_type, boxed, ret_type):
         goto out;
     }
 ''',
-                     c_name=arg_type.c_name())
+                 visit_members=visit_members)
 
-    else:
+    if not have_args:
+        pop_indent()
         ret += mcgen('''
-
-    (void)args;
+    }
 ''')
 
     ret += gen_call(name, arg_type, boxed, ret_type)
 
-    # 'goto out' produced above for arg_type, and by gen_call() for ret_type
-    if (arg_type and not arg_type.is_empty()) or ret_type:
-        ret += mcgen('''
+    ret += mcgen('''
 
 out:
-''')
-    ret += mcgen('''
     error_propagate(errp, err);
-''')
-    if arg_type and not arg_type.is_empty():
-        ret += mcgen('''
     visit_free(v);
+''')
+
+    if have_args:
+        visit_members = ('visit_type_%s_members(v, &arg, NULL);'
+                         % arg_type.c_name())
+    else:
+        visit_members = ''
+        ret += mcgen('''
+    if (args) {
+''')
+        push_indent()
+
+    ret += mcgen('''
     v = qapi_dealloc_visitor_new();
     visit_start_struct(v, NULL, NULL, 0, NULL);
-    visit_type_%(c_name)s_members(v, &arg, NULL);
+    %(visit_members)s
     visit_end_struct(v, NULL);
     visit_free(v);
 ''',
-                     c_name=arg_type.c_name())
+                 visit_members=visit_members)
+
+    if not have_args:
+        pop_indent()
+        ret += mcgen('''
+    }
+''')
 
     ret += mcgen('''
 }
@@ -173,7 +198,8 @@ def gen_register_command(name, success_response):
         options = 'QCO_NO_SUCCESS_RESP'
 
     ret = mcgen('''
-    qmp_register_command("%(name)s", qmp_marshal_%(c_name)s, %(opts)s);
+    qmp_register_command(cmds, "%(name)s",
+                         qmp_marshal_%(c_name)s, %(opts)s);
 ''',
                 name=name, c_name=c_name(name),
                 opts=options)
@@ -183,14 +209,15 @@ def gen_register_command(name, success_response):
 def gen_registry(registry):
     ret = mcgen('''
 
-static void qmp_init_marshal(void)
+void %(c_prefix)sqmp_init_marshal(QmpCommandList *cmds)
 {
-''')
+    QTAILQ_INIT(cmds);
+
+''',
+                c_prefix=c_name(prefix, protect=False))
     ret += registry
     ret += mcgen('''
 }
-
-qapi_init(qmp_init_marshal);
 ''')
     return ret
 
@@ -209,8 +236,7 @@ class QAPISchemaGenCommandVisitor(QAPISchemaVisitor):
         self._visited_ret_types = set()
 
     def visit_end(self):
-        if not middle_mode:
-            self.defn += gen_registry(self._regy)
+        self.defn += gen_registry(self._regy)
         self._regy = None
         self._visited_ret_types = None
 
@@ -222,21 +248,12 @@ class QAPISchemaGenCommandVisitor(QAPISchemaVisitor):
         if ret_type and ret_type not in self._visited_ret_types:
             self._visited_ret_types.add(ret_type)
             self.defn += gen_marshal_output(ret_type)
-        if middle_mode:
-            self.decl += gen_marshal_decl(name)
+        self.decl += gen_marshal_decl(name)
         self.defn += gen_marshal(name, arg_type, boxed, ret_type)
-        if not middle_mode:
-            self._regy += gen_register_command(name, success_response)
+        self._regy += gen_register_command(name, success_response)
 
 
-middle_mode = False
-
-(input_file, output_dir, do_c, do_h, prefix, opts) = \
-    parse_command_line("m", ["middle"])
-
-for o, a in opts:
-    if o in ("-m", "--middle"):
-        middle_mode = True
+(input_file, output_dir, do_c, do_h, prefix, opts) = parse_command_line()
 
 c_comment = '''
 /*
@@ -276,10 +293,9 @@ fdef.write(mcgen('''
 #include "qemu-common.h"
 #include "qemu/module.h"
 #include "qapi/qmp/types.h"
-#include "qapi/qmp/dispatch.h"
 #include "qapi/visitor.h"
-#include "qapi/qmp-output-visitor.h"
-#include "qapi/qmp-input-visitor.h"
+#include "qapi/qobject-output-visitor.h"
+#include "qapi/qobject-input-visitor.h"
 #include "qapi/dealloc-visitor.h"
 #include "%(prefix)sqapi-types.h"
 #include "%(prefix)sqapi-visit.h"
@@ -291,10 +307,12 @@ fdef.write(mcgen('''
 fdecl.write(mcgen('''
 #include "%(prefix)sqapi-types.h"
 #include "qapi/qmp/qdict.h"
+#include "qapi/qmp/dispatch.h"
 #include "qapi/error.h"
 
+void %(c_prefix)sqmp_init_marshal(QmpCommandList *cmds);
 ''',
-                  prefix=prefix))
+                  prefix=prefix, c_prefix=c_name(prefix, protect=False)))
 
 schema = QAPISchema(input_file)
 gen = QAPISchemaGenCommandVisitor()

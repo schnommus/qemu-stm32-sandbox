@@ -15,7 +15,6 @@
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_bus.h"
 #include "hw/pci/pci_host.h"
-#include "hw/pci/pci_bus.h"
 #include "hw/pci/pci_bridge.h"
 #include "hw/i386/pc.h"
 #include "qemu/range.h"
@@ -151,7 +150,7 @@ static void pxb_host_class_init(ObjectClass *class, void *data)
 
     dc->fw_name = "pci";
     /* Reason: Internal part of the pxb/pxb-pcie device, not usable by itself */
-    dc->cannot_instantiate_with_device_add_yet = true;
+    dc->user_creatable = false;
     sbc->explicit_ofw_unit_address = pxb_host_ofw_unit_address;
     hc->root_bus_path = pxb_host_root_bus_path;
 }
@@ -317,6 +316,10 @@ static const TypeInfo pxb_dev_info = {
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(PXBDev),
     .class_init    = pxb_dev_class_init,
+    .interfaces = (InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
 };
 
 static void pxb_pcie_dev_realize(PCIDevice *dev, Error **errp)
@@ -351,6 +354,10 @@ static const TypeInfo pxb_pcie_dev_info = {
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(PXBDev),
     .class_init    = pxb_pcie_dev_class_init,
+    .interfaces = (InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
 };
 
 static void pxb_register_types(void)

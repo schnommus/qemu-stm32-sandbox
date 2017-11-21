@@ -34,11 +34,8 @@
 #include "hw/xen/xen.h"
 #include "trace.h"
 
-//#define DEBUG_VGA
 //#define DEBUG_VGA_MEM
 //#define DEBUG_VGA_REG
-
-//#define DEBUG_BOCHS_VBE
 
 /* 16 state changes per vertical frame @60 Hz */
 #define VGA_TEXT_CURSOR_PERIOD_MS       (1000 * 2 * 16 / 60)
@@ -428,9 +425,7 @@ uint32_t vga_ioport_read(void *opaque, uint32_t addr)
             break;
         }
     }
-#if defined(DEBUG_VGA)
-    printf("VGA: read addr=0x%04x data=0x%02x\n", addr, val);
-#endif
+    trace_vga_std_read_io(addr, val);
     return val;
 }
 
@@ -443,9 +438,7 @@ void vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     if (vga_ioport_invalid(s, addr)) {
         return;
     }
-#ifdef DEBUG_VGA
-    printf("VGA: write addr=0x%04x data=0x%02x\n", addr, val);
-#endif
+    trace_vga_std_write_io(addr, val);
 
     switch(addr) {
     case VGA_ATT_W:
@@ -733,9 +726,7 @@ uint32_t vbe_ioport_read_data(void *opaque, uint32_t addr)
     } else {
         val = 0;
     }
-#ifdef DEBUG_BOCHS_VBE
-    printf("VBE: read index=0x%x val=0x%x\n", s->vbe_index, val);
-#endif
+    trace_vga_vbe_read(s->vbe_index, val);
     return val;
 }
 
@@ -750,9 +741,7 @@ void vbe_ioport_write_data(void *opaque, uint32_t addr, uint32_t val)
     VGACommonState *s = opaque;
 
     if (s->vbe_index <= VBE_DISPI_INDEX_NB) {
-#ifdef DEBUG_BOCHS_VBE
-        printf("VBE: write index=0x%x val=0x%x\n", s->vbe_index, val);
-#endif
+        trace_vga_vbe_write(s->vbe_index, val);
         switch(s->vbe_index) {
         case VBE_DISPI_INDEX_ID:
             if (val == VBE_DISPI_ID0 ||
@@ -1016,7 +1005,7 @@ void vga_mem_writeb(VGACommonState *s, hwaddr addr, uint32_t val)
 }
 
 typedef void vga_draw_line_func(VGACommonState *s1, uint8_t *d,
-                                const uint8_t *s, int width);
+                                uint32_t srcaddr, int width);
 
 #include "vga-helpers.h"
 
@@ -1445,6 +1434,14 @@ void vga_invalidate_scanlines(VGACommonState *s, int y1, int y2)
     }
 }
 
+static bool vga_scanline_invalidated(VGACommonState *s, int y)
+{
+    if (y >= VGA_MAX_HEIGHT) {
+        return false;
+    }
+    return s->invalidated_y_table[y >> 5] & (1 << (y & 0x1f));
+}
+
 void vga_sync_dirty_bitmap(VGACommonState *s)
 {
     memory_region_sync_dirty_bitmap(&s->vram);
@@ -1467,13 +1464,14 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
 {
     DisplaySurface *surface = qemu_console_surface(s->con);
     int y1, y, update, linesize, y_start, double_scan, mask, depth;
-    int width, height, shift_control, line_offset, bwidth, bits;
-    ram_addr_t page0, page1, page_min, page_max;
+    int width, height, shift_control, bwidth, bits;
+    ram_addr_t page0, page1, region_start, region_end;
+    DirtyBitmapSnapshot *snap = NULL;
     int disp_width, multi_scan, multi_run;
     uint8_t *d;
     uint32_t v, addr1, addr;
     vga_draw_line_func *vga_draw_line = NULL;
-    bool share_surface;
+    bool share_surface, force_shadow = false;
     pixman_format_code_t format;
 #ifdef HOST_WORDS_BIGENDIAN
     bool byteswap = !s->big_endian_fb;
@@ -1483,11 +1481,17 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
 
     full_update |= update_basic_params(s);
 
-    if (!full_update)
-        vga_sync_dirty_bitmap(s);
-
     s->get_resolution(s, &width, &height);
     disp_width = width;
+
+    region_start = (s->start_addr * 4);
+    region_end = region_start + (ram_addr_t)s->line_offset * height;
+    if (region_end > s->vbe_size) {
+        /* wraps around (can happen with cirrus vbe modes) */
+        region_start = 0;
+        region_end = s->vbe_size;
+        force_shadow = true;
+    }
 
     shift_control = (s->gr[VGA_GFX_MODE] >> 5) & 3;
     double_scan = (s->cr[VGA_CRTC_MAX_SCAN] >> 7);
@@ -1528,7 +1532,7 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
     format = qemu_default_pixman_format(depth, !byteswap);
     if (format) {
         share_surface = dpy_gfx_check_format(s->con, format)
-            && !s->force_shadow;
+            && !s->force_shadow && !force_shadow;
     } else {
         share_surface = false;
     }
@@ -1543,17 +1547,9 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
                     height, format, s->line_offset,
                     s->vram_ptr + (s->start_addr * 4));
             dpy_gfx_replace_surface(s->con, surface);
-#ifdef DEBUG_VGA
-            printf("VGA: Using shared surface for depth=%d swap=%d\n",
-                   depth, byteswap);
-#endif
         } else {
             qemu_console_resize(s->con, disp_width, height);
             surface = qemu_console_surface(s->con);
-#ifdef DEBUG_VGA
-            printf("VGA: Using shadow surface for depth=%d swap=%d\n",
-                   depth, byteswap);
-#endif
         }
         s->last_scr_width = disp_width;
         s->last_scr_height = height;
@@ -1627,20 +1623,29 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
         s->cursor_invalidate(s);
     }
 
-    line_offset = s->line_offset;
 #if 0
     printf("w=%d h=%d v=%d line_offset=%d cr[0x09]=0x%02x cr[0x17]=0x%02x linecmp=%d sr[0x01]=0x%02x\n",
            width, height, v, line_offset, s->cr[9], s->cr[VGA_CRTC_MODE],
            s->line_compare, sr(s, VGA_SEQ_CLOCK_MODE));
 #endif
     addr1 = (s->start_addr * 4);
-    bwidth = (width * bits + 7) / 8;
+    bwidth = DIV_ROUND_UP(width * bits, 8);
     y_start = -1;
-    page_min = -1;
-    page_max = 0;
     d = surface_data(surface);
     linesize = surface_stride(surface);
     y1 = 0;
+
+    if (!full_update) {
+        vga_sync_dirty_bitmap(s);
+        if (s->line_compare < height) {
+            /* split screen mode */
+            region_start = 0;
+        }
+        snap = memory_region_snapshot_and_clear_dirty(&s->vram, region_start,
+                                                      region_end - region_start,
+                                                      DIRTY_MEMORY_VGA);
+    }
+
     for(y = 0; y < height; y++) {
         addr = addr1;
         if (!(s->cr[VGA_CRTC_MODE] & 1)) {
@@ -1653,21 +1658,28 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
             addr = (addr & ~0x8000) | ((y1 & 2) << 14);
         }
         update = full_update;
-        page0 = addr;
-        page1 = addr + bwidth - 1;
-        update |= memory_region_get_dirty(&s->vram, page0, page1 - page0,
-                                          DIRTY_MEMORY_VGA);
-        /* explicit invalidation for the hardware cursor */
-        update |= (s->invalidated_y_table[y >> 5] >> (y & 0x1f)) & 1;
+        page0 = addr & s->vbe_size_mask;
+        page1 = (addr + bwidth - 1) & s->vbe_size_mask;
+        if (full_update) {
+            update = 1;
+        } else if (page1 < page0) {
+            /* scanline wraps from end of video memory to the start */
+            assert(force_shadow);
+            update = memory_region_snapshot_get_dirty(&s->vram, snap,
+                                                      page0, s->vbe_size - page0);
+            update |= memory_region_snapshot_get_dirty(&s->vram, snap,
+                                                       0, page1);
+        } else {
+            update = memory_region_snapshot_get_dirty(&s->vram, snap,
+                                                      page0, page1 - page0);
+        }
+        /* explicit invalidation for the hardware cursor (cirrus only) */
+        update |= vga_scanline_invalidated(s, y);
         if (update) {
             if (y_start < 0)
                 y_start = y;
-            if (page0 < page_min)
-                page_min = page0;
-            if (page1 > page_max)
-                page_max = page1;
             if (!(is_buffer_shared(surface))) {
-                vga_draw_line(s, d, s->vram_ptr + addr, width);
+                vga_draw_line(s, d, addr, width);
                 if (s->cursor_draw_line)
                     s->cursor_draw_line(s, d, y);
             }
@@ -1682,7 +1694,7 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
         if (!multi_run) {
             mask = (s->cr[VGA_CRTC_MODE] & 3) ^ 3;
             if ((y1 & mask) == mask)
-                addr1 += line_offset;
+                addr1 += s->line_offset;
             y1++;
             multi_run = multi_scan;
         } else {
@@ -1698,14 +1710,8 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
         dpy_gfx_update(s->con, 0, y_start,
                        disp_width, y - y_start);
     }
-    /* reset modified pages */
-    if (page_max >= page_min) {
-        memory_region_reset_dirty(&s->vram,
-                                  page_min,
-                                  page_max - page_min,
-                                  DIRTY_MEMORY_VGA);
-    }
-    memset(s->invalidated_y_table, 0, ((height + 31) >> 5) * 4);
+    g_free(snap);
+    memset(s->invalidated_y_table, 0, sizeof(s->invalidated_y_table));
 }
 
 static void vga_draw_blank(VGACommonState *s, int full_update)
@@ -2057,6 +2063,7 @@ static int vga_common_post_load(void *opaque, int version_id)
     /* force refresh */
     s->graphic_mode = -1;
     vbe_update_vgaregs(s);
+    vga_update_memory_access(s);
     return 0;
 }
 
@@ -2112,7 +2119,7 @@ const VMStateDescription vmstate_vga_common = {
         VMSTATE_BUFFER(palette, VGACommonState),
 
         VMSTATE_INT32(bank_offset, VGACommonState),
-        VMSTATE_UINT8_EQUAL(is_vbe_vmstate, VGACommonState),
+        VMSTATE_UINT8_EQUAL(is_vbe_vmstate, VGACommonState, NULL),
         VMSTATE_UINT16(vbe_index, VGACommonState),
         VMSTATE_UINT16_ARRAY(vbe_regs, VGACommonState, VBE_DISPI_INDEX_NB),
         VMSTATE_UINT32(vbe_start_addr, VGACommonState),
@@ -2177,9 +2184,10 @@ void vga_common_init(VGACommonState *s, Object *obj, bool global_vmstate)
     if (!s->vbe_size) {
         s->vbe_size = s->vram_size;
     }
+    s->vbe_size_mask = s->vbe_size - 1;
 
     s->is_vbe_vmstate = 1;
-    memory_region_init_ram(&s->vram, obj, "vga.vram", s->vram_size,
+    memory_region_init_ram_nomigrate(&s->vram, obj, "vga.vram", s->vram_size,
                            &error_fatal);
     vmstate_register_ram(&s->vram, global_vmstate ? NULL : DEVICE(obj));
     xen_register_framebuffer(&s->vram);

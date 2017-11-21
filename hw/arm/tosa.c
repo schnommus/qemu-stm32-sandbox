@@ -25,6 +25,7 @@
 #include "sysemu/block-backend.h"
 #include "hw/sysbus.h"
 #include "exec/address-spaces.h"
+#include "sysemu/sysemu.h"
 
 #define TOSA_RAM    0x04000000
 #define TOSA_ROM	0x00800000
@@ -86,6 +87,12 @@ static void tosa_out_switch(void *opaque, int line, int level)
     }
 }
 
+static void tosa_reset(void *opaque, int line, int level)
+{
+    if (level) {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
+}
 
 static void tosa_gpio_setup(PXA2xxState *cpu,
                 DeviceState *scp0,
@@ -93,13 +100,16 @@ static void tosa_gpio_setup(PXA2xxState *cpu,
                 TC6393xbState *tmio)
 {
     qemu_irq *outsignals = qemu_allocate_irqs(tosa_out_switch, cpu, 4);
+    qemu_irq reset;
+
     /* MMC/SD host */
     pxa2xx_mmci_handlers(cpu->mmc,
                     qdev_get_gpio_in(scp0, TOSA_GPIO_SD_WP),
                     qemu_irq_invert(qdev_get_gpio_in(cpu->gpio, TOSA_GPIO_nSD_DETECT)));
 
     /* Handle reset */
-    qdev_connect_gpio_out(cpu->gpio, TOSA_GPIO_ON_RESET, cpu->reset);
+    reset = qemu_allocate_irq(tosa_reset, cpu, 0);
+    qdev_connect_gpio_out(cpu->gpio, TOSA_GPIO_ON_RESET, reset);
 
     /* PCMCIA signals: card's IRQ and Card-Detect */
     pxa2xx_pcmcia_set_irq_cb(cpu->pcmcia[0],
@@ -162,7 +172,7 @@ static int tosa_dac_send(I2CSlave *i2c, uint8_t data)
     return 0;
 }
 
-static void tosa_dac_event(I2CSlave *i2c, enum i2c_event event)
+static int tosa_dac_event(I2CSlave *i2c, enum i2c_event event)
 {
     TosaDACState *s = TOSA_DAC(i2c);
 
@@ -184,18 +194,14 @@ static void tosa_dac_event(I2CSlave *i2c, enum i2c_event event)
     default:
         break;
     }
+
+    return 0;
 }
 
 static int tosa_dac_recv(I2CSlave *s)
 {
     printf("%s: recv not supported!!!\n", __FUNCTION__);
     return -1;
-}
-
-static int tosa_dac_init(I2CSlave *i2c)
-{
-    /* Nothing to do.  */
-    return 0;
 }
 
 static void tosa_tg_init(PXA2xxState *cpu)
@@ -213,7 +219,6 @@ static struct arm_boot_info tosa_binfo = {
 
 static void tosa_init(MachineState *machine)
 {
-    const char *cpu_model = machine->cpu_model;
     const char *kernel_filename = machine->kernel_filename;
     const char *kernel_cmdline = machine->kernel_cmdline;
     const char *initrd_filename = machine->initrd_filename;
@@ -223,13 +228,9 @@ static void tosa_init(MachineState *machine)
     TC6393xbState *tmio;
     DeviceState *scp0, *scp1;
 
-    if (!cpu_model)
-        cpu_model = "pxa255";
-
     mpu = pxa255_init(address_space_mem, tosa_binfo.ram_size);
 
     memory_region_init_ram(rom, NULL, "tosa.rom", TOSA_ROM, &error_fatal);
-    vmstate_register_ram_global(rom);
     memory_region_set_readonly(rom, true);
     memory_region_add_subregion(address_space_mem, 0, rom);
 
@@ -257,6 +258,8 @@ static void tosapda_machine_init(MachineClass *mc)
 {
     mc->desc = "Sharp SL-6000 (Tosa) PDA (PXA255)";
     mc->init = tosa_init;
+    mc->block_default_type = IF_IDE;
+    mc->ignore_memory_transaction_failures = true;
 }
 
 DEFINE_MACHINE("tosa", tosapda_machine_init)
@@ -265,7 +268,6 @@ static void tosa_dac_class_init(ObjectClass *klass, void *data)
 {
     I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
 
-    k->init = tosa_dac_init;
     k->event = tosa_dac_event;
     k->recv = tosa_dac_recv;
     k->send = tosa_dac_send;

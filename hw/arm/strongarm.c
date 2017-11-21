@@ -34,7 +34,8 @@
 #include "strongarm.h"
 #include "qemu/error-report.h"
 #include "hw/arm/arm.h"
-#include "sysemu/char.h"
+#include "chardev/char-fe.h"
+#include "chardev/char-serial.h"
 #include "sysemu/sysemu.h"
 #include "hw/ssi/ssi.h"
 #include "qemu/cutils.h"
@@ -405,11 +406,13 @@ static void strongarm_rtc_init(Object *obj)
     sysbus_init_mmio(dev, &s->iomem);
 }
 
-static void strongarm_rtc_pre_save(void *opaque)
+static int strongarm_rtc_pre_save(void *opaque)
 {
     StrongARMRTCState *s = opaque;
 
     strongarm_rtc_hzupdate(s);
+
+    return 0;
 }
 
 static int strongarm_rtc_post_load(void *opaque, int version_id)
@@ -912,7 +915,7 @@ typedef struct StrongARMUARTState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
-    CharDriverState *chr;
+    CharBackend chr;
     qemu_irq irq;
 
     uint8_t utcr0;
@@ -1020,9 +1023,7 @@ static void strongarm_uart_update_parameters(StrongARMUARTState *s)
     ssp.data_bits = data_bits;
     ssp.stop_bits = stop_bits;
     s->char_transmit_time =  (NANOSECONDS_PER_SECOND / speed) * frame_size;
-    if (s->chr) {
-        qemu_chr_fe_ioctl(s->chr, CHR_IOCTL_SERIAL_SET_PARAMS, &ssp);
-    }
+    qemu_chr_fe_ioctl(&s->chr, CHR_IOCTL_SERIAL_SET_PARAMS, &ssp);
 
     DPRINTF(stderr, "%s speed=%d parity=%c data=%d stop=%d\n", s->chr->label,
             speed, parity, data_bits, stop_bits);
@@ -1107,8 +1108,10 @@ static void strongarm_uart_tx(void *opaque)
 
     if (s->utcr3 & UTCR3_LBM) /* loopback */ {
         strongarm_uart_receive(s, &s->tx_fifo[s->tx_start], 1);
-    } else if (s->chr) {
-        qemu_chr_fe_write(s->chr, &s->tx_fifo[s->tx_start], 1);
+    } else if (qemu_chr_fe_backend_connected(&s->chr)) {
+        /* XXX this blocks entire thread. Rewrite to use
+         * qemu_chr_fe_write and background I/O callbacks */
+        qemu_chr_fe_write_all(&s->chr, &s->tx_fifo[s->tx_start], 1);
     }
 
     s->tx_start = (s->tx_start + 1) % 8;
@@ -1236,14 +1239,17 @@ static void strongarm_uart_init(Object *obj)
 
     s->rx_timeout_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, strongarm_uart_rx_to, s);
     s->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, strongarm_uart_tx, s);
+}
 
-    if (s->chr) {
-        qemu_chr_add_handlers(s->chr,
-                        strongarm_uart_can_receive,
-                        strongarm_uart_receive,
-                        strongarm_uart_event,
-                        s);
-    }
+static void strongarm_uart_realize(DeviceState *dev, Error **errp)
+{
+    StrongARMUARTState *s = STRONGARM_UART(dev);
+
+    qemu_chr_fe_set_handlers(&s->chr,
+                             strongarm_uart_can_receive,
+                             strongarm_uart_receive,
+                             strongarm_uart_event,
+                             NULL, s, NULL, true);
 }
 
 static void strongarm_uart_reset(DeviceState *dev)
@@ -1318,6 +1324,7 @@ static void strongarm_uart_class_init(ObjectClass *klass, void *data)
     dc->reset = strongarm_uart_reset;
     dc->vmsd = &vmstate_strongarm_uart_regs;
     dc->props = strongarm_uart_properties;
+    dc->realize = strongarm_uart_realize;
 }
 
 static const TypeInfo strongarm_uart_info = {
@@ -1518,19 +1525,19 @@ static int strongarm_ssp_post_load(void *opaque, int version_id)
     return 0;
 }
 
-static int strongarm_ssp_init(SysBusDevice *sbd)
+static void strongarm_ssp_init(Object *obj)
 {
+    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
     DeviceState *dev = DEVICE(sbd);
     StrongARMSSPState *s = STRONGARM_SSP(dev);
 
     sysbus_init_irq(sbd, &s->irq);
 
-    memory_region_init_io(&s->iomem, OBJECT(s), &strongarm_ssp_ops, s,
+    memory_region_init_io(&s->iomem, obj, &strongarm_ssp_ops, s,
                           "ssp", 0x1000);
     sysbus_init_mmio(sbd, &s->iomem);
 
     s->bus = ssi_create_bus(dev, "ssi");
-    return 0;
 }
 
 static void strongarm_ssp_reset(DeviceState *dev)
@@ -1560,9 +1567,7 @@ static const VMStateDescription vmstate_strongarm_ssp_regs = {
 static void strongarm_ssp_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
-    SysBusDeviceClass *k = SYS_BUS_DEVICE_CLASS(klass);
 
-    k->init = strongarm_ssp_init;
     dc->desc = "StrongARM SSP controller";
     dc->reset = strongarm_ssp_reset;
     dc->vmsd = &vmstate_strongarm_ssp_regs;
@@ -1572,33 +1577,25 @@ static const TypeInfo strongarm_ssp_info = {
     .name          = TYPE_STRONGARM_SSP,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(StrongARMSSPState),
+    .instance_init = strongarm_ssp_init,
     .class_init    = strongarm_ssp_class_init,
 };
 
 /* Main CPU functions */
 StrongARMState *sa1110_init(MemoryRegion *sysmem,
-                            unsigned int sdram_size, const char *rev)
+                            unsigned int sdram_size, const char *cpu_type)
 {
     StrongARMState *s;
     int i;
 
     s = g_new0(StrongARMState, 1);
 
-    if (!rev) {
-        rev = "sa1110-b5";
-    }
-
-    if (strncmp(rev, "sa1110", 6)) {
+    if (strncmp(cpu_type, "sa1110", 6)) {
         error_report("Machine requires a SA1110 processor.");
         exit(1);
     }
 
-    s->cpu = cpu_arm_init(rev);
-
-    if (!s->cpu) {
-        error_report("Unable to find CPU definition");
-        exit(1);
-    }
+    s->cpu = ARM_CPU(cpu_create(cpu_type));
 
     memory_region_allocate_system_memory(&s->sdram, NULL, "strongarm.sdram",
                                          sdram_size);

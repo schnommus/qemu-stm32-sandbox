@@ -29,7 +29,6 @@
 #include "qemu/osdep.h"
 #include "sysemu/sysemu.h"
 #include "hw/sysbus.h"
-#include "trace.h"
 #include "hw/ptimer.h"
 #include "etsec.h"
 #include "registers.h"
@@ -348,8 +347,8 @@ static ssize_t etsec_receive(NetClientState *nc,
     eTSEC *etsec = qemu_get_nic_opaque(nc);
 
 #if defined(HEX_DUMP)
-    fprintf(stderr, "%s receive size:%d\n", etsec->nic->nc.name, size);
-    qemu_hexdump(buf, stderr, "", size);
+    fprintf(stderr, "%s receive size:%zd\n", nc->name, size);
+    qemu_hexdump((void *)buf, stderr, "", size);
 #endif
     /* Flush is unnecessary as are already in receiving path */
     etsec->need_flush = false;
@@ -387,7 +386,7 @@ static void etsec_realize(DeviceState *dev, Error **errp)
 
 
     etsec->bh     = qemu_bh_new(etsec_timer_hit, etsec);
-    etsec->ptimer = ptimer_init(etsec->bh);
+    etsec->ptimer = ptimer_init(etsec->bh, PTIMER_POLICY_DEFAULT);
     ptimer_set_freq(etsec->ptimer, 100);
 }
 
@@ -417,6 +416,8 @@ static void etsec_class_init(ObjectClass *klass, void *data)
     dc->realize = etsec_realize;
     dc->reset = etsec_reset;
     dc->props = etsec_properties;
+    /* Supported by ppce500 machine */
+    dc->user_creatable = true;
 }
 
 static TypeInfo etsec_info = {

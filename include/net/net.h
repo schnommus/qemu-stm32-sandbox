@@ -100,6 +100,7 @@ struct NetClientState {
     unsigned int queue_index;
     unsigned rxfilter_notify_enabled:1;
     int vring_enable;
+    int vnet_hdr_len;
     QTAILQ_HEAD(NetFilterHead, NetFilterState) filters;
 };
 
@@ -111,9 +112,13 @@ typedef struct NICState {
 } NICState;
 
 struct SocketReadState {
-    int state; /* 0 = getting length, 1 = getting data */
+    /* 0 = getting length, 1 = getting vnet header length, 2 = getting data */
+    int state;
+    /* This flag decide whether to read the vnet_hdr_len field */
+    bool vnet_hdr;
     uint32_t index;
     uint32_t packet_len;
+    uint32_t vnet_hdr_len;
     uint8_t buf[NET_BUFSIZE];
     SocketReadStateFinalize *finalize;
 };
@@ -138,8 +143,6 @@ NetClientState *qemu_get_queue(NICState *nic);
 NICState *qemu_get_nic(NetClientState *nc);
 void *qemu_get_nic_opaque(NetClientState *nc);
 void qemu_del_net_client(NetClientState *nc);
-NetClientState *qemu_find_vlan_client_by_name(Monitor *mon, int vlan_id,
-                                              const char *client_str);
 typedef void (*qemu_nic_foreach)(NICState *nic, void *opaque);
 void qemu_foreach_nic(qemu_nic_foreach func, void *opaque);
 int qemu_can_send_packet(NetClientState *nc);
@@ -178,7 +181,8 @@ ssize_t qemu_deliver_packet_iov(NetClientState *sender,
 void print_net_client(Monitor *mon, NetClientState *nc);
 void hmp_info_network(Monitor *mon, const QDict *qdict);
 void net_socket_rs_init(SocketReadState *rs,
-                        SocketReadStateFinalize *finalize);
+                        SocketReadStateFinalize *finalize,
+                        bool vnet_hdr);
 
 /* NIC info */
 

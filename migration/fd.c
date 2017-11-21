@@ -16,8 +16,8 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "qemu-common.h"
-#include "migration/migration.h"
+#include "channel.h"
+#include "fd.h"
 #include "monitor/monitor.h"
 #include "io/channel-util.h"
 #include "trace.h"
@@ -38,6 +38,7 @@ void fd_start_outgoing_migration(MigrationState *s, const char *fdname, Error **
         return;
     }
 
+    qio_channel_set_name(QIO_CHANNEL(ioc), "migration-fd-outgoing");
     migration_channel_connect(s, ioc, NULL);
     object_unref(OBJECT(ioc));
 }
@@ -46,9 +47,9 @@ static gboolean fd_accept_incoming_migration(QIOChannel *ioc,
                                              GIOCondition condition,
                                              gpointer opaque)
 {
-    migration_channel_process_incoming(migrate_get_current(), ioc);
+    migration_channel_process_incoming(ioc);
     object_unref(OBJECT(ioc));
-    return FALSE; /* unregister */
+    return G_SOURCE_REMOVE;
 }
 
 void fd_start_incoming_migration(const char *infd, Error **errp)
@@ -65,6 +66,7 @@ void fd_start_incoming_migration(const char *infd, Error **errp)
         return;
     }
 
+    qio_channel_set_name(QIO_CHANNEL(ioc), "migration-fd-incoming");
     qio_channel_add_watch(ioc,
                           G_IO_IN,
                           fd_accept_incoming_migration,

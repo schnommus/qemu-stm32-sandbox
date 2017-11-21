@@ -196,7 +196,7 @@ static int create_devtree_etsec(SysBusDevice *sbdev, PlatformDevtreeData *data)
     return 0;
 }
 
-static int sysbus_device_create_devtree(SysBusDevice *sbdev, void *opaque)
+static void sysbus_device_create_devtree(SysBusDevice *sbdev, void *opaque)
 {
     PlatformDevtreeData *data = opaque;
     bool matched = false;
@@ -211,8 +211,6 @@ static int sysbus_device_create_devtree(SysBusDevice *sbdev, void *opaque)
                      qdev_fw_name(DEVICE(sbdev)));
         exit(1);
     }
-
-    return 0;
 }
 
 static void platform_bus_create_devtree(PPCE500Params *params, void *fdt,
@@ -384,7 +382,6 @@ static int ppce500_load_device_tree(MachineState *machine,
        the first node as boot node and be happy */
     for (i = smp_cpus - 1; i >= 0; i--) {
         CPUState *cpu;
-        PowerPCCPU *pcpu;
         char cpu_name[128];
         uint64_t cpu_release_addr = params->spin_base + (i * 0x20);
 
@@ -393,16 +390,13 @@ static int ppce500_load_device_tree(MachineState *machine,
             continue;
         }
         env = cpu->env_ptr;
-        pcpu = POWERPC_CPU(cpu);
 
-        snprintf(cpu_name, sizeof(cpu_name), "/cpus/PowerPC,8544@%x",
-                 ppc_get_vcpu_dt_id(pcpu));
+        snprintf(cpu_name, sizeof(cpu_name), "/cpus/PowerPC,8544@%x", i);
         qemu_fdt_add_subnode(fdt, cpu_name);
         qemu_fdt_setprop_cell(fdt, cpu_name, "clock-frequency", clock_freq);
         qemu_fdt_setprop_cell(fdt, cpu_name, "timebase-frequency", tb_freq);
         qemu_fdt_setprop_string(fdt, cpu_name, "device_type", "cpu");
-        qemu_fdt_setprop_cell(fdt, cpu_name, "reg",
-                              ppc_get_vcpu_dt_id(pcpu));
+        qemu_fdt_setprop_cell(fdt, cpu_name, "reg", i);
         qemu_fdt_setprop_cell(fdt, cpu_name, "d-cache-line-size",
                               env->dcache_line_size);
         qemu_fdt_setprop_cell(fdt, cpu_name, "i-cache-line-size",
@@ -735,15 +729,13 @@ static DeviceState *ppce500_init_mpic_kvm(PPCE500Params *params,
     return dev;
 }
 
-static qemu_irq *ppce500_init_mpic(MachineState *machine, PPCE500Params *params,
-                                   MemoryRegion *ccsr, qemu_irq **irqs)
+static DeviceState *ppce500_init_mpic(MachineState *machine,
+                                      PPCE500Params *params,
+                                      MemoryRegion *ccsr,
+                                      qemu_irq **irqs)
 {
-    qemu_irq *mpic;
     DeviceState *dev = NULL;
     SysBusDevice *s;
-    int i;
-
-    mpic = g_new0(qemu_irq, 256);
 
     if (kvm_enabled()) {
         Error *err = NULL;
@@ -762,21 +754,17 @@ static qemu_irq *ppce500_init_mpic(MachineState *machine, PPCE500Params *params,
         dev = ppce500_init_mpic_qemu(params, irqs);
     }
 
-    for (i = 0; i < 256; i++) {
-        mpic[i] = qdev_get_gpio_in(dev, i);
-    }
-
     s = SYS_BUS_DEVICE(dev);
     memory_region_add_subregion(ccsr, MPC8544_MPIC_REGS_OFFSET,
                                 s->mmio[0].memory);
 
-    return mpic;
+    return dev;
 }
 
 static void ppce500_power_off(void *opaque, int line, int on)
 {
     if (on) {
-        qemu_system_shutdown_request();
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
     }
 }
 
@@ -802,17 +790,12 @@ void ppce500_init(MachineState *machine, PPCE500Params *params)
     /* irq num for pin INTA, INTB, INTC and INTD is 1, 2, 3 and
      * 4 respectively */
     unsigned int pci_irq_nrs[PCI_NUM_PINS] = {1, 2, 3, 4};
-    qemu_irq **irqs, *mpic;
-    DeviceState *dev;
+    qemu_irq **irqs;
+    DeviceState *dev, *mpicdev;
     CPUPPCState *firstenv = NULL;
     MemoryRegion *ccsr_addr_space;
     SysBusDevice *s;
     PPCE500CCSRState *ccsr;
-
-    /* Setup CPUs */
-    if (machine->cpu_model == NULL) {
-        machine->cpu_model = "e500v2_v30";
-    }
 
     irqs = g_malloc0(smp_cpus * sizeof(qemu_irq *));
     irqs[0] = g_malloc0(smp_cpus * sizeof(qemu_irq) * OPENPIC_OUTPUT_NB);
@@ -821,13 +804,15 @@ void ppce500_init(MachineState *machine, PPCE500Params *params)
         CPUState *cs;
         qemu_irq *input;
 
-        cpu = cpu_ppc_init(machine->cpu_model);
-        if (cpu == NULL) {
-            fprintf(stderr, "Unable to initialize CPU!\n");
-            exit(1);
-        }
+        cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
         env = &cpu->env;
         cs = CPU(cpu);
+
+        if (env->mmu_model != POWERPC_MMU_BOOKE206) {
+            fprintf(stderr, "MMU model %i not supported by this machine.\n",
+                env->mmu_model);
+            exit(1);
+        }
 
         if (!firstenv) {
             firstenv = env;
@@ -875,18 +860,18 @@ void ppce500_init(MachineState *machine, PPCE500Params *params)
     memory_region_add_subregion(address_space_mem, params->ccsrbar_base,
                                 ccsr_addr_space);
 
-    mpic = ppce500_init_mpic(machine, params, ccsr_addr_space, irqs);
+    mpicdev = ppce500_init_mpic(machine, params, ccsr_addr_space, irqs);
 
     /* Serial */
     if (serial_hds[0]) {
         serial_mm_init(ccsr_addr_space, MPC8544_SERIAL0_REGS_OFFSET,
-                       0, mpic[42], 399193,
+                       0, qdev_get_gpio_in(mpicdev, 42), 399193,
                        serial_hds[0], DEVICE_BIG_ENDIAN);
     }
 
     if (serial_hds[1]) {
         serial_mm_init(ccsr_addr_space, MPC8544_SERIAL1_REGS_OFFSET,
-                       0, mpic[42], 399193,
+                       0, qdev_get_gpio_in(mpicdev, 42), 399193,
                        serial_hds[1], DEVICE_BIG_ENDIAN);
     }
 
@@ -904,7 +889,7 @@ void ppce500_init(MachineState *machine, PPCE500Params *params)
     qdev_init_nofail(dev);
     s = SYS_BUS_DEVICE(dev);
     for (i = 0; i < PCI_NUM_PINS; i++) {
-        sysbus_connect_irq(s, i, mpic[pci_irq_nrs[i]]);
+        sysbus_connect_irq(s, i, qdev_get_gpio_in(mpicdev, pci_irq_nrs[i]));
     }
 
     memory_region_add_subregion(ccsr_addr_space, MPC8544_PCI_REGS_OFFSET,
@@ -935,7 +920,7 @@ void ppce500_init(MachineState *machine, PPCE500Params *params)
         dev = qdev_create(NULL, "mpc8xxx_gpio");
         s = SYS_BUS_DEVICE(dev);
         qdev_init_nofail(dev);
-        sysbus_connect_irq(s, 0, mpic[MPC8XXX_GPIO_IRQ]);
+        sysbus_connect_irq(s, 0, qdev_get_gpio_in(mpicdev, MPC8XXX_GPIO_IRQ));
         memory_region_add_subregion(ccsr_addr_space, MPC8XXX_GPIO_OFFSET,
                                     sysbus_mmio_get_region(s, 0));
 
@@ -955,7 +940,7 @@ void ppce500_init(MachineState *machine, PPCE500Params *params)
 
         for (i = 0; i < params->platform_bus_num_irqs; i++) {
             int irqn = params->platform_bus_first_irq + i;
-            sysbus_connect_irq(s, i, mpic[irqn]);
+            sysbus_connect_irq(s, i, qdev_get_gpio_in(mpicdev, irqn));
         }
 
         memory_region_add_subregion(address_space_mem,
@@ -1051,27 +1036,18 @@ void ppce500_init(MachineState *machine, PPCE500Params *params)
     boot_info->dt_size = dt_size;
 }
 
-static int e500_ccsr_initfn(SysBusDevice *dev)
+static void e500_ccsr_initfn(Object *obj)
 {
-    PPCE500CCSRState *ccsr;
-
-    ccsr = CCSR(dev);
-    memory_region_init(&ccsr->ccsr_space, OBJECT(ccsr), "e500-ccsr",
+    PPCE500CCSRState *ccsr = CCSR(obj);
+    memory_region_init(&ccsr->ccsr_space, obj, "e500-ccsr",
                        MPC8544_CCSRBAR_SIZE);
-    return 0;
-}
-
-static void e500_ccsr_class_init(ObjectClass *klass, void *data)
-{
-    SysBusDeviceClass *k = SYS_BUS_DEVICE_CLASS(klass);
-    k->init = e500_ccsr_initfn;
 }
 
 static const TypeInfo e500_ccsr_info = {
     .name          = TYPE_CCSR,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(PPCE500CCSRState),
-    .class_init    = e500_ccsr_class_init,
+    .instance_init = e500_ccsr_initfn,
 };
 
 static void e500_register_types(void)

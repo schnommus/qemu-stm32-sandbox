@@ -90,7 +90,7 @@ static void sysctl_icap_write(MilkymistSysctlState *s, uint32_t value)
     trace_milkymist_sysctl_icap_write(value);
     switch (value & 0xffff) {
     case 0x000e:
-        qemu_system_shutdown_request();
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
         break;
     }
 }
@@ -195,7 +195,7 @@ static void sysctl_write(void *opaque, hwaddr addr, uint64_t value,
         s->regs[addr] = 1;
         break;
     case R_SYSTEM_ID:
-        qemu_system_reset_request();
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         break;
 
     case R_GPIO_IN:
@@ -281,8 +281,8 @@ static void milkymist_sysctl_init(Object *obj)
 
     s->bh0 = qemu_bh_new(timer0_hit, s);
     s->bh1 = qemu_bh_new(timer1_hit, s);
-    s->ptimer0 = ptimer_init(s->bh0);
-    s->ptimer1 = ptimer_init(s->bh1);
+    s->ptimer0 = ptimer_init(s->bh0, PTIMER_POLICY_DEFAULT);
+    s->ptimer1 = ptimer_init(s->bh1, PTIMER_POLICY_DEFAULT);
 
     memory_region_init_io(&s->regs_region, obj, &sysctl_mmio_ops, s,
             "milkymist-sysctl", R_MAX * 4);

@@ -19,7 +19,9 @@
  */
 
 #include "qemu/osdep.h"
-#include "migration/migration.h"
+#include "channel.h"
+#include "migration.h"
+#include "tls.h"
 #include "io/channel-tls.h"
 #include "crypto/tlscreds.h"
 #include "qemu/error-report.h"
@@ -61,18 +63,18 @@ migration_tls_get_creds(MigrationState *s,
 }
 
 
-static void migration_tls_incoming_handshake(Object *src,
-                                             Error *err,
+static void migration_tls_incoming_handshake(QIOTask *task,
                                              gpointer opaque)
 {
-    QIOChannel *ioc = QIO_CHANNEL(src);
+    QIOChannel *ioc = QIO_CHANNEL(qio_task_get_source(task));
+    Error *err = NULL;
 
-    if (err) {
+    if (qio_task_propagate_error(task, &err)) {
         trace_migration_tls_incoming_handshake_error(error_get_pretty(err));
-        error_report("%s", error_get_pretty(err));
+        error_report_err(err);
     } else {
         trace_migration_tls_incoming_handshake_complete();
-        migration_channel_process_incoming(migrate_get_current(), ioc);
+        migration_channel_process_incoming(ioc);
     }
     object_unref(OBJECT(ioc));
 }
@@ -99,6 +101,7 @@ void migration_tls_channel_process_incoming(MigrationState *s,
     }
 
     trace_migration_tls_incoming_handshake_start();
+    qio_channel_set_name(QIO_CHANNEL(tioc), "migration-tls-incoming");
     qio_channel_tls_handshake(tioc,
                               migration_tls_incoming_handshake,
                               NULL,
@@ -106,16 +109,15 @@ void migration_tls_channel_process_incoming(MigrationState *s,
 }
 
 
-static void migration_tls_outgoing_handshake(Object *src,
-                                             Error *err,
+static void migration_tls_outgoing_handshake(QIOTask *task,
                                              gpointer opaque)
 {
     MigrationState *s = opaque;
-    QIOChannel *ioc = QIO_CHANNEL(src);
+    QIOChannel *ioc = QIO_CHANNEL(qio_task_get_source(task));
+    Error *err = NULL;
 
-    if (err) {
+    if (qio_task_propagate_error(task, &err)) {
         trace_migration_tls_outgoing_handshake_error(error_get_pretty(err));
-        s->to_dst_file = NULL;
         migrate_fd_error(s, err);
     } else {
         trace_migration_tls_outgoing_handshake_complete();
@@ -139,7 +141,7 @@ void migration_tls_channel_connect(MigrationState *s,
         return;
     }
 
-    if (s->parameters.tls_hostname) {
+    if (s->parameters.tls_hostname && *s->parameters.tls_hostname) {
         hostname = s->parameters.tls_hostname;
     }
     if (!hostname) {
@@ -154,6 +156,7 @@ void migration_tls_channel_connect(MigrationState *s,
     }
 
     trace_migration_tls_outgoing_handshake_start(hostname);
+    qio_channel_set_name(QIO_CHANNEL(tioc), "migration-tls-outgoing");
     qio_channel_tls_handshake(tioc,
                               migration_tls_outgoing_handshake,
                               s,

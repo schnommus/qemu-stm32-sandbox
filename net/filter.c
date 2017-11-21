@@ -179,7 +179,7 @@ static void netfilter_init(Object *obj)
                             netfilter_get_netdev_id, netfilter_set_netdev_id,
                             NULL);
     object_property_add_enum(obj, "queue", "NetFilterDirection",
-                             NetFilterDirection_lookup,
+                             &NetFilterDirection_lookup,
                              netfilter_get_direction, netfilter_set_direction,
                              NULL);
     object_property_add_str(obj, "status",
@@ -239,7 +239,7 @@ static void netfilter_finalize(Object *obj)
     }
 
     if (nf->netdev && !QTAILQ_EMPTY(&nf->netdev->filters) &&
-        nf->next.tqe_prev) {
+        QTAILQ_IN_USE(nf, next)) {
         QTAILQ_REMOVE(&nf->netdev->filters, nf, next);
     }
     g_free(nf->netdev_id);

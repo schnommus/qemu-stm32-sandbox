@@ -26,6 +26,7 @@
  */
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/numa.h"
 #include "hw/hw.h"
@@ -36,17 +37,21 @@
 #include "sysemu/device_tree.h"
 #include "sysemu/block-backend.h"
 #include "sysemu/cpus.h"
-#include "sysemu/kvm.h"
-#include "sysemu/device_tree.h"
+#include "sysemu/hw_accel.h"
 #include "kvm_ppc.h"
-#include "migration/migration.h"
+#include "migration/misc.h"
+#include "migration/global_state.h"
+#include "migration/register.h"
 #include "mmu-hash64.h"
+#include "mmu-book3s-v3.h"
+#include "cpu-models.h"
 #include "qom/cpu.h"
 
 #include "hw/boards.h"
 #include "hw/ppc/ppc.h"
 #include "hw/loader.h"
 
+#include "hw/ppc/fdt.h"
 #include "hw/ppc/spapr.h"
 #include "hw/ppc/spapr_vio.h"
 #include "hw/pci-host/spapr.h"
@@ -56,6 +61,7 @@
 #include "hw/pci/pci.h"
 #include "hw/scsi/scsi.h"
 #include "hw/virtio/virtio-scsi.h"
+#include "hw/virtio/vhost-scsi-common.h"
 
 #include "exec/address-spaces.h"
 #include "hw/usb.h"
@@ -63,6 +69,7 @@
 #include "qemu/error-report.h"
 #include "trace.h"
 #include "hw/nmi.h"
+#include "hw/intc/intc.h"
 
 #include "hw/compat.h"
 #include "qemu/cutils.h"
@@ -93,51 +100,108 @@
 
 #define PHANDLE_XICP            0x00001111
 
-#define HTAB_SIZE(spapr)        (1ULL << ((spapr)->htab_shift))
-
-static XICSState *try_create_xics(const char *type, int nr_servers,
+static ICSState *spapr_ics_create(sPAPRMachineState *spapr,
+                                  const char *type_ics,
                                   int nr_irqs, Error **errp)
 {
-    Error *err = NULL;
-    DeviceState *dev;
+    Error *local_err = NULL;
+    Object *obj;
 
-    dev = qdev_create(NULL, type);
-    qdev_prop_set_uint32(dev, "nr_servers", nr_servers);
-    qdev_prop_set_uint32(dev, "nr_irqs", nr_irqs);
-    object_property_set_bool(OBJECT(dev), true, "realized", &err);
-    if (err) {
-        error_propagate(errp, err);
-        object_unparent(OBJECT(dev));
-        return NULL;
+    obj = object_new(type_ics);
+    object_property_add_child(OBJECT(spapr), "ics", obj, &error_abort);
+    object_property_add_const_link(obj, ICS_PROP_XICS, OBJECT(spapr),
+                                   &error_abort);
+    object_property_set_int(obj, nr_irqs, "nr-irqs", &local_err);
+    if (local_err) {
+        goto error;
     }
-    return XICS_COMMON(dev);
+    object_property_set_bool(obj, true, "realized", &local_err);
+    if (local_err) {
+        goto error;
+    }
+
+    return ICS_SIMPLE(obj);
+
+error:
+    error_propagate(errp, local_err);
+    return NULL;
 }
 
-static XICSState *xics_system_init(MachineState *machine,
-                                   int nr_servers, int nr_irqs, Error **errp)
+static bool pre_2_10_vmstate_dummy_icp_needed(void *opaque)
 {
-    XICSState *xics = NULL;
+    /* Dummy entries correspond to unused ICPState objects in older QEMUs,
+     * and newer QEMUs don't even have them. In both cases, we don't want
+     * to send anything on the wire.
+     */
+    return false;
+}
+
+static const VMStateDescription pre_2_10_vmstate_dummy_icp = {
+    .name = "icp/server",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = pre_2_10_vmstate_dummy_icp_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_UNUSED(4), /* uint32_t xirr */
+        VMSTATE_UNUSED(1), /* uint8_t pending_priority */
+        VMSTATE_UNUSED(1), /* uint8_t mfrr */
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static void pre_2_10_vmstate_register_dummy_icp(int i)
+{
+    vmstate_register(NULL, i, &pre_2_10_vmstate_dummy_icp,
+                     (void *)(uintptr_t) i);
+}
+
+static void pre_2_10_vmstate_unregister_dummy_icp(int i)
+{
+    vmstate_unregister(NULL, &pre_2_10_vmstate_dummy_icp,
+                       (void *)(uintptr_t) i);
+}
+
+static inline int xics_max_server_number(void)
+{
+    return DIV_ROUND_UP(max_cpus * kvmppc_smt_threads(), smp_threads);
+}
+
+static void xics_system_init(MachineState *machine, int nr_irqs, Error **errp)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(machine);
+    sPAPRMachineClass *smc = SPAPR_MACHINE_GET_CLASS(machine);
 
     if (kvm_enabled()) {
-        Error *err = NULL;
-
-        if (machine_kernel_irqchip_allowed(machine)) {
-            xics = try_create_xics(TYPE_XICS_SPAPR_KVM, nr_servers, nr_irqs,
-                                   &err);
+        if (machine_kernel_irqchip_allowed(machine) &&
+            !xics_kvm_init(spapr, errp)) {
+            spapr->icp_type = TYPE_KVM_ICP;
+            spapr->ics = spapr_ics_create(spapr, TYPE_ICS_KVM, nr_irqs, errp);
         }
-        if (machine_kernel_irqchip_required(machine) && !xics) {
-            error_reportf_err(err,
-                              "kernel_irqchip requested but unavailable: ");
-        } else {
-            error_free(err);
+        if (machine_kernel_irqchip_required(machine) && !spapr->ics) {
+            error_prepend(errp, "kernel_irqchip requested but unavailable: ");
+            return;
         }
     }
 
-    if (!xics) {
-        xics = try_create_xics(TYPE_XICS_SPAPR, nr_servers, nr_irqs, errp);
+    if (!spapr->ics) {
+        xics_spapr_init(spapr);
+        spapr->icp_type = TYPE_ICP;
+        spapr->ics = spapr_ics_create(spapr, TYPE_ICS_SIMPLE, nr_irqs, errp);
+        if (!spapr->ics) {
+            return;
+        }
     }
 
-    return xics;
+    if (smc->pre_2_10_has_unused_icps) {
+        int i;
+
+        for (i = 0; i < xics_max_server_number(); i++) {
+            /* Dummy entries get deregistered when real ICPState objects
+             * are registered during CPU core hotplug.
+             */
+            pre_2_10_vmstate_register_dummy_icp(i);
+        }
+    }
 }
 
 static int spapr_fixup_cpu_smt_dt(void *fdt, int offset, PowerPCCPU *cpu,
@@ -146,10 +210,10 @@ static int spapr_fixup_cpu_smt_dt(void *fdt, int offset, PowerPCCPU *cpu,
     int i, ret = 0;
     uint32_t servers_prop[smt_threads];
     uint32_t gservers_prop[smt_threads * 2];
-    int index = ppc_get_vcpu_dt_id(cpu);
+    int index = spapr_vcpu_id(cpu);
 
-    if (cpu->cpu_version) {
-        ret = fdt_setprop_cell(fdt, offset, "cpu-version", cpu->cpu_version);
+    if (cpu->compat_pvr) {
+        ret = fdt_setprop_cell(fdt, offset, "cpu-version", cpu->compat_pvr);
         if (ret < 0) {
             return ret;
         }
@@ -173,25 +237,98 @@ static int spapr_fixup_cpu_smt_dt(void *fdt, int offset, PowerPCCPU *cpu,
     return ret;
 }
 
-static int spapr_fixup_cpu_numa_dt(void *fdt, int offset, CPUState *cs)
+static int spapr_fixup_cpu_numa_dt(void *fdt, int offset, PowerPCCPU *cpu)
 {
-    int ret = 0;
-    PowerPCCPU *cpu = POWERPC_CPU(cs);
-    int index = ppc_get_vcpu_dt_id(cpu);
+    int index = spapr_vcpu_id(cpu);
     uint32_t associativity[] = {cpu_to_be32(0x5),
                                 cpu_to_be32(0x0),
                                 cpu_to_be32(0x0),
                                 cpu_to_be32(0x0),
-                                cpu_to_be32(cs->numa_node),
+                                cpu_to_be32(cpu->node_id),
                                 cpu_to_be32(index)};
 
     /* Advertise NUMA via ibm,associativity */
-    if (nb_numa_nodes > 1) {
-        ret = fdt_setprop(fdt, offset, "ibm,associativity", associativity,
+    return fdt_setprop(fdt, offset, "ibm,associativity", associativity,
                           sizeof(associativity));
+}
+
+/* Populate the "ibm,pa-features" property */
+static void spapr_populate_pa_features(PowerPCCPU *cpu, void *fdt, int offset,
+                                       bool legacy_guest)
+{
+    CPUPPCState *env = &cpu->env;
+    uint8_t pa_features_206[] = { 6, 0,
+        0xf6, 0x1f, 0xc7, 0x00, 0x80, 0xc0 };
+    uint8_t pa_features_207[] = { 24, 0,
+        0xf6, 0x1f, 0xc7, 0xc0, 0x80, 0xf0,
+        0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x80, 0x00,
+        0x80, 0x00, 0x80, 0x00, 0x00, 0x00 };
+    uint8_t pa_features_300[] = { 66, 0,
+        /* 0: MMU|FPU|SLB|RUN|DABR|NX, 1: fri[nzpm]|DABRX|SPRG3|SLB0|PP110 */
+        /* 2: VPM|DS205|PPR|DS202|DS206, 3: LSD|URG, SSO, 5: LE|CFAR|EB|LSQ */
+        0xf6, 0x1f, 0xc7, 0xc0, 0x80, 0xf0, /* 0 - 5 */
+        /* 6: DS207 */
+        0x80, 0x00, 0x00, 0x00, 0x00, 0x00, /* 6 - 11 */
+        /* 16: Vector */
+        0x00, 0x00, 0x00, 0x00, 0x80, 0x00, /* 12 - 17 */
+        /* 18: Vec. Scalar, 20: Vec. XOR, 22: HTM */
+        0x80, 0x00, 0x80, 0x00, 0x00, 0x00, /* 18 - 23 */
+        /* 24: Ext. Dec, 26: 64 bit ftrs, 28: PM ftrs */
+        0x80, 0x00, 0x80, 0x00, 0x80, 0x00, /* 24 - 29 */
+        /* 30: MMR, 32: LE atomic, 34: EBB + ext EBB */
+        0x80, 0x00, 0x80, 0x00, 0xC0, 0x00, /* 30 - 35 */
+        /* 36: SPR SO, 38: Copy/Paste, 40: Radix MMU */
+        0x80, 0x00, 0x80, 0x00, 0x80, 0x00, /* 36 - 41 */
+        /* 42: PM, 44: PC RA, 46: SC vec'd */
+        0x80, 0x00, 0x80, 0x00, 0x80, 0x00, /* 42 - 47 */
+        /* 48: SIMD, 50: QP BFP, 52: String */
+        0x80, 0x00, 0x80, 0x00, 0x80, 0x00, /* 48 - 53 */
+        /* 54: DecFP, 56: DecI, 58: SHA */
+        0x80, 0x00, 0x80, 0x00, 0x80, 0x00, /* 54 - 59 */
+        /* 60: NM atomic, 62: RNG */
+        0x80, 0x00, 0x80, 0x00, 0x00, 0x00, /* 60 - 65 */
+    };
+    uint8_t *pa_features = NULL;
+    size_t pa_size;
+
+    if (ppc_check_compat(cpu, CPU_POWERPC_LOGICAL_2_06, 0, cpu->compat_pvr)) {
+        pa_features = pa_features_206;
+        pa_size = sizeof(pa_features_206);
+    }
+    if (ppc_check_compat(cpu, CPU_POWERPC_LOGICAL_2_07, 0, cpu->compat_pvr)) {
+        pa_features = pa_features_207;
+        pa_size = sizeof(pa_features_207);
+    }
+    if (ppc_check_compat(cpu, CPU_POWERPC_LOGICAL_3_00, 0, cpu->compat_pvr)) {
+        pa_features = pa_features_300;
+        pa_size = sizeof(pa_features_300);
+    }
+    if (!pa_features) {
+        return;
     }
 
-    return ret;
+    if (env->ci_large_pages) {
+        /*
+         * Note: we keep CI large pages off by default because a 64K capable
+         * guest provisioned with large pages might otherwise try to map a qemu
+         * framebuffer (or other kind of memory mapped PCI BAR) using 64K pages
+         * even if that qemu runs on a 4k host.
+         * We dd this bit back here if we are confident this is not an issue
+         */
+        pa_features[3] |= 0x20;
+    }
+    if (kvmppc_has_cap_htm() && pa_size > 24) {
+        pa_features[24] |= 0x80;    /* Transactional memory support */
+    }
+    if (legacy_guest && pa_size > 40) {
+        /* Workaround for broken kernels that attempt (guest) radix
+         * mode when they can't handle it, if they see the radix bit set
+         * in pa-features. So hide it from them. */
+        pa_features[40 + 2] &= ~0x80; /* Radix MMU */
+    }
+
+    _FDT((fdt_setprop(fdt, offset, "ibm,pa-features", pa_features, pa_size)));
 }
 
 static int spapr_fixup_cpu_dt(void *fdt, sPAPRMachineState *spapr)
@@ -205,7 +342,8 @@ static int spapr_fixup_cpu_dt(void *fdt, sPAPRMachineState *spapr)
     CPU_FOREACH(cs) {
         PowerPCCPU *cpu = POWERPC_CPU(cs);
         DeviceClass *dc = DEVICE_GET_CLASS(cs);
-        int index = ppc_get_vcpu_dt_id(cpu);
+        int index = spapr_vcpu_id(cpu);
+        int compat_smt = MIN(smp_threads, ppc_compat_max_threads(cpu));
 
         if ((index % smt) != 0) {
             continue;
@@ -215,8 +353,7 @@ static int spapr_fixup_cpu_dt(void *fdt, sPAPRMachineState *spapr)
 
         cpus_offset = fdt_path_offset(fdt, "/cpus");
         if (cpus_offset < 0) {
-            cpus_offset = fdt_add_subnode(fdt, fdt_path_offset(fdt, "/"),
-                                          "cpus");
+            cpus_offset = fdt_add_subnode(fdt, 0, "cpus");
             if (cpus_offset < 0) {
                 return cpus_offset;
             }
@@ -235,58 +372,26 @@ static int spapr_fixup_cpu_dt(void *fdt, sPAPRMachineState *spapr)
             return ret;
         }
 
-        ret = spapr_fixup_cpu_numa_dt(fdt, offset, cs);
+        if (nb_numa_nodes > 1) {
+            ret = spapr_fixup_cpu_numa_dt(fdt, offset, cpu);
+            if (ret < 0) {
+                return ret;
+            }
+        }
+
+        ret = spapr_fixup_cpu_smt_dt(fdt, offset, cpu, compat_smt);
         if (ret < 0) {
             return ret;
         }
 
-        ret = spapr_fixup_cpu_smt_dt(fdt, offset, cpu,
-                                     ppc_get_compat_smt_threads(cpu));
-        if (ret < 0) {
-            return ret;
-        }
+        spapr_populate_pa_features(cpu, fdt, offset,
+                                         spapr->cas_legacy_guest_workaround);
     }
     return ret;
 }
 
-
-static size_t create_page_sizes_prop(CPUPPCState *env, uint32_t *prop,
-                                     size_t maxsize)
+static hwaddr spapr_node0_size(MachineState *machine)
 {
-    size_t maxcells = maxsize / sizeof(uint32_t);
-    int i, j, count;
-    uint32_t *p = prop;
-
-    for (i = 0; i < PPC_PAGE_SIZES_MAX_SZ; i++) {
-        struct ppc_one_seg_page_size *sps = &env->sps.sps[i];
-
-        if (!sps->page_shift) {
-            break;
-        }
-        for (count = 0; count < PPC_PAGE_SIZES_MAX_SZ; count++) {
-            if (sps->enc[count].page_shift == 0) {
-                break;
-            }
-        }
-        if ((p - prop) >= (maxcells - 3 - count * 2)) {
-            break;
-        }
-        *(p++) = cpu_to_be32(sps->page_shift);
-        *(p++) = cpu_to_be32(sps->slb_enc);
-        *(p++) = cpu_to_be32(count);
-        for (j = 0; j < count; j++) {
-            *(p++) = cpu_to_be32(sps->enc[j].page_shift);
-            *(p++) = cpu_to_be32(sps->enc[j].pte_enc);
-        }
-    }
-
-    return (p - prop) * sizeof(uint32_t);
-}
-
-static hwaddr spapr_node0_size(void)
-{
-    MachineState *machine = MACHINE(qdev_get_machine());
-
     if (nb_numa_nodes) {
         int i;
         for (i = 0; i < nb_numa_nodes; ++i) {
@@ -299,223 +404,9 @@ static hwaddr spapr_node0_size(void)
     return machine->ram_size;
 }
 
-#define _FDT(exp) \
-    do { \
-        int ret = (exp);                                           \
-        if (ret < 0) {                                             \
-            fprintf(stderr, "qemu: error creating device tree: %s: %s\n", \
-                    #exp, fdt_strerror(ret));                      \
-            exit(1);                                               \
-        }                                                          \
-    } while (0)
-
 static void add_str(GString *s, const gchar *s1)
 {
     g_string_append_len(s, s1, strlen(s1) + 1);
-}
-
-static void *spapr_create_fdt_skel(hwaddr initrd_base,
-                                   hwaddr initrd_size,
-                                   hwaddr kernel_size,
-                                   bool little_endian,
-                                   const char *kernel_cmdline,
-                                   uint32_t epow_irq)
-{
-    void *fdt;
-    uint32_t start_prop = cpu_to_be32(initrd_base);
-    uint32_t end_prop = cpu_to_be32(initrd_base + initrd_size);
-    GString *hypertas = g_string_sized_new(256);
-    GString *qemu_hypertas = g_string_sized_new(256);
-    uint32_t refpoints[] = {cpu_to_be32(0x4), cpu_to_be32(0x4)};
-    uint32_t interrupt_server_ranges_prop[] = {0, cpu_to_be32(max_cpus)};
-    unsigned char vec5[] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x80};
-    char *buf;
-
-    add_str(hypertas, "hcall-pft");
-    add_str(hypertas, "hcall-term");
-    add_str(hypertas, "hcall-dabr");
-    add_str(hypertas, "hcall-interrupt");
-    add_str(hypertas, "hcall-tce");
-    add_str(hypertas, "hcall-vio");
-    add_str(hypertas, "hcall-splpar");
-    add_str(hypertas, "hcall-bulk");
-    add_str(hypertas, "hcall-set-mode");
-    add_str(hypertas, "hcall-sprg0");
-    add_str(hypertas, "hcall-copy");
-    add_str(hypertas, "hcall-debug");
-    add_str(qemu_hypertas, "hcall-memop1");
-
-    fdt = g_malloc0(FDT_MAX_SIZE);
-    _FDT((fdt_create(fdt, FDT_MAX_SIZE)));
-
-    if (kernel_size) {
-        _FDT((fdt_add_reservemap_entry(fdt, KERNEL_LOAD_ADDR, kernel_size)));
-    }
-    if (initrd_size) {
-        _FDT((fdt_add_reservemap_entry(fdt, initrd_base, initrd_size)));
-    }
-    _FDT((fdt_finish_reservemap(fdt)));
-
-    /* Root node */
-    _FDT((fdt_begin_node(fdt, "")));
-    _FDT((fdt_property_string(fdt, "device_type", "chrp")));
-    _FDT((fdt_property_string(fdt, "model", "IBM pSeries (emulated by qemu)")));
-    _FDT((fdt_property_string(fdt, "compatible", "qemu,pseries")));
-
-    /*
-     * Add info to guest to indentify which host is it being run on
-     * and what is the uuid of the guest
-     */
-    if (kvmppc_get_host_model(&buf)) {
-        _FDT((fdt_property_string(fdt, "host-model", buf)));
-        g_free(buf);
-    }
-    if (kvmppc_get_host_serial(&buf)) {
-        _FDT((fdt_property_string(fdt, "host-serial", buf)));
-        g_free(buf);
-    }
-
-    buf = g_strdup_printf(UUID_FMT, qemu_uuid[0], qemu_uuid[1],
-                          qemu_uuid[2], qemu_uuid[3], qemu_uuid[4],
-                          qemu_uuid[5], qemu_uuid[6], qemu_uuid[7],
-                          qemu_uuid[8], qemu_uuid[9], qemu_uuid[10],
-                          qemu_uuid[11], qemu_uuid[12], qemu_uuid[13],
-                          qemu_uuid[14], qemu_uuid[15]);
-
-    _FDT((fdt_property_string(fdt, "vm,uuid", buf)));
-    if (qemu_uuid_set) {
-        _FDT((fdt_property_string(fdt, "system-id", buf)));
-    }
-    g_free(buf);
-
-    if (qemu_get_vm_name()) {
-        _FDT((fdt_property_string(fdt, "ibm,partition-name",
-                                  qemu_get_vm_name())));
-    }
-
-    _FDT((fdt_property_cell(fdt, "#address-cells", 0x2)));
-    _FDT((fdt_property_cell(fdt, "#size-cells", 0x2)));
-
-    /* /chosen */
-    _FDT((fdt_begin_node(fdt, "chosen")));
-
-    /* Set Form1_affinity */
-    _FDT((fdt_property(fdt, "ibm,architecture-vec-5", vec5, sizeof(vec5))));
-
-    _FDT((fdt_property_string(fdt, "bootargs", kernel_cmdline)));
-    _FDT((fdt_property(fdt, "linux,initrd-start",
-                       &start_prop, sizeof(start_prop))));
-    _FDT((fdt_property(fdt, "linux,initrd-end",
-                       &end_prop, sizeof(end_prop))));
-    if (kernel_size) {
-        uint64_t kprop[2] = { cpu_to_be64(KERNEL_LOAD_ADDR),
-                              cpu_to_be64(kernel_size) };
-
-        _FDT((fdt_property(fdt, "qemu,boot-kernel", &kprop, sizeof(kprop))));
-        if (little_endian) {
-            _FDT((fdt_property(fdt, "qemu,boot-kernel-le", NULL, 0)));
-        }
-    }
-    if (boot_menu) {
-        _FDT((fdt_property_cell(fdt, "qemu,boot-menu", boot_menu)));
-    }
-    _FDT((fdt_property_cell(fdt, "qemu,graphic-width", graphic_width)));
-    _FDT((fdt_property_cell(fdt, "qemu,graphic-height", graphic_height)));
-    _FDT((fdt_property_cell(fdt, "qemu,graphic-depth", graphic_depth)));
-
-    _FDT((fdt_end_node(fdt)));
-
-    /* RTAS */
-    _FDT((fdt_begin_node(fdt, "rtas")));
-
-    if (!kvm_enabled() || kvmppc_spapr_use_multitce()) {
-        add_str(hypertas, "hcall-multi-tce");
-    }
-    _FDT((fdt_property(fdt, "ibm,hypertas-functions", hypertas->str,
-                       hypertas->len)));
-    g_string_free(hypertas, TRUE);
-    _FDT((fdt_property(fdt, "qemu,hypertas-functions", qemu_hypertas->str,
-                       qemu_hypertas->len)));
-    g_string_free(qemu_hypertas, TRUE);
-
-    _FDT((fdt_property(fdt, "ibm,associativity-reference-points",
-        refpoints, sizeof(refpoints))));
-
-    _FDT((fdt_property_cell(fdt, "rtas-error-log-max", RTAS_ERROR_LOG_MAX)));
-    _FDT((fdt_property_cell(fdt, "rtas-event-scan-rate",
-                            RTAS_EVENT_SCAN_RATE)));
-
-    if (msi_nonbroken) {
-        _FDT((fdt_property(fdt, "ibm,change-msix-capable", NULL, 0)));
-    }
-
-    /*
-     * According to PAPR, rtas ibm,os-term does not guarantee a return
-     * back to the guest cpu.
-     *
-     * While an additional ibm,extended-os-term property indicates that
-     * rtas call return will always occur. Set this property.
-     */
-    _FDT((fdt_property(fdt, "ibm,extended-os-term", NULL, 0)));
-
-    _FDT((fdt_end_node(fdt)));
-
-    /* interrupt controller */
-    _FDT((fdt_begin_node(fdt, "interrupt-controller")));
-
-    _FDT((fdt_property_string(fdt, "device_type",
-                              "PowerPC-External-Interrupt-Presentation")));
-    _FDT((fdt_property_string(fdt, "compatible", "IBM,ppc-xicp")));
-    _FDT((fdt_property(fdt, "interrupt-controller", NULL, 0)));
-    _FDT((fdt_property(fdt, "ibm,interrupt-server-ranges",
-                       interrupt_server_ranges_prop,
-                       sizeof(interrupt_server_ranges_prop))));
-    _FDT((fdt_property_cell(fdt, "#interrupt-cells", 2)));
-    _FDT((fdt_property_cell(fdt, "linux,phandle", PHANDLE_XICP)));
-    _FDT((fdt_property_cell(fdt, "phandle", PHANDLE_XICP)));
-
-    _FDT((fdt_end_node(fdt)));
-
-    /* vdevice */
-    _FDT((fdt_begin_node(fdt, "vdevice")));
-
-    _FDT((fdt_property_string(fdt, "device_type", "vdevice")));
-    _FDT((fdt_property_string(fdt, "compatible", "IBM,vdevice")));
-    _FDT((fdt_property_cell(fdt, "#address-cells", 0x1)));
-    _FDT((fdt_property_cell(fdt, "#size-cells", 0x0)));
-    _FDT((fdt_property_cell(fdt, "#interrupt-cells", 0x2)));
-    _FDT((fdt_property(fdt, "interrupt-controller", NULL, 0)));
-
-    _FDT((fdt_end_node(fdt)));
-
-    /* event-sources */
-    spapr_events_fdt_skel(fdt, epow_irq);
-
-    /* /hypervisor node */
-    if (kvm_enabled()) {
-        uint8_t hypercall[16];
-
-        /* indicate KVM hypercall interface */
-        _FDT((fdt_begin_node(fdt, "hypervisor")));
-        _FDT((fdt_property_string(fdt, "compatible", "linux,kvm")));
-        if (kvmppc_has_cap_fixup_hcalls()) {
-            /*
-             * Older KVM versions with older guest kernels were broken with the
-             * magic page, don't allow the guest to map it.
-             */
-            if (!kvmppc_get_hypercall(first_cpu->env_ptr, hypercall,
-                                      sizeof(hypercall))) {
-                _FDT((fdt_property(fdt, "hcall-instructions", hypercall,
-                                   sizeof(hypercall))));
-            }
-        }
-        _FDT((fdt_end_node(fdt)));
-    }
-
-    _FDT((fdt_end_node(fdt))); /* close root node */
-    _FDT((fdt_finish(fdt)));
-
-    return fdt;
 }
 
 static int spapr_populate_memory_node(void *fdt, int nodeid, hwaddr start,
@@ -594,58 +485,13 @@ static int spapr_populate_memory(sPAPRMachineState *spapr, void *fdt)
     return 0;
 }
 
-/* Populate the "ibm,pa-features" property */
-static void spapr_populate_pa_features(CPUPPCState *env, void *fdt, int offset)
-{
-    uint8_t pa_features_206[] = { 6, 0,
-        0xf6, 0x1f, 0xc7, 0x00, 0x80, 0xc0 };
-    uint8_t pa_features_207[] = { 24, 0,
-        0xf6, 0x1f, 0xc7, 0xc0, 0x80, 0xf0,
-        0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x80, 0x00,
-        0x80, 0x00, 0x80, 0x00, 0x00, 0x00 };
-    uint8_t *pa_features;
-    size_t pa_size;
-
-    switch (env->mmu_model) {
-    case POWERPC_MMU_2_06:
-    case POWERPC_MMU_2_06a:
-        pa_features = pa_features_206;
-        pa_size = sizeof(pa_features_206);
-        break;
-    case POWERPC_MMU_2_07:
-    case POWERPC_MMU_2_07a:
-        pa_features = pa_features_207;
-        pa_size = sizeof(pa_features_207);
-        break;
-    default:
-        return;
-    }
-
-    if (env->ci_large_pages) {
-        /*
-         * Note: we keep CI large pages off by default because a 64K capable
-         * guest provisioned with large pages might otherwise try to map a qemu
-         * framebuffer (or other kind of memory mapped PCI BAR) using 64K pages
-         * even if that qemu runs on a 4k host.
-         * We dd this bit back here if we are confident this is not an issue
-         */
-        pa_features[3] |= 0x20;
-    }
-    if (kvmppc_has_cap_htm() && pa_size > 24) {
-        pa_features[24] |= 0x80;    /* Transactional memory support */
-    }
-
-    _FDT((fdt_setprop(fdt, offset, "ibm,pa-features", pa_features, pa_size)));
-}
-
 static void spapr_populate_cpu_dt(CPUState *cs, void *fdt, int offset,
                                   sPAPRMachineState *spapr)
 {
     PowerPCCPU *cpu = POWERPC_CPU(cs);
     CPUPPCState *env = &cpu->env;
     PowerPCCPUClass *pcc = POWERPC_CPU_GET_CLASS(cs);
-    int index = ppc_get_vcpu_dt_id(cpu);
+    int index = spapr_vcpu_id(cpu);
     uint32_t segs[] = {cpu_to_be32(28), cpu_to_be32(40),
                        0xffffffff, 0xffffffff};
     uint32_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq()
@@ -655,14 +501,15 @@ static void spapr_populate_cpu_dt(CPUState *cs, void *fdt, int offset,
     size_t page_sizes_prop_size;
     uint32_t vcpus_per_socket = smp_threads * smp_cores;
     uint32_t pft_size_prop[] = {0, cpu_to_be32(spapr->htab_shift)};
+    int compat_smt = MIN(smp_threads, ppc_compat_max_threads(cpu));
     sPAPRDRConnector *drc;
-    sPAPRDRConnectorClass *drck;
     int drc_index;
+    uint32_t radix_AP_encodings[PPC_PAGE_SIZES_MAX_SZ];
+    int i;
 
-    drc = spapr_dr_connector_by_id(SPAPR_DR_CONNECTOR_TYPE_CPU, index);
+    drc = spapr_drc_by_id(TYPE_SPAPR_DRC_CPU, index);
     if (drc) {
-        drck = SPAPR_DR_CONNECTOR_GET_CLASS(drc);
-        drc_index = drck->get_index(drc);
+        drc_index = spapr_drc_index(drc);
         _FDT((fdt_setprop_cell(fdt, offset, "ibm,my-drc-index", drc_index)));
     }
 
@@ -683,13 +530,13 @@ static void spapr_populate_cpu_dt(CPUState *cs, void *fdt, int offset,
         _FDT((fdt_setprop_cell(fdt, offset, "d-cache-size",
                                pcc->l1_dcache_size)));
     } else {
-        fprintf(stderr, "Warning: Unknown L1 dcache size for cpu\n");
+        warn_report("Unknown L1 dcache size for cpu");
     }
     if (pcc->l1_icache_size) {
         _FDT((fdt_setprop_cell(fdt, offset, "i-cache-size",
                                pcc->l1_icache_size)));
     } else {
-        fprintf(stderr, "Warning: Unknown L1 icache size for cpu\n");
+        warn_report("Unknown L1 icache size for cpu");
     }
 
     _FDT((fdt_setprop_cell(fdt, offset, "timebase-frequency", tbfreq)));
@@ -725,14 +572,14 @@ static void spapr_populate_cpu_dt(CPUState *cs, void *fdt, int offset,
         _FDT((fdt_setprop_cell(fdt, offset, "ibm,dfp", 1)));
     }
 
-    page_sizes_prop_size = create_page_sizes_prop(env, page_sizes_prop,
+    page_sizes_prop_size = ppc_create_page_sizes_prop(env, page_sizes_prop,
                                                   sizeof(page_sizes_prop));
     if (page_sizes_prop_size) {
         _FDT((fdt_setprop(fdt, offset, "ibm,segment-page-sizes",
                           page_sizes_prop, page_sizes_prop_size)));
     }
 
-    spapr_populate_pa_features(env, fdt, offset);
+    spapr_populate_pa_features(cpu, fdt, offset, false);
 
     _FDT((fdt_setprop_cell(fdt, offset, "ibm,chip-id",
                            cs->cpu_index / vcpus_per_socket)));
@@ -740,10 +587,22 @@ static void spapr_populate_cpu_dt(CPUState *cs, void *fdt, int offset,
     _FDT((fdt_setprop(fdt, offset, "ibm,pft-size",
                       pft_size_prop, sizeof(pft_size_prop))));
 
-    _FDT(spapr_fixup_cpu_numa_dt(fdt, offset, cs));
+    if (nb_numa_nodes > 1) {
+        _FDT(spapr_fixup_cpu_numa_dt(fdt, offset, cpu));
+    }
 
-    _FDT(spapr_fixup_cpu_smt_dt(fdt, offset, cpu,
-                                ppc_get_compat_smt_threads(cpu)));
+    _FDT(spapr_fixup_cpu_smt_dt(fdt, offset, cpu, compat_smt));
+
+    if (pcc->radix_page_info) {
+        for (i = 0; i < pcc->radix_page_info->count; i++) {
+            radix_AP_encodings[i] =
+                cpu_to_be32(pcc->radix_page_info->entries[i]);
+        }
+        _FDT((fdt_setprop(fdt, offset, "ibm,processor-radix-AP-encodings",
+                          radix_AP_encodings,
+                          pcc->radix_page_info->count *
+                          sizeof(radix_AP_encodings[0]))));
+    }
 }
 
 static void spapr_populate_cpus_dt_node(void *fdt, sPAPRMachineState *spapr)
@@ -765,7 +624,7 @@ static void spapr_populate_cpus_dt_node(void *fdt, sPAPRMachineState *spapr)
      */
     CPU_FOREACH_REVERSE(cs) {
         PowerPCCPU *cpu = POWERPC_CPU(cs);
-        int index = ppc_get_vcpu_dt_id(cpu);
+        int index = spapr_vcpu_id(cpu);
         DeviceClass *dc = DEVICE_GET_CLASS(cs);
         int offset;
 
@@ -842,15 +701,13 @@ static int spapr_populate_drconf_memory(sPAPRMachineState *spapr, void *fdt)
 
         if (i >= hotplug_lmb_start) {
             sPAPRDRConnector *drc;
-            sPAPRDRConnectorClass *drck;
 
-            drc = spapr_dr_connector_by_id(SPAPR_DR_CONNECTOR_TYPE_LMB, i);
+            drc = spapr_drc_by_id(TYPE_SPAPR_DRC_LMB, i);
             g_assert(drc);
-            drck = SPAPR_DR_CONNECTOR_GET_CLASS(drc);
 
             dynamic_memory[0] = cpu_to_be32(addr >> 32);
             dynamic_memory[1] = cpu_to_be32(addr & 0xffffffff);
-            dynamic_memory[2] = cpu_to_be32(drck->get_index(drc));
+            dynamic_memory[2] = cpu_to_be32(spapr_drc_index(drc));
             dynamic_memory[3] = cpu_to_be32(0); /* reserved */
             dynamic_memory[4] = cpu_to_be32(numa_get_node(addr, NULL));
             if (memory_region_present(get_system_memory(), addr)) {
@@ -902,17 +759,76 @@ out:
     return ret;
 }
 
+static int spapr_dt_cas_updates(sPAPRMachineState *spapr, void *fdt,
+                                sPAPROptionVector *ov5_updates)
+{
+    sPAPRMachineClass *smc = SPAPR_MACHINE_GET_CLASS(spapr);
+    int ret = 0, offset;
+
+    /* Generate ibm,dynamic-reconfiguration-memory node if required */
+    if (spapr_ovec_test(ov5_updates, OV5_DRCONF_MEMORY)) {
+        g_assert(smc->dr_lmb_enabled);
+        ret = spapr_populate_drconf_memory(spapr, fdt);
+        if (ret) {
+            goto out;
+        }
+    }
+
+    offset = fdt_path_offset(fdt, "/chosen");
+    if (offset < 0) {
+        offset = fdt_add_subnode(fdt, 0, "chosen");
+        if (offset < 0) {
+            return offset;
+        }
+    }
+    ret = spapr_ovec_populate_dt(fdt, offset, spapr->ov5_cas,
+                                 "ibm,architecture-vec-5");
+
+out:
+    return ret;
+}
+
+static bool spapr_hotplugged_dev_before_cas(void)
+{
+    Object *drc_container, *obj;
+    ObjectProperty *prop;
+    ObjectPropertyIterator iter;
+
+    drc_container = container_get(object_get_root(), "/dr-connector");
+    object_property_iter_init(&iter, drc_container);
+    while ((prop = object_property_iter_next(&iter))) {
+        if (!strstart(prop->type, "link<", NULL)) {
+            continue;
+        }
+        obj = object_property_get_link(drc_container, prop->name, NULL);
+        if (spapr_drc_needed(obj)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int spapr_h_cas_compose_response(sPAPRMachineState *spapr,
                                  target_ulong addr, target_ulong size,
-                                 bool cpu_update, bool memory_update)
+                                 sPAPROptionVector *ov5_updates)
 {
     void *fdt, *fdt_skel;
     sPAPRDeviceTreeUpdateHeader hdr = { .version_id = 1 };
-    sPAPRMachineClass *smc = SPAPR_MACHINE_GET_CLASS(qdev_get_machine());
+
+    if (spapr_hotplugged_dev_before_cas()) {
+        return 1;
+    }
+
+    if (size < sizeof(hdr) || size > FW_MAX_SIZE) {
+        error_report("SLOF provided an unexpected CAS buffer size "
+                     TARGET_FMT_lu " (min: %zu, max: %u)",
+                     size, sizeof(hdr), FW_MAX_SIZE);
+        exit(EXIT_FAILURE);
+    }
 
     size -= sizeof(hdr);
 
-    /* Create sceleton */
+    /* Create skeleton */
     fdt_skel = g_malloc0(size);
     _FDT((fdt_create(fdt_skel, size)));
     _FDT((fdt_begin_node(fdt_skel, "")));
@@ -923,13 +839,10 @@ int spapr_h_cas_compose_response(sPAPRMachineState *spapr,
     g_free(fdt_skel);
 
     /* Fixup cpu nodes */
-    if (cpu_update) {
-        _FDT((spapr_fixup_cpu_dt(fdt, spapr)));
-    }
+    _FDT((spapr_fixup_cpu_dt(fdt, spapr)));
 
-    /* Generate ibm,dynamic-reconfiguration-memory node if required */
-    if (memory_update && smc->dr_lmb_enabled) {
-        _FDT((spapr_populate_drconf_memory(spapr, fdt)));
+    if (spapr_dt_cas_updates(spapr, fdt, ov5_updates)) {
+        return -1;
     }
 
     /* Pack resulting tree */
@@ -948,42 +861,261 @@ int spapr_h_cas_compose_response(sPAPRMachineState *spapr,
     return 0;
 }
 
-static void spapr_finalize_fdt(sPAPRMachineState *spapr,
-                               hwaddr fdt_addr,
-                               hwaddr rtas_addr,
-                               hwaddr rtas_size)
+static void spapr_dt_rtas(sPAPRMachineState *spapr, void *fdt)
 {
-    MachineState *machine = MACHINE(qdev_get_machine());
+    int rtas;
+    GString *hypertas = g_string_sized_new(256);
+    GString *qemu_hypertas = g_string_sized_new(256);
+    uint32_t refpoints[] = { cpu_to_be32(0x4), cpu_to_be32(0x4) };
+    uint64_t max_hotplug_addr = spapr->hotplug_memory.base +
+        memory_region_size(&spapr->hotplug_memory.mr);
+    uint32_t lrdr_capacity[] = {
+        cpu_to_be32(max_hotplug_addr >> 32),
+        cpu_to_be32(max_hotplug_addr & 0xffffffff),
+        0, cpu_to_be32(SPAPR_MEMORY_BLOCK_SIZE),
+        cpu_to_be32(max_cpus / smp_threads),
+    };
+
+    _FDT(rtas = fdt_add_subnode(fdt, 0, "rtas"));
+
+    /* hypertas */
+    add_str(hypertas, "hcall-pft");
+    add_str(hypertas, "hcall-term");
+    add_str(hypertas, "hcall-dabr");
+    add_str(hypertas, "hcall-interrupt");
+    add_str(hypertas, "hcall-tce");
+    add_str(hypertas, "hcall-vio");
+    add_str(hypertas, "hcall-splpar");
+    add_str(hypertas, "hcall-bulk");
+    add_str(hypertas, "hcall-set-mode");
+    add_str(hypertas, "hcall-sprg0");
+    add_str(hypertas, "hcall-copy");
+    add_str(hypertas, "hcall-debug");
+    add_str(qemu_hypertas, "hcall-memop1");
+
+    if (!kvm_enabled() || kvmppc_spapr_use_multitce()) {
+        add_str(hypertas, "hcall-multi-tce");
+    }
+
+    if (spapr->resize_hpt != SPAPR_RESIZE_HPT_DISABLED) {
+        add_str(hypertas, "hcall-hpt-resize");
+    }
+
+    _FDT(fdt_setprop(fdt, rtas, "ibm,hypertas-functions",
+                     hypertas->str, hypertas->len));
+    g_string_free(hypertas, TRUE);
+    _FDT(fdt_setprop(fdt, rtas, "qemu,hypertas-functions",
+                     qemu_hypertas->str, qemu_hypertas->len));
+    g_string_free(qemu_hypertas, TRUE);
+
+    _FDT(fdt_setprop(fdt, rtas, "ibm,associativity-reference-points",
+                     refpoints, sizeof(refpoints)));
+
+    _FDT(fdt_setprop_cell(fdt, rtas, "rtas-error-log-max",
+                          RTAS_ERROR_LOG_MAX));
+    _FDT(fdt_setprop_cell(fdt, rtas, "rtas-event-scan-rate",
+                          RTAS_EVENT_SCAN_RATE));
+
+    if (msi_nonbroken) {
+        _FDT(fdt_setprop(fdt, rtas, "ibm,change-msix-capable", NULL, 0));
+    }
+
+    /*
+     * According to PAPR, rtas ibm,os-term does not guarantee a return
+     * back to the guest cpu.
+     *
+     * While an additional ibm,extended-os-term property indicates
+     * that rtas call return will always occur. Set this property.
+     */
+    _FDT(fdt_setprop(fdt, rtas, "ibm,extended-os-term", NULL, 0));
+
+    _FDT(fdt_setprop(fdt, rtas, "ibm,lrdr-capacity",
+                     lrdr_capacity, sizeof(lrdr_capacity)));
+
+    spapr_dt_rtas_tokens(fdt, rtas);
+}
+
+/* Prepare ibm,arch-vec-5-platform-support, which indicates the MMU features
+ * that the guest may request and thus the valid values for bytes 24..26 of
+ * option vector 5: */
+static void spapr_dt_ov5_platform_support(void *fdt, int chosen)
+{
+    PowerPCCPU *first_ppc_cpu = POWERPC_CPU(first_cpu);
+
+    char val[2 * 4] = {
+        23, 0x00, /* Xive mode, filled in below. */
+        24, 0x00, /* Hash/Radix, filled in below. */
+        25, 0x00, /* Hash options: Segment Tables == no, GTSE == no. */
+        26, 0x40, /* Radix options: GTSE == yes. */
+    };
+
+    if (!ppc_check_compat(first_ppc_cpu, CPU_POWERPC_LOGICAL_3_00, 0,
+                          first_ppc_cpu->compat_pvr)) {
+        /* If we're in a pre POWER9 compat mode then the guest should do hash */
+        val[3] = 0x00; /* Hash */
+    } else if (kvm_enabled()) {
+        if (kvmppc_has_cap_mmu_radix() && kvmppc_has_cap_mmu_hash_v3()) {
+            val[3] = 0x80; /* OV5_MMU_BOTH */
+        } else if (kvmppc_has_cap_mmu_radix()) {
+            val[3] = 0x40; /* OV5_MMU_RADIX_300 */
+        } else {
+            val[3] = 0x00; /* Hash */
+        }
+    } else {
+        /* V3 MMU supports both hash and radix in tcg (with dynamic switching) */
+        val[3] = 0xC0;
+    }
+    _FDT(fdt_setprop(fdt, chosen, "ibm,arch-vec-5-platform-support",
+                     val, sizeof(val)));
+}
+
+static void spapr_dt_chosen(sPAPRMachineState *spapr, void *fdt)
+{
+    MachineState *machine = MACHINE(spapr);
+    int chosen;
+    const char *boot_device = machine->boot_order;
+    char *stdout_path = spapr_vio_stdout_path(spapr->vio_bus);
+    size_t cb = 0;
+    char *bootlist = get_boot_devices_list(&cb, true);
+
+    _FDT(chosen = fdt_add_subnode(fdt, 0, "chosen"));
+
+    _FDT(fdt_setprop_string(fdt, chosen, "bootargs", machine->kernel_cmdline));
+    _FDT(fdt_setprop_cell(fdt, chosen, "linux,initrd-start",
+                          spapr->initrd_base));
+    _FDT(fdt_setprop_cell(fdt, chosen, "linux,initrd-end",
+                          spapr->initrd_base + spapr->initrd_size));
+
+    if (spapr->kernel_size) {
+        uint64_t kprop[2] = { cpu_to_be64(KERNEL_LOAD_ADDR),
+                              cpu_to_be64(spapr->kernel_size) };
+
+        _FDT(fdt_setprop(fdt, chosen, "qemu,boot-kernel",
+                         &kprop, sizeof(kprop)));
+        if (spapr->kernel_le) {
+            _FDT(fdt_setprop(fdt, chosen, "qemu,boot-kernel-le", NULL, 0));
+        }
+    }
+    if (boot_menu) {
+        _FDT((fdt_setprop_cell(fdt, chosen, "qemu,boot-menu", boot_menu)));
+    }
+    _FDT(fdt_setprop_cell(fdt, chosen, "qemu,graphic-width", graphic_width));
+    _FDT(fdt_setprop_cell(fdt, chosen, "qemu,graphic-height", graphic_height));
+    _FDT(fdt_setprop_cell(fdt, chosen, "qemu,graphic-depth", graphic_depth));
+
+    if (cb && bootlist) {
+        int i;
+
+        for (i = 0; i < cb; i++) {
+            if (bootlist[i] == '\n') {
+                bootlist[i] = ' ';
+            }
+        }
+        _FDT(fdt_setprop_string(fdt, chosen, "qemu,boot-list", bootlist));
+    }
+
+    if (boot_device && strlen(boot_device)) {
+        _FDT(fdt_setprop_string(fdt, chosen, "qemu,boot-device", boot_device));
+    }
+
+    if (!spapr->has_graphics && stdout_path) {
+        _FDT(fdt_setprop_string(fdt, chosen, "linux,stdout-path", stdout_path));
+    }
+
+    spapr_dt_ov5_platform_support(fdt, chosen);
+
+    g_free(stdout_path);
+    g_free(bootlist);
+}
+
+static void spapr_dt_hypervisor(sPAPRMachineState *spapr, void *fdt)
+{
+    /* The /hypervisor node isn't in PAPR - this is a hack to allow PR
+     * KVM to work under pHyp with some guest co-operation */
+    int hypervisor;
+    uint8_t hypercall[16];
+
+    _FDT(hypervisor = fdt_add_subnode(fdt, 0, "hypervisor"));
+    /* indicate KVM hypercall interface */
+    _FDT(fdt_setprop_string(fdt, hypervisor, "compatible", "linux,kvm"));
+    if (kvmppc_has_cap_fixup_hcalls()) {
+        /*
+         * Older KVM versions with older guest kernels were broken
+         * with the magic page, don't allow the guest to map it.
+         */
+        if (!kvmppc_get_hypercall(first_cpu->env_ptr, hypercall,
+                                  sizeof(hypercall))) {
+            _FDT(fdt_setprop(fdt, hypervisor, "hcall-instructions",
+                             hypercall, sizeof(hypercall)));
+        }
+    }
+}
+
+static void *spapr_build_fdt(sPAPRMachineState *spapr,
+                             hwaddr rtas_addr,
+                             hwaddr rtas_size)
+{
+    MachineState *machine = MACHINE(spapr);
     MachineClass *mc = MACHINE_GET_CLASS(machine);
     sPAPRMachineClass *smc = SPAPR_MACHINE_GET_CLASS(machine);
-    const char *boot_device = machine->boot_order;
-    int ret, i;
-    size_t cb = 0;
-    char *bootlist;
+    int ret;
     void *fdt;
     sPAPRPHBState *phb;
+    char *buf;
 
-    fdt = g_malloc(FDT_MAX_SIZE);
+    fdt = g_malloc0(FDT_MAX_SIZE);
+    _FDT((fdt_create_empty_tree(fdt, FDT_MAX_SIZE)));
 
-    /* open out the base tree into a temp buffer for the final tweaks */
-    _FDT((fdt_open_into(spapr->fdt_skel, fdt, FDT_MAX_SIZE)));
+    /* Root node */
+    _FDT(fdt_setprop_string(fdt, 0, "device_type", "chrp"));
+    _FDT(fdt_setprop_string(fdt, 0, "model", "IBM pSeries (emulated by qemu)"));
+    _FDT(fdt_setprop_string(fdt, 0, "compatible", "qemu,pseries"));
+
+    /*
+     * Add info to guest to indentify which host is it being run on
+     * and what is the uuid of the guest
+     */
+    if (kvmppc_get_host_model(&buf)) {
+        _FDT(fdt_setprop_string(fdt, 0, "host-model", buf));
+        g_free(buf);
+    }
+    if (kvmppc_get_host_serial(&buf)) {
+        _FDT(fdt_setprop_string(fdt, 0, "host-serial", buf));
+        g_free(buf);
+    }
+
+    buf = qemu_uuid_unparse_strdup(&qemu_uuid);
+
+    _FDT(fdt_setprop_string(fdt, 0, "vm,uuid", buf));
+    if (qemu_uuid_set) {
+        _FDT(fdt_setprop_string(fdt, 0, "system-id", buf));
+    }
+    g_free(buf);
+
+    if (qemu_get_vm_name()) {
+        _FDT(fdt_setprop_string(fdt, 0, "ibm,partition-name",
+                                qemu_get_vm_name()));
+    }
+
+    _FDT(fdt_setprop_cell(fdt, 0, "#address-cells", 2));
+    _FDT(fdt_setprop_cell(fdt, 0, "#size-cells", 2));
+
+    /* /interrupt controller */
+    spapr_dt_xics(xics_max_server_number(), fdt, PHANDLE_XICP);
 
     ret = spapr_populate_memory(spapr, fdt);
     if (ret < 0) {
-        fprintf(stderr, "couldn't setup memory nodes in fdt\n");
+        error_report("couldn't setup memory nodes in fdt");
         exit(1);
     }
 
-    ret = spapr_populate_vdevice(spapr->vio_bus, fdt);
-    if (ret < 0) {
-        fprintf(stderr, "couldn't setup vio devices in fdt\n");
-        exit(1);
-    }
+    /* /vdevice */
+    spapr_dt_vdevice(spapr->vio_bus, fdt);
 
     if (object_resolve_path_type("", TYPE_SPAPR_RNG, NULL)) {
         ret = spapr_rng_populate_dt(fdt);
         if (ret < 0) {
-            fprintf(stderr, "could not set up rng device in the fdt\n");
+            error_report("could not set up rng device in the fdt");
             exit(1);
         }
     }
@@ -996,48 +1128,14 @@ static void spapr_finalize_fdt(sPAPRMachineState *spapr,
         }
     }
 
-    /* RTAS */
-    ret = spapr_rtas_device_tree_setup(fdt, rtas_addr, rtas_size);
-    if (ret < 0) {
-        fprintf(stderr, "Couldn't set up RTAS device tree properties\n");
-    }
-
     /* cpus */
     spapr_populate_cpus_dt_node(fdt, spapr);
-
-    bootlist = get_boot_devices_list(&cb, true);
-    if (cb && bootlist) {
-        int offset = fdt_path_offset(fdt, "/chosen");
-        if (offset < 0) {
-            exit(1);
-        }
-        for (i = 0; i < cb; i++) {
-            if (bootlist[i] == '\n') {
-                bootlist[i] = ' ';
-            }
-
-        }
-        ret = fdt_setprop_string(fdt, offset, "qemu,boot-list", bootlist);
-    }
-
-    if (boot_device && strlen(boot_device)) {
-        int offset = fdt_path_offset(fdt, "/chosen");
-
-        if (offset < 0) {
-            exit(1);
-        }
-        fdt_setprop_string(fdt, offset, "qemu,boot-device", boot_device);
-    }
-
-    if (!spapr->has_graphics) {
-        spapr_populate_chosen_stdout(fdt, spapr->vio_bus);
-    }
 
     if (smc->dr_lmb_enabled) {
         _FDT(spapr_drc_populate_dt(fdt, 0, NULL, SPAPR_DR_CONNECTOR_TYPE_LMB));
     }
 
-    if (mc->query_hotpluggable_cpus) {
+    if (mc->has_hotpluggable_cpus) {
         int offset = fdt_path_offset(fdt, "/cpus");
         ret = spapr_drc_populate_dt(fdt, offset, NULL,
                                     SPAPR_DR_CONNECTOR_TYPE_CPU);
@@ -1047,19 +1145,36 @@ static void spapr_finalize_fdt(sPAPRMachineState *spapr,
         }
     }
 
-    _FDT((fdt_pack(fdt)));
+    /* /event-sources */
+    spapr_dt_events(spapr, fdt);
 
-    if (fdt_totalsize(fdt) > FDT_MAX_SIZE) {
-        error_report("FDT too big ! 0x%x bytes (max is 0x%x)",
-                     fdt_totalsize(fdt), FDT_MAX_SIZE);
+    /* /rtas */
+    spapr_dt_rtas(spapr, fdt);
+
+    /* /chosen */
+    spapr_dt_chosen(spapr, fdt);
+
+    /* /hypervisor */
+    if (kvm_enabled()) {
+        spapr_dt_hypervisor(spapr, fdt);
+    }
+
+    /* Build memory reserve map */
+    if (spapr->kernel_size) {
+        _FDT((fdt_add_mem_rsv(fdt, KERNEL_LOAD_ADDR, spapr->kernel_size)));
+    }
+    if (spapr->initrd_size) {
+        _FDT((fdt_add_mem_rsv(fdt, spapr->initrd_base, spapr->initrd_size)));
+    }
+
+    /* ibm,client-architecture-support updates */
+    ret = spapr_dt_cas_updates(spapr, fdt, spapr->ov5_cas);
+    if (ret < 0) {
+        error_report("couldn't setup CAS properties fdt");
         exit(1);
     }
 
-    qemu_fdt_dumpdtb(fdt, fdt_totalsize(fdt));
-    cpu_physical_memory_write(fdt_addr, fdt, fdt_totalsize(fdt));
-
-    g_free(bootlist);
-    g_free(fdt);
+    return fdt;
 }
 
 static uint64_t translate_kernel_address(void *opaque, uint64_t addr)
@@ -1067,9 +1182,13 @@ static uint64_t translate_kernel_address(void *opaque, uint64_t addr)
     return (addr & 0x0fffffff) + KERNEL_LOAD_ADDR;
 }
 
-static void emulate_spapr_hypercall(PowerPCCPU *cpu)
+static void emulate_spapr_hypercall(PPCVirtualHypervisor *vhyp,
+                                    PowerPCCPU *cpu)
 {
     CPUPPCState *env = &cpu->env;
+
+    /* The TCG path should also be holding the BQL at this point */
+    g_assert(qemu_mutex_iothread_locked());
 
     if (msr_pr) {
         hcall_dprintf("Hypercall made with MSR[PR]=1\n");
@@ -1077,6 +1196,13 @@ static void emulate_spapr_hypercall(PowerPCCPU *cpu)
     } else {
         env->gpr[3] = spapr_hypercall(cpu, env->gpr[3], &env->gpr[4]);
     }
+}
+
+static uint64_t spapr_get_patbe(PPCVirtualHypervisor *vhyp)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(vhyp);
+
+    return spapr->patb_entry;
 }
 
 #define HPTE(_table, _i)   (void *)(((uint64_t *)(_table)) + ((_i) * 2))
@@ -1090,20 +1216,21 @@ static void emulate_spapr_hypercall(PowerPCCPU *cpu)
  */
 static int get_htab_fd(sPAPRMachineState *spapr)
 {
+    Error *local_err = NULL;
+
     if (spapr->htab_fd >= 0) {
         return spapr->htab_fd;
     }
 
-    spapr->htab_fd = kvmppc_get_htab_fd(false);
+    spapr->htab_fd = kvmppc_get_htab_fd(false, 0, &local_err);
     if (spapr->htab_fd < 0) {
-        error_report("Unable to open fd for reading hash table from KVM: %s",
-                     strerror(errno));
+        error_report_err(local_err);
     }
 
     return spapr->htab_fd;
 }
 
-static void close_htab_fd(sPAPRMachineState *spapr)
+void close_htab_fd(sPAPRMachineState *spapr)
 {
     if (spapr->htab_fd >= 0) {
         close(spapr->htab_fd);
@@ -1111,7 +1238,76 @@ static void close_htab_fd(sPAPRMachineState *spapr)
     spapr->htab_fd = -1;
 }
 
-static int spapr_hpt_shift_for_ramsize(uint64_t ramsize)
+static hwaddr spapr_hpt_mask(PPCVirtualHypervisor *vhyp)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(vhyp);
+
+    return HTAB_SIZE(spapr) / HASH_PTEG_SIZE_64 - 1;
+}
+
+static target_ulong spapr_encode_hpt_for_kvm_pr(PPCVirtualHypervisor *vhyp)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(vhyp);
+
+    assert(kvm_enabled());
+
+    if (!spapr->htab) {
+        return 0;
+    }
+
+    return (target_ulong)(uintptr_t)spapr->htab | (spapr->htab_shift - 18);
+}
+
+static const ppc_hash_pte64_t *spapr_map_hptes(PPCVirtualHypervisor *vhyp,
+                                                hwaddr ptex, int n)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(vhyp);
+    hwaddr pte_offset = ptex * HASH_PTE_SIZE_64;
+
+    if (!spapr->htab) {
+        /*
+         * HTAB is controlled by KVM. Fetch into temporary buffer
+         */
+        ppc_hash_pte64_t *hptes = g_malloc(n * HASH_PTE_SIZE_64);
+        kvmppc_read_hptes(hptes, ptex, n);
+        return hptes;
+    }
+
+    /*
+     * HTAB is controlled by QEMU. Just point to the internally
+     * accessible PTEG.
+     */
+    return (const ppc_hash_pte64_t *)(spapr->htab + pte_offset);
+}
+
+static void spapr_unmap_hptes(PPCVirtualHypervisor *vhyp,
+                              const ppc_hash_pte64_t *hptes,
+                              hwaddr ptex, int n)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(vhyp);
+
+    if (!spapr->htab) {
+        g_free((void *)hptes);
+    }
+
+    /* Nothing to do for qemu managed HPT */
+}
+
+static void spapr_store_hpte(PPCVirtualHypervisor *vhyp, hwaddr ptex,
+                             uint64_t pte0, uint64_t pte1)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(vhyp);
+    hwaddr offset = ptex * HASH_PTE_SIZE_64;
+
+    if (!spapr->htab) {
+        kvmppc_write_hpte(ptex, pte0, pte1);
+    } else {
+        stq_p(spapr->htab + offset, pte0);
+        stq_p(spapr->htab + offset + HASH_PTE_SIZE_64 / 2, pte1);
+    }
+}
+
+int spapr_hpt_shift_for_ramsize(uint64_t ramsize)
 {
     int shift;
 
@@ -1124,16 +1320,21 @@ static int spapr_hpt_shift_for_ramsize(uint64_t ramsize)
     return shift;
 }
 
-static void spapr_reallocate_hpt(sPAPRMachineState *spapr, int shift,
-                                 Error **errp)
+void spapr_free_hpt(sPAPRMachineState *spapr)
 {
-    long rc;
-
-    /* Clean up any HPT info from a previous boot */
     g_free(spapr->htab);
     spapr->htab = NULL;
     spapr->htab_shift = 0;
     close_htab_fd(spapr);
+}
+
+void spapr_reallocate_hpt(sPAPRMachineState *spapr, int shift,
+                          Error **errp)
+{
+    long rc;
+
+    /* Clean up any HPT info from a previous boot */
+    spapr_free_hpt(spapr);
 
     rc = kvmppc_reset_htab(shift);
     if (rc < 0) {
@@ -1174,7 +1375,28 @@ static void spapr_reallocate_hpt(sPAPRMachineState *spapr, int shift,
     }
 }
 
-static int find_unknown_sysbus_device(SysBusDevice *sbdev, void *opaque)
+void spapr_setup_hpt_and_vrma(sPAPRMachineState *spapr)
+{
+    int hpt_shift;
+
+    if ((spapr->resize_hpt == SPAPR_RESIZE_HPT_DISABLED)
+        || (spapr->cas_reboot
+            && !spapr_ovec_test(spapr->ov5_cas, OV5_HPT_RESIZE))) {
+        hpt_shift = spapr_hpt_shift_for_ramsize(MACHINE(spapr)->maxram_size);
+    } else {
+        hpt_shift = spapr_hpt_shift_for_ramsize(MACHINE(spapr)->ram_size);
+    }
+    spapr_reallocate_hpt(spapr, hpt_shift, &error_fatal);
+
+    if (spapr->vrma_adjust) {
+        spapr->rma_size = kvmppc_rma_size(spapr_node0_size(MACHINE(spapr)),
+                                          spapr->htab_shift);
+    }
+    /* We're setting up a hash table, so that means we're not radix */
+    spapr->patb_entry = 0;
+}
+
+static void find_unknown_sysbus_device(SysBusDevice *sbdev, void *opaque)
 {
     bool matched = false;
 
@@ -1187,6 +1409,17 @@ static int find_unknown_sysbus_device(SysBusDevice *sbdev, void *opaque)
                      qdev_fw_name(DEVICE(sbdev)));
         exit(1);
     }
+}
+
+static int spapr_reset_drcs(Object *child, void *opaque)
+{
+    sPAPRDRConnector *drc =
+        (sPAPRDRConnector *) object_dynamic_cast(child,
+                                                 TYPE_SPAPR_DR_CONNECTOR);
+
+    if (drc) {
+        spapr_drc_reset(drc);
+    }
 
     return 0;
 }
@@ -1197,22 +1430,32 @@ static void ppc_spapr_reset(void)
     sPAPRMachineState *spapr = SPAPR_MACHINE(machine);
     PowerPCCPU *first_ppc_cpu;
     uint32_t rtas_limit;
+    hwaddr rtas_addr, fdt_addr;
+    void *fdt;
+    int rc;
 
     /* Check for unknown sysbus devices */
     foreach_dynamic_sysbus_device(find_unknown_sysbus_device, NULL);
 
-    /* Allocate and/or reset the hash page table */
-    spapr_reallocate_hpt(spapr,
-                         spapr_hpt_shift_for_ramsize(machine->maxram_size),
-                         &error_fatal);
-
-    /* Update the RMA size if necessary */
-    if (spapr->vrma_adjust) {
-        spapr->rma_size = kvmppc_rma_size(spapr_node0_size(),
-                                          spapr->htab_shift);
+    if (kvm_enabled() && kvmppc_has_cap_mmu_radix()) {
+        /* If using KVM with radix mode available, VCPUs can be started
+         * without a HPT because KVM will start them in radix mode.
+         * Set the GR bit in PATB so that we know there is no HPT. */
+        spapr->patb_entry = PATBE1_GR;
+    } else {
+        spapr_setup_hpt_and_vrma(spapr);
     }
 
     qemu_devices_reset();
+
+    /* DRC reset may cause a device to be unplugged. This will cause troubles
+     * if this device is used by another device (eg, a running vhost backend
+     * will crash QEMU if the DIMM holding the vring goes away). To avoid such
+     * situations, we reset DRCs after all devices have been reset.
+     */
+    object_child_foreach_recursive(object_get_root(), spapr_reset_drcs, NULL);
+
+    spapr_clear_pending_events(spapr);
 
     /*
      * We place the device tree and RTAS just below either the top of the RMA,
@@ -1220,24 +1463,46 @@ static void ppc_spapr_reset(void)
      * processed with 32-bit real mode code if necessary
      */
     rtas_limit = MIN(spapr->rma_size, RTAS_MAX_ADDR);
-    spapr->rtas_addr = rtas_limit - RTAS_MAX_SIZE;
-    spapr->fdt_addr = spapr->rtas_addr - FDT_MAX_SIZE;
+    rtas_addr = rtas_limit - RTAS_MAX_SIZE;
+    fdt_addr = rtas_addr - FDT_MAX_SIZE;
+
+    /* if this reset wasn't generated by CAS, we should reset our
+     * negotiated options and start from scratch */
+    if (!spapr->cas_reboot) {
+        spapr_ovec_cleanup(spapr->ov5_cas);
+        spapr->ov5_cas = spapr_ovec_new();
+
+        ppc_set_compat_all(spapr->max_compat_pvr, &error_fatal);
+    }
+
+    fdt = spapr_build_fdt(spapr, rtas_addr, spapr->rtas_size);
+
+    spapr_load_rtas(spapr, fdt, rtas_addr);
+
+    rc = fdt_pack(fdt);
+
+    /* Should only fail if we've built a corrupted tree */
+    assert(rc == 0);
+
+    if (fdt_totalsize(fdt) > FDT_MAX_SIZE) {
+        error_report("FDT too big ! 0x%x bytes (max is 0x%x)",
+                     fdt_totalsize(fdt), FDT_MAX_SIZE);
+        exit(1);
+    }
 
     /* Load the fdt */
-    spapr_finalize_fdt(spapr, spapr->fdt_addr, spapr->rtas_addr,
-                       spapr->rtas_size);
-
-    /* Copy RTAS over */
-    cpu_physical_memory_write(spapr->rtas_addr, spapr->rtas_blob,
-                              spapr->rtas_size);
+    qemu_fdt_dumpdtb(fdt, fdt_totalsize(fdt));
+    cpu_physical_memory_write(fdt_addr, fdt, fdt_totalsize(fdt));
+    g_free(fdt);
 
     /* Set up the entry state */
     first_ppc_cpu = POWERPC_CPU(first_cpu);
-    first_ppc_cpu->env.gpr[3] = spapr->fdt_addr;
+    first_ppc_cpu->env.gpr[3] = fdt_addr;
     first_ppc_cpu->env.gpr[5] = 0;
     first_cpu->halted = 0;
     first_ppc_cpu->env.nip = SPAPR_ENTRY_POINT;
 
+    spapr->cas_reboot = false;
 }
 
 static void spapr_create_nvram(sPAPRMachineState *spapr)
@@ -1257,13 +1522,13 @@ static void spapr_create_nvram(sPAPRMachineState *spapr)
 
 static void spapr_rtc_create(sPAPRMachineState *spapr)
 {
-    DeviceState *dev = qdev_create(NULL, TYPE_SPAPR_RTC);
-
-    qdev_init_nofail(dev);
-    spapr->rtc = dev;
-
-    object_property_add_alias(qdev_get_machine(), "rtc-time",
-                              OBJECT(spapr->rtc), "date", NULL);
+    object_initialize(&spapr->rtc, sizeof(spapr->rtc), TYPE_SPAPR_RTC);
+    object_property_add_child(OBJECT(spapr), "rtc", OBJECT(&spapr->rtc),
+                              &error_fatal);
+    object_property_set_bool(OBJECT(&spapr->rtc), true, "realized",
+                              &error_fatal);
+    object_property_add_alias(OBJECT(spapr), "rtc-time", OBJECT(&spapr->rtc),
+                              "date", &error_fatal);
 }
 
 /* Returns whether we want to use VGA or not */
@@ -1289,12 +1554,32 @@ static int spapr_post_load(void *opaque, int version_id)
     sPAPRMachineState *spapr = (sPAPRMachineState *)opaque;
     int err = 0;
 
+    if (!object_dynamic_cast(OBJECT(spapr->ics), TYPE_ICS_KVM)) {
+        CPUState *cs;
+        CPU_FOREACH(cs) {
+            PowerPCCPU *cpu = POWERPC_CPU(cs);
+            icp_resend(ICP(cpu->intc));
+        }
+    }
+
     /* In earlier versions, there was no separate qdev for the PAPR
      * RTC, so the RTC offset was stored directly in sPAPREnvironment.
      * So when migrating from those versions, poke the incoming offset
      * value into the RTC device */
     if (version_id < 3) {
-        err = spapr_rtc_import_offset(spapr->rtc, spapr->rtc_offset);
+        err = spapr_rtc_import_offset(&spapr->rtc, spapr->rtc_offset);
+    }
+
+    if (spapr->patb_entry) {
+        PowerPCCPU *cpu = POWERPC_CPU(first_cpu);
+        bool radix = !!(spapr->patb_entry & PATBE1_GR);
+        bool gtse = !!(cpu->env.spr[SPR_LPCR] & LPCR_GTSE);
+
+        err = kvmppc_configure_v3_mmu(cpu, radix, gtse, spapr->patb_entry);
+        if (err) {
+            error_report("Process table config unsupported by the host");
+            return -EINVAL;
+        }
     }
 
     return err;
@@ -1304,6 +1589,117 @@ static bool version_before_3(void *opaque, int version_id)
 {
     return version_id < 3;
 }
+
+static bool spapr_pending_events_needed(void *opaque)
+{
+    sPAPRMachineState *spapr = (sPAPRMachineState *)opaque;
+    return !QTAILQ_EMPTY(&spapr->pending_events);
+}
+
+static const VMStateDescription vmstate_spapr_event_entry = {
+    .name = "spapr_event_log_entry",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32(summary, sPAPREventLogEntry),
+        VMSTATE_UINT32(extended_length, sPAPREventLogEntry),
+        VMSTATE_VBUFFER_ALLOC_UINT32(extended_log, sPAPREventLogEntry, 0,
+                                     NULL, extended_length),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_spapr_pending_events = {
+    .name = "spapr_pending_events",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = spapr_pending_events_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_QTAILQ_V(pending_events, sPAPRMachineState, 1,
+                         vmstate_spapr_event_entry, sPAPREventLogEntry, next),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static bool spapr_ov5_cas_needed(void *opaque)
+{
+    sPAPRMachineState *spapr = opaque;
+    sPAPROptionVector *ov5_mask = spapr_ovec_new();
+    sPAPROptionVector *ov5_legacy = spapr_ovec_new();
+    sPAPROptionVector *ov5_removed = spapr_ovec_new();
+    bool cas_needed;
+
+    /* Prior to the introduction of sPAPROptionVector, we had two option
+     * vectors we dealt with: OV5_FORM1_AFFINITY, and OV5_DRCONF_MEMORY.
+     * Both of these options encode machine topology into the device-tree
+     * in such a way that the now-booted OS should still be able to interact
+     * appropriately with QEMU regardless of what options were actually
+     * negotiatied on the source side.
+     *
+     * As such, we can avoid migrating the CAS-negotiated options if these
+     * are the only options available on the current machine/platform.
+     * Since these are the only options available for pseries-2.7 and
+     * earlier, this allows us to maintain old->new/new->old migration
+     * compatibility.
+     *
+     * For QEMU 2.8+, there are additional CAS-negotiatable options available
+     * via default pseries-2.8 machines and explicit command-line parameters.
+     * Some of these options, like OV5_HP_EVT, *do* require QEMU to be aware
+     * of the actual CAS-negotiated values to continue working properly. For
+     * example, availability of memory unplug depends on knowing whether
+     * OV5_HP_EVT was negotiated via CAS.
+     *
+     * Thus, for any cases where the set of available CAS-negotiatable
+     * options extends beyond OV5_FORM1_AFFINITY and OV5_DRCONF_MEMORY, we
+     * include the CAS-negotiated options in the migration stream.
+     */
+    spapr_ovec_set(ov5_mask, OV5_FORM1_AFFINITY);
+    spapr_ovec_set(ov5_mask, OV5_DRCONF_MEMORY);
+
+    /* spapr_ovec_diff returns true if bits were removed. we avoid using
+     * the mask itself since in the future it's possible "legacy" bits may be
+     * removed via machine options, which could generate a false positive
+     * that breaks migration.
+     */
+    spapr_ovec_intersect(ov5_legacy, spapr->ov5, ov5_mask);
+    cas_needed = spapr_ovec_diff(ov5_removed, spapr->ov5, ov5_legacy);
+
+    spapr_ovec_cleanup(ov5_mask);
+    spapr_ovec_cleanup(ov5_legacy);
+    spapr_ovec_cleanup(ov5_removed);
+
+    return cas_needed;
+}
+
+static const VMStateDescription vmstate_spapr_ov5_cas = {
+    .name = "spapr_option_vector_ov5_cas",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = spapr_ov5_cas_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_STRUCT_POINTER_V(ov5_cas, sPAPRMachineState, 1,
+                                 vmstate_spapr_ovec, sPAPROptionVector),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static bool spapr_patb_entry_needed(void *opaque)
+{
+    sPAPRMachineState *spapr = opaque;
+
+    return !!spapr->patb_entry;
+}
+
+static const VMStateDescription vmstate_spapr_patb_entry = {
+    .name = "spapr_patb_entry",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = spapr_patb_entry_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT64(patb_entry, sPAPRMachineState),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static const VMStateDescription vmstate_spapr = {
     .name = "spapr",
@@ -1320,6 +1716,12 @@ static const VMStateDescription vmstate_spapr = {
         VMSTATE_PPC_TIMEBASE_V(tb, sPAPRMachineState, 2),
         VMSTATE_END_OF_LIST()
     },
+    .subsections = (const VMStateDescription*[]) {
+        &vmstate_spapr_ov5_cas,
+        &vmstate_spapr_patb_entry,
+        &vmstate_spapr_pending_events,
+        NULL
+    }
 };
 
 static int htab_save_setup(QEMUFile *f, void *opaque)
@@ -1327,17 +1729,40 @@ static int htab_save_setup(QEMUFile *f, void *opaque)
     sPAPRMachineState *spapr = opaque;
 
     /* "Iteration" header */
-    qemu_put_be32(f, spapr->htab_shift);
+    if (!spapr->htab_shift) {
+        qemu_put_be32(f, -1);
+    } else {
+        qemu_put_be32(f, spapr->htab_shift);
+    }
 
     if (spapr->htab) {
         spapr->htab_save_index = 0;
         spapr->htab_first_pass = true;
     } else {
-        assert(kvm_enabled());
+        if (spapr->htab_shift) {
+            assert(kvm_enabled());
+        }
     }
 
 
     return 0;
+}
+
+static void htab_save_chunk(QEMUFile *f, sPAPRMachineState *spapr,
+                            int chunkstart, int n_valid, int n_invalid)
+{
+    qemu_put_be32(f, chunkstart);
+    qemu_put_be16(f, n_valid);
+    qemu_put_be16(f, n_invalid);
+    qemu_put_buffer(f, HPTE(spapr->htab, chunkstart),
+                    HASH_PTE_SIZE_64 * n_valid);
+}
+
+static void htab_save_end_marker(QEMUFile *f)
+{
+    qemu_put_be32(f, 0);
+    qemu_put_be16(f, 0);
+    qemu_put_be16(f, 0);
 }
 
 static void htab_save_first_pass(QEMUFile *f, sPAPRMachineState *spapr,
@@ -1356,26 +1781,22 @@ static void htab_save_first_pass(QEMUFile *f, sPAPRMachineState *spapr,
         /* Consume invalid HPTEs */
         while ((index < htabslots)
                && !HPTE_VALID(HPTE(spapr->htab, index))) {
-            index++;
             CLEAN_HPTE(HPTE(spapr->htab, index));
+            index++;
         }
 
         /* Consume valid HPTEs */
         chunkstart = index;
         while ((index < htabslots) && (index - chunkstart < USHRT_MAX)
                && HPTE_VALID(HPTE(spapr->htab, index))) {
-            index++;
             CLEAN_HPTE(HPTE(spapr->htab, index));
+            index++;
         }
 
         if (index > chunkstart) {
             int n_valid = index - chunkstart;
 
-            qemu_put_be32(f, chunkstart);
-            qemu_put_be16(f, n_valid);
-            qemu_put_be16(f, 0);
-            qemu_put_buffer(f, HPTE(spapr->htab, chunkstart),
-                            HASH_PTE_SIZE_64 * n_valid);
+            htab_save_chunk(f, spapr, chunkstart, n_valid, 0);
 
             if (has_timeout &&
                 (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - starttime) > max_ns) {
@@ -1437,11 +1858,7 @@ static int htab_save_later_pass(QEMUFile *f, sPAPRMachineState *spapr,
             int n_valid = invalidstart - chunkstart;
             int n_invalid = index - invalidstart;
 
-            qemu_put_be32(f, chunkstart);
-            qemu_put_be16(f, n_valid);
-            qemu_put_be16(f, n_invalid);
-            qemu_put_buffer(f, HPTE(spapr->htab, chunkstart),
-                            HASH_PTE_SIZE_64 * n_valid);
+            htab_save_chunk(f, spapr, chunkstart, n_valid, n_invalid);
             sent += index - chunkstart;
 
             if (!final && (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - starttime) > max_ns) {
@@ -1479,7 +1896,12 @@ static int htab_save_iterate(QEMUFile *f, void *opaque)
     int rc = 0;
 
     /* Iteration header */
-    qemu_put_be32(f, 0);
+    if (!spapr->htab_shift) {
+        qemu_put_be32(f, -1);
+        return 1;
+    } else {
+        qemu_put_be32(f, 0);
+    }
 
     if (!spapr->htab) {
         assert(kvm_enabled());
@@ -1499,10 +1921,7 @@ static int htab_save_iterate(QEMUFile *f, void *opaque)
         rc = htab_save_later_pass(f, spapr, MAX_ITERATION_NS);
     }
 
-    /* End marker */
-    qemu_put_be32(f, 0);
-    qemu_put_be16(f, 0);
-    qemu_put_be16(f, 0);
+    htab_save_end_marker(f);
 
     return rc;
 }
@@ -1513,7 +1932,12 @@ static int htab_save_complete(QEMUFile *f, void *opaque)
     int fd;
 
     /* Iteration header */
-    qemu_put_be32(f, 0);
+    if (!spapr->htab_shift) {
+        qemu_put_be32(f, -1);
+        return 0;
+    } else {
+        qemu_put_be32(f, 0);
+    }
 
     if (!spapr->htab) {
         int rc;
@@ -1537,9 +1961,7 @@ static int htab_save_complete(QEMUFile *f, void *opaque)
     }
 
     /* End marker */
-    qemu_put_be32(f, 0);
-    qemu_put_be16(f, 0);
-    qemu_put_be16(f, 0);
+    htab_save_end_marker(f);
 
     return 0;
 }
@@ -1549,6 +1971,7 @@ static int htab_load(QEMUFile *f, void *opaque, int version_id)
     sPAPRMachineState *spapr = opaque;
     uint32_t section_hdr;
     int fd = -1;
+    Error *local_err = NULL;
 
     if (version_id < 1 || version_id > 1) {
         error_report("htab_load() bad version");
@@ -1557,9 +1980,12 @@ static int htab_load(QEMUFile *f, void *opaque, int version_id)
 
     section_hdr = qemu_get_be32(f);
 
-    if (section_hdr) {
-        Error *local_err = NULL;
+    if (section_hdr == -1) {
+        spapr_free_hpt(spapr);
+        return 0;
+    }
 
+    if (section_hdr) {
         /* First section gives the htab size */
         spapr_reallocate_hpt(spapr, section_hdr, &local_err);
         if (local_err) {
@@ -1572,10 +1998,10 @@ static int htab_load(QEMUFile *f, void *opaque, int version_id)
     if (!spapr->htab) {
         assert(kvm_enabled());
 
-        fd = kvmppc_get_htab_fd(true);
+        fd = kvmppc_get_htab_fd(true, 0, &local_err);
         if (fd < 0) {
-            error_report("Unable to open fd to restore KVM hash table: %s",
-                         strerror(errno));
+            error_report_err(local_err);
+            return fd;
         }
     }
 
@@ -1630,7 +2056,7 @@ static int htab_load(QEMUFile *f, void *opaque, int version_id)
     return 0;
 }
 
-static void htab_cleanup(void *opaque)
+static void htab_save_cleanup(void *opaque)
 {
     sPAPRMachineState *spapr = opaque;
 
@@ -1638,36 +2064,18 @@ static void htab_cleanup(void *opaque)
 }
 
 static SaveVMHandlers savevm_htab_handlers = {
-    .save_live_setup = htab_save_setup,
+    .save_setup = htab_save_setup,
     .save_live_iterate = htab_save_iterate,
     .save_live_complete_precopy = htab_save_complete,
-    .cleanup = htab_cleanup,
+    .save_cleanup = htab_save_cleanup,
     .load_state = htab_load,
 };
 
 static void spapr_boot_set(void *opaque, const char *boot_device,
                            Error **errp)
 {
-    MachineState *machine = MACHINE(qdev_get_machine());
+    MachineState *machine = MACHINE(opaque);
     machine->boot_order = g_strdup(boot_device);
-}
-
-/*
- * Reset routine for LMB DR devices.
- *
- * Unlike PCI DR devices, LMB DR devices explicitly register this reset
- * routine. Reset for PCI DR devices will be handled by PHB reset routine
- * when it walks all its children devices. LMB devices reset occurs
- * as part of spapr_ppc_reset().
- */
-static void spapr_drc_reset(void *opaque)
-{
-    sPAPRDRConnector *drc = opaque;
-    DeviceState *d = DEVICE(drc);
-
-    if (d) {
-        device_reset(d);
-    }
 }
 
 static void spapr_create_lmb_dr_connectors(sPAPRMachineState *spapr)
@@ -1678,13 +2086,11 @@ static void spapr_create_lmb_dr_connectors(sPAPRMachineState *spapr)
     int i;
 
     for (i = 0; i < nr_lmbs; i++) {
-        sPAPRDRConnector *drc;
         uint64_t addr;
 
         addr = i * lmb_size + spapr->hotplug_memory.base;
-        drc = spapr_dr_connector_new(OBJECT(spapr), SPAPR_DR_CONNECTOR_TYPE_LMB,
-                                     addr/lmb_size);
-        qemu_register_reset(spapr_drc_reset, drc);
+        spapr_dr_connector_new(OBJECT(spapr), TYPE_SPAPR_DRC_LMB,
+                               addr / lmb_size);
     }
 }
 
@@ -1725,33 +2131,37 @@ static void spapr_validate_node_memory(MachineState *machine, Error **errp)
     }
 }
 
-/* pSeries LPAR / sPAPR hardware init */
-static void ppc_spapr_init(MachineState *machine)
+/* find cpu slot in machine->possible_cpus by core_id */
+static CPUArchId *spapr_find_cpu_slot(MachineState *ms, uint32_t id, int *idx)
 {
-    sPAPRMachineState *spapr = SPAPR_MACHINE(machine);
-    MachineClass *mc = MACHINE_GET_CLASS(machine);
-    sPAPRMachineClass *smc = SPAPR_MACHINE_GET_CLASS(machine);
-    const char *kernel_filename = machine->kernel_filename;
-    const char *kernel_cmdline = machine->kernel_cmdline;
-    const char *initrd_filename = machine->initrd_filename;
-    PCIHostState *phb;
-    int i;
-    MemoryRegion *sysmem = get_system_memory();
-    MemoryRegion *ram = g_new(MemoryRegion, 1);
-    MemoryRegion *rma_region;
-    void *rma = NULL;
-    hwaddr rma_alloc_size;
-    hwaddr node0_size = spapr_node0_size();
-    uint32_t initrd_base = 0;
-    long kernel_size = 0, initrd_size = 0;
-    long load_limit, fw_size;
-    bool kernel_le = false;
-    char *filename;
-    int smt = kvmppc_smt_threads();
-    int spapr_cores = smp_cpus / smp_threads;
-    int spapr_max_cores = max_cpus / smp_threads;
+    int index = id / smp_threads;
 
-    if (mc->query_hotpluggable_cpus) {
+    if (index >= ms->possible_cpus->len) {
+        return NULL;
+    }
+    if (idx) {
+        *idx = index;
+    }
+    return &ms->possible_cpus->cpus[index];
+}
+
+static void spapr_init_cpus(sPAPRMachineState *spapr)
+{
+    MachineState *machine = MACHINE(spapr);
+    MachineClass *mc = MACHINE_GET_CLASS(machine);
+    const char *type = spapr_get_cpu_core_type(machine->cpu_type);
+    int smt = kvmppc_smt_threads();
+    const CPUArchIdList *possible_cpus;
+    int boot_cores_nr = smp_cpus / smp_threads;
+    int i;
+
+    if (!type) {
+        error_report("Unable to find sPAPR CPU Core definition");
+        exit(1);
+    }
+
+    possible_cpus = mc->possible_cpu_arch_ids(machine);
+    if (mc->has_hotpluggable_cpus) {
         if (smp_cpus % smp_threads) {
             error_report("smp_cpus (%u) must be multiple of threads (%u)",
                          smp_cpus, smp_threads);
@@ -1762,13 +2172,146 @@ static void ppc_spapr_init(MachineState *machine)
                          max_cpus, smp_threads);
             exit(1);
         }
+    } else {
+        if (max_cpus != smp_cpus) {
+            error_report("This machine version does not support CPU hotplug");
+            exit(1);
+        }
+        boot_cores_nr = possible_cpus->len;
     }
+
+    for (i = 0; i < possible_cpus->len; i++) {
+        int core_id = i * smp_threads;
+
+        if (mc->has_hotpluggable_cpus) {
+            spapr_dr_connector_new(OBJECT(spapr), TYPE_SPAPR_DRC_CPU,
+                                   (core_id / smp_threads) * smt);
+        }
+
+        if (i < boot_cores_nr) {
+            Object *core  = object_new(type);
+            int nr_threads = smp_threads;
+
+            /* Handle the partially filled core for older machine types */
+            if ((i + 1) * smp_threads >= smp_cpus) {
+                nr_threads = smp_cpus - i * smp_threads;
+            }
+
+            object_property_set_int(core, nr_threads, "nr-threads",
+                                    &error_fatal);
+            object_property_set_int(core, core_id, CPU_CORE_PROP_CORE_ID,
+                                    &error_fatal);
+            object_property_set_bool(core, true, "realized", &error_fatal);
+        }
+    }
+}
+
+static void spapr_set_vsmt_mode(sPAPRMachineState *spapr, Error **errp)
+{
+    Error *local_err = NULL;
+    bool vsmt_user = !!spapr->vsmt;
+    int kvm_smt = kvmppc_smt_threads();
+    int ret;
+
+    if (!kvm_enabled() && (smp_threads > 1)) {
+        error_setg(&local_err, "TCG cannot support more than 1 thread/core "
+                     "on a pseries machine");
+        goto out;
+    }
+    if (!is_power_of_2(smp_threads)) {
+        error_setg(&local_err, "Cannot support %d threads/core on a pseries "
+                     "machine because it must be a power of 2", smp_threads);
+        goto out;
+    }
+
+    /* Detemine the VSMT mode to use: */
+    if (vsmt_user) {
+        if (spapr->vsmt < smp_threads) {
+            error_setg(&local_err, "Cannot support VSMT mode %d"
+                         " because it must be >= threads/core (%d)",
+                         spapr->vsmt, smp_threads);
+            goto out;
+        }
+        /* In this case, spapr->vsmt has been set by the command line */
+    } else {
+        /* Choose a VSMT mode that may be higher than necessary but is
+         * likely to be compatible with hosts that don't have VSMT. */
+        spapr->vsmt = MAX(kvm_smt, smp_threads);
+    }
+
+    /* KVM: If necessary, set the SMT mode: */
+    if (kvm_enabled() && (spapr->vsmt != kvm_smt)) {
+        ret = kvmppc_set_smt_threads(spapr->vsmt);
+        if (ret) {
+            error_setg(&local_err,
+                       "Failed to set KVM's VSMT mode to %d (errno %d)",
+                       spapr->vsmt, ret);
+            if (!vsmt_user) {
+                error_append_hint(&local_err, "On PPC, a VM with %d threads/"
+                             "core on a host with %d threads/core requires "
+                             " the use of VSMT mode %d.\n",
+                             smp_threads, kvm_smt, spapr->vsmt);
+            }
+            kvmppc_hint_smt_possible(&local_err);
+            goto out;
+        }
+    }
+    /* else TCG: nothing to do currently */
+out:
+    error_propagate(errp, local_err);
+}
+
+/* pSeries LPAR / sPAPR hardware init */
+static void ppc_spapr_init(MachineState *machine)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(machine);
+    sPAPRMachineClass *smc = SPAPR_MACHINE_GET_CLASS(machine);
+    const char *kernel_filename = machine->kernel_filename;
+    const char *initrd_filename = machine->initrd_filename;
+    PCIHostState *phb;
+    int i;
+    MemoryRegion *sysmem = get_system_memory();
+    MemoryRegion *ram = g_new(MemoryRegion, 1);
+    MemoryRegion *rma_region;
+    void *rma = NULL;
+    hwaddr rma_alloc_size;
+    hwaddr node0_size = spapr_node0_size(machine);
+    long load_limit, fw_size;
+    char *filename;
+    Error *resize_hpt_err = NULL;
 
     msi_nonbroken = true;
 
     QLIST_INIT(&spapr->phbs);
+    QTAILQ_INIT(&spapr->pending_dimm_unplugs);
 
-    cpu_ppc_hypercall = emulate_spapr_hypercall;
+    /* Check HPT resizing availability */
+    kvmppc_check_papr_resize_hpt(&resize_hpt_err);
+    if (spapr->resize_hpt == SPAPR_RESIZE_HPT_DEFAULT) {
+        /*
+         * If the user explicitly requested a mode we should either
+         * supply it, or fail completely (which we do below).  But if
+         * it's not set explicitly, we reset our mode to something
+         * that works
+         */
+        if (resize_hpt_err) {
+            spapr->resize_hpt = SPAPR_RESIZE_HPT_DISABLED;
+            error_free(resize_hpt_err);
+            resize_hpt_err = NULL;
+        } else {
+            spapr->resize_hpt = smc->resize_hpt_default;
+        }
+    }
+
+    assert(spapr->resize_hpt != SPAPR_RESIZE_HPT_DEFAULT);
+
+    if ((spapr->resize_hpt != SPAPR_RESIZE_HPT_DISABLED) && resize_hpt_err) {
+        /*
+         * User requested HPT resize, but this host can't supply it.  Bail out
+         */
+        error_report_err(resize_hpt_err);
+        exit(1);
+    }
 
     /* Allocate RMA if necessary */
     rma_alloc_size = kvmppc_alloc_rma(&rma);
@@ -1815,64 +2358,47 @@ static void ppc_spapr_init(MachineState *machine)
     load_limit = MIN(spapr->rma_size, RTAS_MAX_ADDR) - FW_OVERHEAD;
 
     /* Set up Interrupt Controller before we create the VCPUs */
-    spapr->xics = xics_system_init(machine,
-                                   DIV_ROUND_UP(max_cpus * smt, smp_threads),
-                                   XICS_IRQS_SPAPR, &error_fatal);
+    xics_system_init(machine, XICS_IRQS_SPAPR, &error_fatal);
+
+    /* Set up containers for ibm,client-architecture-support negotiated options
+     */
+    spapr->ov5 = spapr_ovec_new();
+    spapr->ov5_cas = spapr_ovec_new();
 
     if (smc->dr_lmb_enabled) {
+        spapr_ovec_set(spapr->ov5, OV5_DRCONF_MEMORY);
         spapr_validate_node_memory(machine, &error_fatal);
     }
 
+    spapr_ovec_set(spapr->ov5, OV5_FORM1_AFFINITY);
+    if (!kvm_enabled() || kvmppc_has_cap_mmu_radix()) {
+        /* KVM and TCG always allow GTSE with radix... */
+        spapr_ovec_set(spapr->ov5, OV5_MMU_RADIX_GTSE);
+    }
+    /* ... but not with hash (currently). */
+
+    /* advertise support for dedicated HP event source to guests */
+    if (spapr->use_hotplug_event_source) {
+        spapr_ovec_set(spapr->ov5, OV5_HP_EVT);
+    }
+
+    /* advertise support for HPT resizing */
+    if (spapr->resize_hpt != SPAPR_RESIZE_HPT_DISABLED) {
+        spapr_ovec_set(spapr->ov5, OV5_HPT_RESIZE);
+    }
+
     /* init CPUs */
-    if (machine->cpu_model == NULL) {
-        machine->cpu_model = kvm_enabled() ? "host" : "POWER7";
-    }
+    spapr_set_vsmt_mode(spapr, &error_fatal);
 
-    ppc_cpu_parse_features(machine->cpu_model);
-
-    if (mc->query_hotpluggable_cpus) {
-        char *type = spapr_get_cpu_core_type(machine->cpu_model);
-
-        if (type == NULL) {
-            error_report("Unable to find sPAPR CPU Core definition");
-            exit(1);
-        }
-
-        spapr->cores = g_new0(Object *, spapr_max_cores);
-        for (i = 0; i < spapr_max_cores; i++) {
-            int core_id = i * smp_threads;
-            sPAPRDRConnector *drc =
-                spapr_dr_connector_new(OBJECT(spapr),
-                                       SPAPR_DR_CONNECTOR_TYPE_CPU,
-                                       (core_id / smp_threads) * smt);
-
-            qemu_register_reset(spapr_drc_reset, drc);
-
-            if (i < spapr_cores) {
-                Object *core  = object_new(type);
-                object_property_set_int(core, smp_threads, "nr-threads",
-                                        &error_fatal);
-                object_property_set_int(core, core_id, CPU_CORE_PROP_CORE_ID,
-                                        &error_fatal);
-                object_property_set_bool(core, true, "realized", &error_fatal);
-            }
-        }
-        g_free(type);
-    } else {
-        for (i = 0; i < smp_cpus; i++) {
-            PowerPCCPU *cpu = cpu_ppc_init(machine->cpu_model);
-            if (cpu == NULL) {
-                error_report("Unable to find PowerPC CPU definition");
-                exit(1);
-            }
-            spapr_cpu_init(spapr, cpu, &error_fatal);
-       }
-    }
+    spapr_init_cpus(spapr);
 
     if (kvm_enabled()) {
         /* Enable H_LOGICAL_CI_* so SLOF can talk to in-kernel devices */
         kvmppc_enable_logical_ci_hcalls();
         kvmppc_enable_set_mode_hcall();
+
+        /* H_CLEAR_MOD/_REF are mandatory in PAPR, but off by default */
+        kvmppc_enable_clear_ref_mod_hcalls();
     }
 
     /* allocate RAM */
@@ -1943,7 +2469,7 @@ static void ppc_spapr_init(MachineState *machine)
     }
     g_free(filename);
 
-    /* Set up EPOW events infrastructure */
+    /* Set up RTAS event infrastructure */
     spapr_events_init(spapr);
 
     /* Set up the RTC RTAS interfaces */
@@ -2015,19 +2541,19 @@ static void ppc_spapr_init(MachineState *machine)
     if (kernel_filename) {
         uint64_t lowaddr = 0;
 
-        kernel_size = load_elf(kernel_filename, translate_kernel_address, NULL,
-                               NULL, &lowaddr, NULL, 1, PPC_ELF_MACHINE,
-                               0, 0);
-        if (kernel_size == ELF_LOAD_WRONG_ENDIAN) {
-            kernel_size = load_elf(kernel_filename,
-                                   translate_kernel_address, NULL,
-                                   NULL, &lowaddr, NULL, 0, PPC_ELF_MACHINE,
-                                   0, 0);
-            kernel_le = kernel_size > 0;
+        spapr->kernel_size = load_elf(kernel_filename, translate_kernel_address,
+                                      NULL, NULL, &lowaddr, NULL, 1,
+                                      PPC_ELF_MACHINE, 0, 0);
+        if (spapr->kernel_size == ELF_LOAD_WRONG_ENDIAN) {
+            spapr->kernel_size = load_elf(kernel_filename,
+                                          translate_kernel_address, NULL, NULL,
+                                          &lowaddr, NULL, 0, PPC_ELF_MACHINE,
+                                          0, 0);
+            spapr->kernel_le = spapr->kernel_size > 0;
         }
-        if (kernel_size < 0) {
-            error_report("error loading %s: %s",
-                         kernel_filename, load_elf_strerror(kernel_size));
+        if (spapr->kernel_size < 0) {
+            error_report("error loading %s: %s", kernel_filename,
+                         load_elf_strerror(spapr->kernel_size));
             exit(1);
         }
 
@@ -2036,17 +2562,17 @@ static void ppc_spapr_init(MachineState *machine)
             /* Try to locate the initrd in the gap between the kernel
              * and the firmware. Add a bit of space just in case
              */
-            initrd_base = (KERNEL_LOAD_ADDR + kernel_size + 0x1ffff) & ~0xffff;
-            initrd_size = load_image_targphys(initrd_filename, initrd_base,
-                                              load_limit - initrd_base);
-            if (initrd_size < 0) {
+            spapr->initrd_base = (KERNEL_LOAD_ADDR + spapr->kernel_size
+                                  + 0x1ffff) & ~0xffff;
+            spapr->initrd_size = load_image_targphys(initrd_filename,
+                                                     spapr->initrd_base,
+                                                     load_limit
+                                                     - spapr->initrd_base);
+            if (spapr->initrd_size < 0) {
                 error_report("could not load initial ram disk '%s'",
                              initrd_filename);
                 exit(1);
             }
-        } else {
-            initrd_base = 0;
-            initrd_size = 0;
         }
     }
 
@@ -2072,18 +2598,15 @@ static void ppc_spapr_init(MachineState *machine)
     register_savevm_live(NULL, "spapr/htab", -1, 1,
                          &savevm_htab_handlers, spapr);
 
-    /* Prepare the device tree */
-    spapr->fdt_skel = spapr_create_fdt_skel(initrd_base, initrd_size,
-                                            kernel_size, kernel_le,
-                                            kernel_cmdline,
-                                            spapr->check_exception_irq);
-    assert(spapr->fdt_skel != NULL);
-
-    /* used by RTAS */
-    QTAILQ_INIT(&spapr->ccs_list);
-    qemu_register_reset(spapr_ccs_reset_hook, spapr);
-
     qemu_register_boot_set(spapr_boot_set, spapr);
+
+    if (kvm_enabled()) {
+        /* to stop and start vmclock */
+        qemu_add_vm_change_state_handler(cpu_ppc_clock_vm_state_change,
+                                         &spapr->tb);
+
+        kvmppc_spapr_enable_inkernel_multitce();
+    }
 }
 
 static int spapr_kvm_type(const char *vm_type)
@@ -2115,6 +2638,7 @@ static char *spapr_get_fw_dev_path(FWPathProvider *p, BusState *bus,
     ((type *)object_dynamic_cast(OBJECT(obj), (name)))
     SCSIDevice *d = CAST(SCSIDevice,  dev, TYPE_SCSI_DEVICE);
     sPAPRPHBState *phb = CAST(sPAPRPHBState, dev, TYPE_SPAPR_PCI_HOST_BRIDGE);
+    VHostSCSICommon *vsc = CAST(VHostSCSICommon, dev, TYPE_VHOST_SCSI_COMMON);
 
     if (d) {
         void *spapr = CAST(void, bus->parent, "spapr-vscsi");
@@ -2153,9 +2677,34 @@ static char *spapr_get_fw_dev_path(FWPathProvider *p, BusState *bus,
         }
     }
 
+    /*
+     * SLOF probes the USB devices, and if it recognizes that the device is a
+     * storage device, it changes its name to "storage" instead of "usb-host",
+     * and additionally adds a child node for the SCSI LUN, so the correct
+     * boot path in SLOF is something like .../storage@1/disk@xxx" instead.
+     */
+    if (strcmp("usb-host", qdev_fw_name(dev)) == 0) {
+        USBDevice *usbdev = CAST(USBDevice, dev, TYPE_USB_DEVICE);
+        if (usb_host_dev_is_scsi_storage(usbdev)) {
+            return g_strdup_printf("storage@%s/disk", usbdev->port->path);
+        }
+    }
+
     if (phb) {
         /* Replace "pci" with "pci@800000020000000" */
         return g_strdup_printf("pci@%"PRIX64, phb->buid);
+    }
+
+    if (vsc) {
+        /* Same logic as virtio above */
+        unsigned id = 0x1000000 | (vsc->target << 16) | vsc->lun;
+        return g_strdup_printf("disk@%"PRIX64, (uint64_t)id << 32);
+    }
+
+    if (g_str_equal("pci-bridge", qdev_fw_name(dev))) {
+        /* SLOF uses "pci" instead of "pci-bridge" for PCI bridges */
+        PCIDevice *pcidev = CAST(PCIDevice, dev, TYPE_PCI_DEVICE);
+        return g_strdup_printf("pci@%x", PCI_SLOT(pcidev->devfn));
     }
 
     return NULL;
@@ -2176,16 +2725,102 @@ static void spapr_set_kvm_type(Object *obj, const char *value, Error **errp)
     spapr->kvm_type = g_strdup(value);
 }
 
+static bool spapr_get_modern_hotplug_events(Object *obj, Error **errp)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(obj);
+
+    return spapr->use_hotplug_event_source;
+}
+
+static void spapr_set_modern_hotplug_events(Object *obj, bool value,
+                                            Error **errp)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(obj);
+
+    spapr->use_hotplug_event_source = value;
+}
+
+static char *spapr_get_resize_hpt(Object *obj, Error **errp)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(obj);
+
+    switch (spapr->resize_hpt) {
+    case SPAPR_RESIZE_HPT_DEFAULT:
+        return g_strdup("default");
+    case SPAPR_RESIZE_HPT_DISABLED:
+        return g_strdup("disabled");
+    case SPAPR_RESIZE_HPT_ENABLED:
+        return g_strdup("enabled");
+    case SPAPR_RESIZE_HPT_REQUIRED:
+        return g_strdup("required");
+    }
+    g_assert_not_reached();
+}
+
+static void spapr_set_resize_hpt(Object *obj, const char *value, Error **errp)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(obj);
+
+    if (strcmp(value, "default") == 0) {
+        spapr->resize_hpt = SPAPR_RESIZE_HPT_DEFAULT;
+    } else if (strcmp(value, "disabled") == 0) {
+        spapr->resize_hpt = SPAPR_RESIZE_HPT_DISABLED;
+    } else if (strcmp(value, "enabled") == 0) {
+        spapr->resize_hpt = SPAPR_RESIZE_HPT_ENABLED;
+    } else if (strcmp(value, "required") == 0) {
+        spapr->resize_hpt = SPAPR_RESIZE_HPT_REQUIRED;
+    } else {
+        error_setg(errp, "Bad value for \"resize-hpt\" property");
+    }
+}
+
+static void spapr_get_vsmt(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    visit_type_uint32(v, name, (uint32_t *)opaque, errp);
+}
+
+static void spapr_set_vsmt(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    visit_type_uint32(v, name, (uint32_t *)opaque, errp);
+}
+
 static void spapr_machine_initfn(Object *obj)
 {
     sPAPRMachineState *spapr = SPAPR_MACHINE(obj);
 
     spapr->htab_fd = -1;
+    spapr->use_hotplug_event_source = true;
     object_property_add_str(obj, "kvm-type",
                             spapr_get_kvm_type, spapr_set_kvm_type, NULL);
     object_property_set_description(obj, "kvm-type",
                                     "Specifies the KVM virtualization mode (HV, PR)",
                                     NULL);
+    object_property_add_bool(obj, "modern-hotplug-events",
+                            spapr_get_modern_hotplug_events,
+                            spapr_set_modern_hotplug_events,
+                            NULL);
+    object_property_set_description(obj, "modern-hotplug-events",
+                                    "Use dedicated hotplug event mechanism in"
+                                    " place of standard EPOW events when possible"
+                                    " (required for memory hot-unplug support)",
+                                    NULL);
+
+    ppc_compat_add_property(obj, "max-cpu-compat", &spapr->max_compat_pvr,
+                            "Maximum permitted CPU compatibility mode",
+                            &error_fatal);
+
+    object_property_add_str(obj, "resize-hpt",
+                            spapr_get_resize_hpt, spapr_set_resize_hpt, NULL);
+    object_property_set_description(obj, "resize-hpt",
+                                    "Resizing of the Hash Page Table (enabled, disabled, required)",
+                                    NULL);
+    object_property_add(obj, "vsmt", "uint32", spapr_get_vsmt,
+                        spapr_set_vsmt, NULL, &spapr->vsmt, &error_abort);
+    object_property_set_description(obj, "vsmt",
+                                    "Virtual SMT: KVM behaves as if this were"
+                                    " the host's SMT mode", &error_abort);
 }
 
 static void spapr_machine_finalizefn(Object *obj)
@@ -2195,10 +2830,8 @@ static void spapr_machine_finalizefn(Object *obj)
     g_free(spapr->kvm_type);
 }
 
-static void ppc_cpu_do_nmi_on_cpu(void *arg)
+void spapr_do_system_reset_on_cpu(CPUState *cs, run_on_cpu_data arg)
 {
-    CPUState *cs = arg;
-
     cpu_synchronize_state(cs);
     ppc_cpu_do_system_reset(cs);
 }
@@ -2208,37 +2841,62 @@ static void spapr_nmi(NMIState *n, int cpu_index, Error **errp)
     CPUState *cs;
 
     CPU_FOREACH(cs) {
-        async_run_on_cpu(cs, ppc_cpu_do_nmi_on_cpu, cs);
+        async_run_on_cpu(cs, spapr_do_system_reset_on_cpu, RUN_ON_CPU_NULL);
     }
 }
 
-static void spapr_add_lmbs(DeviceState *dev, uint64_t addr, uint64_t size,
-                           uint32_t node, Error **errp)
+static void spapr_add_lmbs(DeviceState *dev, uint64_t addr_start, uint64_t size,
+                           uint32_t node, bool dedicated_hp_event_source,
+                           Error **errp)
 {
     sPAPRDRConnector *drc;
-    sPAPRDRConnectorClass *drck;
     uint32_t nr_lmbs = size/SPAPR_MEMORY_BLOCK_SIZE;
     int i, fdt_offset, fdt_size;
     void *fdt;
+    uint64_t addr = addr_start;
+    bool hotplugged = spapr_drc_hotplugged(dev);
+    Error *local_err = NULL;
 
     for (i = 0; i < nr_lmbs; i++) {
-        drc = spapr_dr_connector_by_id(SPAPR_DR_CONNECTOR_TYPE_LMB,
-                addr/SPAPR_MEMORY_BLOCK_SIZE);
+        drc = spapr_drc_by_id(TYPE_SPAPR_DRC_LMB,
+                              addr / SPAPR_MEMORY_BLOCK_SIZE);
         g_assert(drc);
 
         fdt = create_device_tree(&fdt_size);
         fdt_offset = spapr_populate_memory_node(fdt, node, addr,
                                                 SPAPR_MEMORY_BLOCK_SIZE);
 
-        drck = SPAPR_DR_CONNECTOR_GET_CLASS(drc);
-        drck->attach(drc, dev, fdt, fdt_offset, !dev->hotplugged, errp);
+        spapr_drc_attach(drc, dev, fdt, fdt_offset, &local_err);
+        if (local_err) {
+            while (addr > addr_start) {
+                addr -= SPAPR_MEMORY_BLOCK_SIZE;
+                drc = spapr_drc_by_id(TYPE_SPAPR_DRC_LMB,
+                                      addr / SPAPR_MEMORY_BLOCK_SIZE);
+                spapr_drc_detach(drc);
+            }
+            g_free(fdt);
+            error_propagate(errp, local_err);
+            return;
+        }
+        if (!hotplugged) {
+            spapr_drc_reset(drc);
+        }
         addr += SPAPR_MEMORY_BLOCK_SIZE;
     }
     /* send hotplug notification to the
      * guest only in case of hotplugged memory
      */
-    if (dev->hotplugged) {
-       spapr_hotplug_req_add_by_count(SPAPR_DR_CONNECTOR_TYPE_LMB, nr_lmbs);
+    if (hotplugged) {
+        if (dedicated_hp_event_source) {
+            drc = spapr_drc_by_id(TYPE_SPAPR_DRC_LMB,
+                                  addr_start / SPAPR_MEMORY_BLOCK_SIZE);
+            spapr_hotplug_req_add_by_count_indexed(SPAPR_DR_CONNECTOR_TYPE_LMB,
+                                                   nr_lmbs,
+                                                   spapr_drc_index(drc));
+        } else {
+            spapr_hotplug_req_add_by_count(SPAPR_DR_CONNECTOR_TYPE_LMB,
+                                           nr_lmbs);
+        }
     }
 }
 
@@ -2249,40 +2907,247 @@ static void spapr_memory_plug(HotplugHandler *hotplug_dev, DeviceState *dev,
     sPAPRMachineState *ms = SPAPR_MACHINE(hotplug_dev);
     PCDIMMDevice *dimm = PC_DIMM(dev);
     PCDIMMDeviceClass *ddc = PC_DIMM_GET_CLASS(dimm);
-    MemoryRegion *mr = ddc->get_memory_region(dimm);
-    uint64_t align = memory_region_get_alignment(mr);
-    uint64_t size = memory_region_size(mr);
-    uint64_t addr;
+    MemoryRegion *mr;
+    uint64_t align, size, addr;
 
-    if (size % SPAPR_MEMORY_BLOCK_SIZE) {
-        error_setg(&local_err, "Hotplugged memory size must be a multiple of "
-                      "%lld MB", SPAPR_MEMORY_BLOCK_SIZE/M_BYTE);
+    mr = ddc->get_memory_region(dimm, &local_err);
+    if (local_err) {
         goto out;
     }
+    align = memory_region_get_alignment(mr);
+    size = memory_region_size(mr);
 
     pc_dimm_memory_plug(dev, &ms->hotplug_memory, mr, align, &local_err);
     if (local_err) {
         goto out;
     }
 
-    addr = object_property_get_int(OBJECT(dimm), PC_DIMM_ADDR_PROP, &local_err);
+    addr = object_property_get_uint(OBJECT(dimm),
+                                    PC_DIMM_ADDR_PROP, &local_err);
     if (local_err) {
-        pc_dimm_memory_unplug(dev, &ms->hotplug_memory, mr);
-        goto out;
+        goto out_unplug;
     }
 
-    spapr_add_lmbs(dev, addr, size, node, &error_abort);
+    spapr_add_lmbs(dev, addr, size, node,
+                   spapr_ovec_test(ms->ov5_cas, OV5_HP_EVT),
+                   &local_err);
+    if (local_err) {
+        goto out_unplug;
+    }
 
+    return;
+
+out_unplug:
+    pc_dimm_memory_unplug(dev, &ms->hotplug_memory, mr);
 out:
     error_propagate(errp, local_err);
 }
 
-void *spapr_populate_hotplug_cpu_dt(CPUState *cs, int *fdt_offset,
-                                    sPAPRMachineState *spapr)
+static void spapr_memory_pre_plug(HotplugHandler *hotplug_dev, DeviceState *dev,
+                                  Error **errp)
+{
+    PCDIMMDevice *dimm = PC_DIMM(dev);
+    PCDIMMDeviceClass *ddc = PC_DIMM_GET_CLASS(dimm);
+    MemoryRegion *mr;
+    uint64_t size;
+    char *mem_dev;
+
+    mr = ddc->get_memory_region(dimm, errp);
+    if (!mr) {
+        return;
+    }
+    size = memory_region_size(mr);
+
+    if (size % SPAPR_MEMORY_BLOCK_SIZE) {
+        error_setg(errp, "Hotplugged memory size must be a multiple of "
+                      "%lld MB", SPAPR_MEMORY_BLOCK_SIZE / M_BYTE);
+        return;
+    }
+
+    mem_dev = object_property_get_str(OBJECT(dimm), PC_DIMM_MEMDEV_PROP, NULL);
+    if (mem_dev && !kvmppc_is_mem_backend_page_size_ok(mem_dev)) {
+        error_setg(errp, "Memory backend has bad page size. "
+                   "Use 'memory-backend-file' with correct mem-path.");
+        goto out;
+    }
+
+out:
+    g_free(mem_dev);
+}
+
+struct sPAPRDIMMState {
+    PCDIMMDevice *dimm;
+    uint32_t nr_lmbs;
+    QTAILQ_ENTRY(sPAPRDIMMState) next;
+};
+
+static sPAPRDIMMState *spapr_pending_dimm_unplugs_find(sPAPRMachineState *s,
+                                                       PCDIMMDevice *dimm)
+{
+    sPAPRDIMMState *dimm_state = NULL;
+
+    QTAILQ_FOREACH(dimm_state, &s->pending_dimm_unplugs, next) {
+        if (dimm_state->dimm == dimm) {
+            break;
+        }
+    }
+    return dimm_state;
+}
+
+static sPAPRDIMMState *spapr_pending_dimm_unplugs_add(sPAPRMachineState *spapr,
+                                                      uint32_t nr_lmbs,
+                                                      PCDIMMDevice *dimm)
+{
+    sPAPRDIMMState *ds = NULL;
+
+    /*
+     * If this request is for a DIMM whose removal had failed earlier
+     * (due to guest's refusal to remove the LMBs), we would have this
+     * dimm already in the pending_dimm_unplugs list. In that
+     * case don't add again.
+     */
+    ds = spapr_pending_dimm_unplugs_find(spapr, dimm);
+    if (!ds) {
+        ds = g_malloc0(sizeof(sPAPRDIMMState));
+        ds->nr_lmbs = nr_lmbs;
+        ds->dimm = dimm;
+        QTAILQ_INSERT_HEAD(&spapr->pending_dimm_unplugs, ds, next);
+    }
+    return ds;
+}
+
+static void spapr_pending_dimm_unplugs_remove(sPAPRMachineState *spapr,
+                                              sPAPRDIMMState *dimm_state)
+{
+    QTAILQ_REMOVE(&spapr->pending_dimm_unplugs, dimm_state, next);
+    g_free(dimm_state);
+}
+
+static sPAPRDIMMState *spapr_recover_pending_dimm_state(sPAPRMachineState *ms,
+                                                        PCDIMMDevice *dimm)
+{
+    sPAPRDRConnector *drc;
+    PCDIMMDeviceClass *ddc = PC_DIMM_GET_CLASS(dimm);
+    MemoryRegion *mr = ddc->get_memory_region(dimm, &error_abort);
+    uint64_t size = memory_region_size(mr);
+    uint32_t nr_lmbs = size / SPAPR_MEMORY_BLOCK_SIZE;
+    uint32_t avail_lmbs = 0;
+    uint64_t addr_start, addr;
+    int i;
+
+    addr_start = object_property_get_int(OBJECT(dimm), PC_DIMM_ADDR_PROP,
+                                         &error_abort);
+
+    addr = addr_start;
+    for (i = 0; i < nr_lmbs; i++) {
+        drc = spapr_drc_by_id(TYPE_SPAPR_DRC_LMB,
+                              addr / SPAPR_MEMORY_BLOCK_SIZE);
+        g_assert(drc);
+        if (drc->dev) {
+            avail_lmbs++;
+        }
+        addr += SPAPR_MEMORY_BLOCK_SIZE;
+    }
+
+    return spapr_pending_dimm_unplugs_add(ms, avail_lmbs, dimm);
+}
+
+/* Callback to be called during DRC release. */
+void spapr_lmb_release(DeviceState *dev)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(qdev_get_hotplug_handler(dev));
+    PCDIMMDevice *dimm = PC_DIMM(dev);
+    PCDIMMDeviceClass *ddc = PC_DIMM_GET_CLASS(dimm);
+    MemoryRegion *mr = ddc->get_memory_region(dimm, &error_abort);
+    sPAPRDIMMState *ds = spapr_pending_dimm_unplugs_find(spapr, PC_DIMM(dev));
+
+    /* This information will get lost if a migration occurs
+     * during the unplug process. In this case recover it. */
+    if (ds == NULL) {
+        ds = spapr_recover_pending_dimm_state(spapr, PC_DIMM(dev));
+        g_assert(ds);
+        /* The DRC being examined by the caller at least must be counted */
+        g_assert(ds->nr_lmbs);
+    }
+
+    if (--ds->nr_lmbs) {
+        return;
+    }
+
+    /*
+     * Now that all the LMBs have been removed by the guest, call the
+     * pc-dimm unplug handler to cleanup up the pc-dimm device.
+     */
+    pc_dimm_memory_unplug(dev, &spapr->hotplug_memory, mr);
+    object_unparent(OBJECT(dev));
+    spapr_pending_dimm_unplugs_remove(spapr, ds);
+}
+
+static void spapr_memory_unplug_request(HotplugHandler *hotplug_dev,
+                                        DeviceState *dev, Error **errp)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(hotplug_dev);
+    Error *local_err = NULL;
+    PCDIMMDevice *dimm = PC_DIMM(dev);
+    PCDIMMDeviceClass *ddc = PC_DIMM_GET_CLASS(dimm);
+    MemoryRegion *mr;
+    uint32_t nr_lmbs;
+    uint64_t size, addr_start, addr;
+    int i;
+    sPAPRDRConnector *drc;
+
+    mr = ddc->get_memory_region(dimm, &local_err);
+    if (local_err) {
+        goto out;
+    }
+    size = memory_region_size(mr);
+    nr_lmbs = size / SPAPR_MEMORY_BLOCK_SIZE;
+
+    addr_start = object_property_get_uint(OBJECT(dimm), PC_DIMM_ADDR_PROP,
+                                         &local_err);
+    if (local_err) {
+        goto out;
+    }
+
+    /*
+     * An existing pending dimm state for this DIMM means that there is an
+     * unplug operation in progress, waiting for the spapr_lmb_release
+     * callback to complete the job (BQL can't cover that far). In this case,
+     * bail out to avoid detaching DRCs that were already released.
+     */
+    if (spapr_pending_dimm_unplugs_find(spapr, dimm)) {
+        error_setg(&local_err,
+                   "Memory unplug already in progress for device %s",
+                   dev->id);
+        goto out;
+    }
+
+    spapr_pending_dimm_unplugs_add(spapr, nr_lmbs, dimm);
+
+    addr = addr_start;
+    for (i = 0; i < nr_lmbs; i++) {
+        drc = spapr_drc_by_id(TYPE_SPAPR_DRC_LMB,
+                              addr / SPAPR_MEMORY_BLOCK_SIZE);
+        g_assert(drc);
+
+        spapr_drc_detach(drc);
+        addr += SPAPR_MEMORY_BLOCK_SIZE;
+    }
+
+    drc = spapr_drc_by_id(TYPE_SPAPR_DRC_LMB,
+                          addr_start / SPAPR_MEMORY_BLOCK_SIZE);
+    spapr_hotplug_req_remove_by_count_indexed(SPAPR_DR_CONNECTOR_TYPE_LMB,
+                                              nr_lmbs, spapr_drc_index(drc));
+out:
+    error_propagate(errp, local_err);
+}
+
+static void *spapr_populate_hotplug_cpu_dt(CPUState *cs, int *fdt_offset,
+                                           sPAPRMachineState *spapr)
 {
     PowerPCCPU *cpu = POWERPC_CPU(cs);
     DeviceClass *dc = DEVICE_GET_CLASS(cs);
-    int id = ppc_get_vcpu_dt_id(cpu);
+    int id = spapr_vcpu_id(cpu);
     void *fdt;
     int offset, fdt_size;
     char *nodename;
@@ -2298,10 +3163,187 @@ void *spapr_populate_hotplug_cpu_dt(CPUState *cs, int *fdt_offset,
     return fdt;
 }
 
+/* Callback to be called during DRC release. */
+void spapr_core_release(DeviceState *dev)
+{
+    MachineState *ms = MACHINE(qdev_get_hotplug_handler(dev));
+    sPAPRMachineClass *smc = SPAPR_MACHINE_GET_CLASS(ms);
+    CPUCore *cc = CPU_CORE(dev);
+    CPUArchId *core_slot = spapr_find_cpu_slot(ms, cc->core_id, NULL);
+
+    if (smc->pre_2_10_has_unused_icps) {
+        sPAPRCPUCore *sc = SPAPR_CPU_CORE(OBJECT(dev));
+        sPAPRCPUCoreClass *scc = SPAPR_CPU_CORE_GET_CLASS(OBJECT(cc));
+        size_t size = object_type_get_instance_size(scc->cpu_type);
+        int i;
+
+        for (i = 0; i < cc->nr_threads; i++) {
+            CPUState *cs = CPU(sc->threads + i * size);
+
+            pre_2_10_vmstate_register_dummy_icp(cs->cpu_index);
+        }
+    }
+
+    assert(core_slot);
+    core_slot->cpu = NULL;
+    object_unparent(OBJECT(dev));
+}
+
+static
+void spapr_core_unplug_request(HotplugHandler *hotplug_dev, DeviceState *dev,
+                               Error **errp)
+{
+    int index;
+    sPAPRDRConnector *drc;
+    CPUCore *cc = CPU_CORE(dev);
+    int smt = kvmppc_smt_threads();
+
+    if (!spapr_find_cpu_slot(MACHINE(hotplug_dev), cc->core_id, &index)) {
+        error_setg(errp, "Unable to find CPU core with core-id: %d",
+                   cc->core_id);
+        return;
+    }
+    if (index == 0) {
+        error_setg(errp, "Boot CPU core may not be unplugged");
+        return;
+    }
+
+    drc = spapr_drc_by_id(TYPE_SPAPR_DRC_CPU, index * smt);
+    g_assert(drc);
+
+    spapr_drc_detach(drc);
+
+    spapr_hotplug_req_remove_by_index(drc);
+}
+
+static void spapr_core_plug(HotplugHandler *hotplug_dev, DeviceState *dev,
+                            Error **errp)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(OBJECT(hotplug_dev));
+    MachineClass *mc = MACHINE_GET_CLASS(spapr);
+    sPAPRMachineClass *smc = SPAPR_MACHINE_CLASS(mc);
+    sPAPRCPUCore *core = SPAPR_CPU_CORE(OBJECT(dev));
+    CPUCore *cc = CPU_CORE(dev);
+    CPUState *cs = CPU(core->threads);
+    sPAPRDRConnector *drc;
+    Error *local_err = NULL;
+    int smt = kvmppc_smt_threads();
+    CPUArchId *core_slot;
+    int index;
+    bool hotplugged = spapr_drc_hotplugged(dev);
+
+    core_slot = spapr_find_cpu_slot(MACHINE(hotplug_dev), cc->core_id, &index);
+    if (!core_slot) {
+        error_setg(errp, "Unable to find CPU core with core-id: %d",
+                   cc->core_id);
+        return;
+    }
+    drc = spapr_drc_by_id(TYPE_SPAPR_DRC_CPU, index * smt);
+
+    g_assert(drc || !mc->has_hotpluggable_cpus);
+
+    if (drc) {
+        void *fdt;
+        int fdt_offset;
+
+        fdt = spapr_populate_hotplug_cpu_dt(cs, &fdt_offset, spapr);
+
+        spapr_drc_attach(drc, dev, fdt, fdt_offset, &local_err);
+        if (local_err) {
+            g_free(fdt);
+            error_propagate(errp, local_err);
+            return;
+        }
+
+        if (hotplugged) {
+            /*
+             * Send hotplug notification interrupt to the guest only
+             * in case of hotplugged CPUs.
+             */
+            spapr_hotplug_req_add_by_index(drc);
+        } else {
+            spapr_drc_reset(drc);
+        }
+    }
+
+    core_slot->cpu = OBJECT(dev);
+
+    if (smc->pre_2_10_has_unused_icps) {
+        sPAPRCPUCoreClass *scc = SPAPR_CPU_CORE_GET_CLASS(OBJECT(cc));
+        size_t size = object_type_get_instance_size(scc->cpu_type);
+        int i;
+
+        for (i = 0; i < cc->nr_threads; i++) {
+            sPAPRCPUCore *sc = SPAPR_CPU_CORE(dev);
+            void *obj = sc->threads + i * size;
+
+            cs = CPU(obj);
+            pre_2_10_vmstate_unregister_dummy_icp(cs->cpu_index);
+        }
+    }
+}
+
+static void spapr_core_pre_plug(HotplugHandler *hotplug_dev, DeviceState *dev,
+                                Error **errp)
+{
+    MachineState *machine = MACHINE(OBJECT(hotplug_dev));
+    MachineClass *mc = MACHINE_GET_CLASS(hotplug_dev);
+    Error *local_err = NULL;
+    CPUCore *cc = CPU_CORE(dev);
+    const char *base_core_type = spapr_get_cpu_core_type(machine->cpu_type);
+    const char *type = object_get_typename(OBJECT(dev));
+    CPUArchId *core_slot;
+    int index;
+
+    if (dev->hotplugged && !mc->has_hotpluggable_cpus) {
+        error_setg(&local_err, "CPU hotplug not supported for this machine");
+        goto out;
+    }
+
+    if (strcmp(base_core_type, type)) {
+        error_setg(&local_err, "CPU core type should be %s", base_core_type);
+        goto out;
+    }
+
+    if (cc->core_id % smp_threads) {
+        error_setg(&local_err, "invalid core id %d", cc->core_id);
+        goto out;
+    }
+
+    /*
+     * In general we should have homogeneous threads-per-core, but old
+     * (pre hotplug support) machine types allow the last core to have
+     * reduced threads as a compatibility hack for when we allowed
+     * total vcpus not a multiple of threads-per-core.
+     */
+    if (mc->has_hotpluggable_cpus && (cc->nr_threads != smp_threads)) {
+        error_setg(&local_err, "invalid nr-threads %d, must be %d",
+                   cc->nr_threads, smp_threads);
+        goto out;
+    }
+
+    core_slot = spapr_find_cpu_slot(MACHINE(hotplug_dev), cc->core_id, &index);
+    if (!core_slot) {
+        error_setg(&local_err, "core id %d out of range", cc->core_id);
+        goto out;
+    }
+
+    if (core_slot->cpu) {
+        error_setg(&local_err, "core %d already populated", cc->core_id);
+        goto out;
+    }
+
+    numa_cpu_pre_plug(core_slot, dev, &local_err);
+
+out:
+    error_propagate(errp, local_err);
+}
+
 static void spapr_machine_device_plug(HotplugHandler *hotplug_dev,
                                       DeviceState *dev, Error **errp)
 {
-    sPAPRMachineClass *smc = SPAPR_MACHINE_GET_CLASS(qdev_get_machine());
+    MachineState *ms = MACHINE(hotplug_dev);
+    sPAPRMachineClass *smc = SPAPR_MACHINE_GET_CLASS(ms);
 
     if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
         int node;
@@ -2310,7 +3352,7 @@ static void spapr_machine_device_plug(HotplugHandler *hotplug_dev,
             error_setg(errp, "Memory hotplug not supported for this machine");
             return;
         }
-        node = object_property_get_int(OBJECT(dev), PC_DIMM_NODE_PROP, errp);
+        node = object_property_get_uint(OBJECT(dev), PC_DIMM_NODE_PROP, errp);
         if (*errp) {
             return;
         }
@@ -2347,32 +3389,45 @@ static void spapr_machine_device_plug(HotplugHandler *hotplug_dev,
     }
 }
 
-static void spapr_machine_device_unplug(HotplugHandler *hotplug_dev,
-                                      DeviceState *dev, Error **errp)
+static void spapr_machine_device_unplug_request(HotplugHandler *hotplug_dev,
+                                                DeviceState *dev, Error **errp)
 {
-    MachineClass *mc = MACHINE_GET_CLASS(qdev_get_machine());
+    sPAPRMachineState *sms = SPAPR_MACHINE(OBJECT(hotplug_dev));
+    MachineClass *mc = MACHINE_GET_CLASS(sms);
 
     if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
-        error_setg(errp, "Memory hot unplug not supported by sPAPR");
+        if (spapr_ovec_test(sms->ov5_cas, OV5_HP_EVT)) {
+            spapr_memory_unplug_request(hotplug_dev, dev, errp);
+        } else {
+            /* NOTE: this means there is a window after guest reset, prior to
+             * CAS negotiation, where unplug requests will fail due to the
+             * capability not being detected yet. This is a bit different than
+             * the case with PCI unplug, where the events will be queued and
+             * eventually handled by the guest after boot
+             */
+            error_setg(errp, "Memory hot unplug not supported for this guest");
+        }
     } else if (object_dynamic_cast(OBJECT(dev), TYPE_SPAPR_CPU_CORE)) {
-        if (!mc->query_hotpluggable_cpus) {
+        if (!mc->has_hotpluggable_cpus) {
             error_setg(errp, "CPU hot unplug not supported on this machine");
             return;
         }
-        spapr_core_unplug(hotplug_dev, dev, errp);
+        spapr_core_unplug_request(hotplug_dev, dev, errp);
     }
 }
 
 static void spapr_machine_device_pre_plug(HotplugHandler *hotplug_dev,
                                           DeviceState *dev, Error **errp)
 {
-    if (object_dynamic_cast(OBJECT(dev), TYPE_SPAPR_CPU_CORE)) {
+    if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
+        spapr_memory_pre_plug(hotplug_dev, dev, errp);
+    } else if (object_dynamic_cast(OBJECT(dev), TYPE_SPAPR_CPU_CORE)) {
         spapr_core_pre_plug(hotplug_dev, dev, errp);
     }
 }
 
-static HotplugHandler *spapr_get_hotpug_handler(MachineState *machine,
-                                             DeviceState *dev)
+static HotplugHandler *spapr_get_hotplug_handler(MachineState *machine,
+                                                 DeviceState *dev)
 {
     if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM) ||
         object_dynamic_cast(OBJECT(dev), TYPE_SPAPR_CPU_CORE)) {
@@ -2381,42 +3436,165 @@ static HotplugHandler *spapr_get_hotpug_handler(MachineState *machine,
     return NULL;
 }
 
-static unsigned spapr_cpu_index_to_socket_id(unsigned cpu_index)
+static CpuInstanceProperties
+spapr_cpu_index_to_props(MachineState *machine, unsigned cpu_index)
 {
-    /* Allocate to NUMA nodes on a "socket" basis (not that concept of
-     * socket means much for the paravirtualized PAPR platform) */
-    return cpu_index / smp_threads / smp_cores;
+    CPUArchId *core_slot;
+    MachineClass *mc = MACHINE_GET_CLASS(machine);
+
+    /* make sure possible_cpu are intialized */
+    mc->possible_cpu_arch_ids(machine);
+    /* get CPU core slot containing thread that matches cpu_index */
+    core_slot = spapr_find_cpu_slot(machine, cpu_index, NULL);
+    assert(core_slot);
+    return core_slot->props;
 }
 
-static HotpluggableCPUList *spapr_query_hotpluggable_cpus(MachineState *machine)
+static int64_t spapr_get_default_cpu_node_id(const MachineState *ms, int idx)
+{
+    return idx / smp_cores % nb_numa_nodes;
+}
+
+static const CPUArchIdList *spapr_possible_cpu_arch_ids(MachineState *machine)
 {
     int i;
-    HotpluggableCPUList *head = NULL;
-    sPAPRMachineState *spapr = SPAPR_MACHINE(machine);
     int spapr_max_cores = max_cpus / smp_threads;
+    MachineClass *mc = MACHINE_GET_CLASS(machine);
 
-    for (i = 0; i < spapr_max_cores; i++) {
-        HotpluggableCPUList *list_item = g_new0(typeof(*list_item), 1);
-        HotpluggableCPU *cpu_item = g_new0(typeof(*cpu_item), 1);
-        CpuInstanceProperties *cpu_props = g_new0(typeof(*cpu_props), 1);
-
-        cpu_item->type = spapr_get_cpu_core_type(machine->cpu_model);
-        cpu_item->vcpus_count = smp_threads;
-        cpu_props->has_core_id = true;
-        cpu_props->core_id = i * smp_threads;
-        /* TODO: add 'has_node/node' here to describe
-           to which node core belongs */
-
-        cpu_item->props = cpu_props;
-        if (spapr->cores[i]) {
-            cpu_item->has_qom_path = true;
-            cpu_item->qom_path = object_get_canonical_path(spapr->cores[i]);
-        }
-        list_item->value = cpu_item;
-        list_item->next = head;
-        head = list_item;
+    if (!mc->has_hotpluggable_cpus) {
+        spapr_max_cores = QEMU_ALIGN_UP(smp_cpus, smp_threads) / smp_threads;
     }
-    return head;
+    if (machine->possible_cpus) {
+        assert(machine->possible_cpus->len == spapr_max_cores);
+        return machine->possible_cpus;
+    }
+
+    machine->possible_cpus = g_malloc0(sizeof(CPUArchIdList) +
+                             sizeof(CPUArchId) * spapr_max_cores);
+    machine->possible_cpus->len = spapr_max_cores;
+    for (i = 0; i < machine->possible_cpus->len; i++) {
+        int core_id = i * smp_threads;
+
+        machine->possible_cpus->cpus[i].vcpus_count = smp_threads;
+        machine->possible_cpus->cpus[i].arch_id = core_id;
+        machine->possible_cpus->cpus[i].props.has_core_id = true;
+        machine->possible_cpus->cpus[i].props.core_id = core_id;
+    }
+    return machine->possible_cpus;
+}
+
+static void spapr_phb_placement(sPAPRMachineState *spapr, uint32_t index,
+                                uint64_t *buid, hwaddr *pio,
+                                hwaddr *mmio32, hwaddr *mmio64,
+                                unsigned n_dma, uint32_t *liobns, Error **errp)
+{
+    /*
+     * New-style PHB window placement.
+     *
+     * Goals: Gives large (1TiB), naturally aligned 64-bit MMIO window
+     * for each PHB, in addition to 2GiB 32-bit MMIO and 64kiB PIO
+     * windows.
+     *
+     * Some guest kernels can't work with MMIO windows above 1<<46
+     * (64TiB), so we place up to 31 PHBs in the area 32TiB..64TiB
+     *
+     * 32TiB..(33TiB+1984kiB) contains the 64kiB PIO windows for each
+     * PHB stacked together.  (32TiB+2GiB)..(32TiB+64GiB) contains the
+     * 2GiB 32-bit MMIO windows for each PHB.  Then 33..64TiB has the
+     * 1TiB 64-bit MMIO windows for each PHB.
+     */
+    const uint64_t base_buid = 0x800000020000000ULL;
+#define SPAPR_MAX_PHBS ((SPAPR_PCI_LIMIT - SPAPR_PCI_BASE) / \
+                        SPAPR_PCI_MEM64_WIN_SIZE - 1)
+    int i;
+
+    /* Sanity check natural alignments */
+    QEMU_BUILD_BUG_ON((SPAPR_PCI_BASE % SPAPR_PCI_MEM64_WIN_SIZE) != 0);
+    QEMU_BUILD_BUG_ON((SPAPR_PCI_LIMIT % SPAPR_PCI_MEM64_WIN_SIZE) != 0);
+    QEMU_BUILD_BUG_ON((SPAPR_PCI_MEM64_WIN_SIZE % SPAPR_PCI_MEM32_WIN_SIZE) != 0);
+    QEMU_BUILD_BUG_ON((SPAPR_PCI_MEM32_WIN_SIZE % SPAPR_PCI_IO_WIN_SIZE) != 0);
+    /* Sanity check bounds */
+    QEMU_BUILD_BUG_ON((SPAPR_MAX_PHBS * SPAPR_PCI_IO_WIN_SIZE) >
+                      SPAPR_PCI_MEM32_WIN_SIZE);
+    QEMU_BUILD_BUG_ON((SPAPR_MAX_PHBS * SPAPR_PCI_MEM32_WIN_SIZE) >
+                      SPAPR_PCI_MEM64_WIN_SIZE);
+
+    if (index >= SPAPR_MAX_PHBS) {
+        error_setg(errp, "\"index\" for PAPR PHB is too large (max %llu)",
+                   SPAPR_MAX_PHBS - 1);
+        return;
+    }
+
+    *buid = base_buid + index;
+    for (i = 0; i < n_dma; ++i) {
+        liobns[i] = SPAPR_PCI_LIOBN(index, i);
+    }
+
+    *pio = SPAPR_PCI_BASE + index * SPAPR_PCI_IO_WIN_SIZE;
+    *mmio32 = SPAPR_PCI_BASE + (index + 1) * SPAPR_PCI_MEM32_WIN_SIZE;
+    *mmio64 = SPAPR_PCI_BASE + (index + 1) * SPAPR_PCI_MEM64_WIN_SIZE;
+}
+
+static ICSState *spapr_ics_get(XICSFabric *dev, int irq)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(dev);
+
+    return ics_valid_irq(spapr->ics, irq) ? spapr->ics : NULL;
+}
+
+static void spapr_ics_resend(XICSFabric *dev)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(dev);
+
+    ics_resend(spapr->ics);
+}
+
+static ICPState *spapr_icp_get(XICSFabric *xi, int vcpu_id)
+{
+    PowerPCCPU *cpu = spapr_find_cpu(vcpu_id);
+
+    return cpu ? ICP(cpu->intc) : NULL;
+}
+
+static void spapr_pic_print_info(InterruptStatsProvider *obj,
+                                 Monitor *mon)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(obj);
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        PowerPCCPU *cpu = POWERPC_CPU(cs);
+
+        icp_pic_print_info(ICP(cpu->intc), mon);
+    }
+
+    ics_pic_print_info(spapr->ics, mon);
+}
+
+int spapr_vcpu_id(PowerPCCPU *cpu)
+{
+    CPUState *cs = CPU(cpu);
+
+    if (kvm_enabled()) {
+        return kvm_arch_vcpu_id(cs);
+    } else {
+        return cs->cpu_index;
+    }
+}
+
+PowerPCCPU *spapr_find_cpu(int vcpu_id)
+{
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        PowerPCCPU *cpu = POWERPC_CPU(cs);
+
+        if (spapr_vcpu_id(cpu) == vcpu_id) {
+            return cpu;
+        }
+    }
+
+    return NULL;
 }
 
 static void spapr_machine_class_init(ObjectClass *oc, void *data)
@@ -2426,6 +3604,9 @@ static void spapr_machine_class_init(ObjectClass *oc, void *data)
     FWPathProviderClass *fwc = FW_PATH_PROVIDER_CLASS(oc);
     NMIClass *nc = NMI_CLASS(oc);
     HotplugHandlerClass *hc = HOTPLUG_HANDLER_CLASS(oc);
+    PPCVirtualHypervisorClass *vhc = PPC_VIRTUAL_HYPERVISOR_CLASS(oc);
+    XICSFabricClass *xic = XICS_FABRIC_CLASS(oc);
+    InterruptStatsProviderClass *ispc = INTERRUPT_STATS_PROVIDER_CLASS(oc);
 
     mc->desc = "pSeries Logical Partition (PAPR compliant)";
 
@@ -2437,23 +3618,44 @@ static void spapr_machine_class_init(ObjectClass *oc, void *data)
     mc->init = ppc_spapr_init;
     mc->reset = ppc_spapr_reset;
     mc->block_default_type = IF_SCSI;
-    mc->max_cpus = MAX_CPUMASK_BITS;
+    mc->max_cpus = 1024;
     mc->no_parallel = 1;
     mc->default_boot_order = "";
     mc->default_ram_size = 512 * M_BYTE;
     mc->kvm_type = spapr_kvm_type;
     mc->has_dynamic_sysbus = true;
     mc->pci_allow_0_address = true;
-    mc->get_hotplug_handler = spapr_get_hotpug_handler;
+    mc->get_hotplug_handler = spapr_get_hotplug_handler;
     hc->pre_plug = spapr_machine_device_pre_plug;
     hc->plug = spapr_machine_device_plug;
-    hc->unplug = spapr_machine_device_unplug;
-    mc->cpu_index_to_socket_id = spapr_cpu_index_to_socket_id;
+    mc->cpu_index_to_instance_props = spapr_cpu_index_to_props;
+    mc->get_default_cpu_node_id = spapr_get_default_cpu_node_id;
+    mc->possible_cpu_arch_ids = spapr_possible_cpu_arch_ids;
+    hc->unplug_request = spapr_machine_device_unplug_request;
 
     smc->dr_lmb_enabled = true;
-    mc->query_hotpluggable_cpus = spapr_query_hotpluggable_cpus;
+    mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("power8_v2.0");
+    mc->has_hotpluggable_cpus = true;
+    smc->resize_hpt_default = SPAPR_RESIZE_HPT_ENABLED;
     fwc->get_dev_path = spapr_get_fw_dev_path;
     nc->nmi_monitor_handler = spapr_nmi;
+    smc->phb_placement = spapr_phb_placement;
+    vhc->hypercall = emulate_spapr_hypercall;
+    vhc->hpt_mask = spapr_hpt_mask;
+    vhc->map_hptes = spapr_map_hptes;
+    vhc->unmap_hptes = spapr_unmap_hptes;
+    vhc->store_hpte = spapr_store_hpte;
+    vhc->get_patbe = spapr_get_patbe;
+    vhc->encode_hpt_for_kvm_pr = spapr_encode_hpt_for_kvm_pr;
+    xic->ics_get = spapr_ics_get;
+    xic->ics_resend = spapr_ics_resend;
+    xic->icp_get = spapr_icp_get;
+    ispc->print_info = spapr_pic_print_info;
+    /* Force NUMA node memory size to be a multiple of
+     * SPAPR_MEMORY_BLOCK_SIZE (256M) since that's the granularity
+     * in which LMBs are represented and hot-added
+     */
+    mc->numa_mem_align_shift = 28;
 }
 
 static const TypeInfo spapr_machine_info = {
@@ -2469,6 +3671,9 @@ static const TypeInfo spapr_machine_info = {
         { TYPE_FW_PATH_PROVIDER },
         { TYPE_NMI },
         { TYPE_HOTPLUG_HANDLER },
+        { TYPE_PPC_VIRTUAL_HYPERVISOR },
+        { TYPE_XICS_FABRIC },
+        { TYPE_INTERRUPT_STATS_PROVIDER },
         { }
     },
 };
@@ -2502,18 +3707,185 @@ static const TypeInfo spapr_machine_info = {
     type_init(spapr_machine_register_##suffix)
 
 /*
- * pseries-2.7
+ * pseries-2.11
  */
-static void spapr_machine_2_7_instance_options(MachineState *machine)
+static void spapr_machine_2_11_instance_options(MachineState *machine)
 {
 }
 
-static void spapr_machine_2_7_class_options(MachineClass *mc)
+static void spapr_machine_2_11_class_options(MachineClass *mc)
 {
     /* Defaults for the latest behaviour inherited from the base class */
 }
 
-DEFINE_SPAPR_MACHINE(2_7, "2.7", true);
+DEFINE_SPAPR_MACHINE(2_11, "2.11", true);
+
+/*
+ * pseries-2.10
+ */
+#define SPAPR_COMPAT_2_10                                              \
+    HW_COMPAT_2_10                                                     \
+
+static void spapr_machine_2_10_instance_options(MachineState *machine)
+{
+}
+
+static void spapr_machine_2_10_class_options(MachineClass *mc)
+{
+    spapr_machine_2_11_class_options(mc);
+    SET_MACHINE_COMPAT(mc, SPAPR_COMPAT_2_10);
+}
+
+DEFINE_SPAPR_MACHINE(2_10, "2.10", false);
+
+/*
+ * pseries-2.9
+ */
+#define SPAPR_COMPAT_2_9                                               \
+    HW_COMPAT_2_9                                                      \
+    {                                                                  \
+        .driver = TYPE_POWERPC_CPU,                                    \
+        .property = "pre-2.10-migration",                              \
+        .value    = "on",                                              \
+    },                                                                 \
+
+static void spapr_machine_2_9_instance_options(MachineState *machine)
+{
+    spapr_machine_2_10_instance_options(machine);
+}
+
+static void spapr_machine_2_9_class_options(MachineClass *mc)
+{
+    sPAPRMachineClass *smc = SPAPR_MACHINE_CLASS(mc);
+
+    spapr_machine_2_10_class_options(mc);
+    SET_MACHINE_COMPAT(mc, SPAPR_COMPAT_2_9);
+    mc->numa_auto_assign_ram = numa_legacy_auto_assign_ram;
+    smc->pre_2_10_has_unused_icps = true;
+    smc->resize_hpt_default = SPAPR_RESIZE_HPT_DISABLED;
+}
+
+DEFINE_SPAPR_MACHINE(2_9, "2.9", false);
+
+/*
+ * pseries-2.8
+ */
+#define SPAPR_COMPAT_2_8                                        \
+    HW_COMPAT_2_8                                               \
+    {                                                           \
+        .driver   = TYPE_SPAPR_PCI_HOST_BRIDGE,                 \
+        .property = "pcie-extended-configuration-space",        \
+        .value    = "off",                                      \
+    },
+
+static void spapr_machine_2_8_instance_options(MachineState *machine)
+{
+    spapr_machine_2_9_instance_options(machine);
+}
+
+static void spapr_machine_2_8_class_options(MachineClass *mc)
+{
+    spapr_machine_2_9_class_options(mc);
+    SET_MACHINE_COMPAT(mc, SPAPR_COMPAT_2_8);
+    mc->numa_mem_align_shift = 23;
+}
+
+DEFINE_SPAPR_MACHINE(2_8, "2.8", false);
+
+/*
+ * pseries-2.7
+ */
+#define SPAPR_COMPAT_2_7                            \
+    HW_COMPAT_2_7                                   \
+    {                                               \
+        .driver   = TYPE_SPAPR_PCI_HOST_BRIDGE,     \
+        .property = "mem_win_size",                 \
+        .value    = stringify(SPAPR_PCI_2_7_MMIO_WIN_SIZE),\
+    },                                              \
+    {                                               \
+        .driver   = TYPE_SPAPR_PCI_HOST_BRIDGE,     \
+        .property = "mem64_win_size",               \
+        .value    = "0",                            \
+    },                                              \
+    {                                               \
+        .driver = TYPE_POWERPC_CPU,                 \
+        .property = "pre-2.8-migration",            \
+        .value    = "on",                           \
+    },                                              \
+    {                                               \
+        .driver = TYPE_SPAPR_PCI_HOST_BRIDGE,       \
+        .property = "pre-2.8-migration",            \
+        .value    = "on",                           \
+    },
+
+static void phb_placement_2_7(sPAPRMachineState *spapr, uint32_t index,
+                              uint64_t *buid, hwaddr *pio,
+                              hwaddr *mmio32, hwaddr *mmio64,
+                              unsigned n_dma, uint32_t *liobns, Error **errp)
+{
+    /* Legacy PHB placement for pseries-2.7 and earlier machine types */
+    const uint64_t base_buid = 0x800000020000000ULL;
+    const hwaddr phb_spacing = 0x1000000000ULL; /* 64 GiB */
+    const hwaddr mmio_offset = 0xa0000000; /* 2 GiB + 512 MiB */
+    const hwaddr pio_offset = 0x80000000; /* 2 GiB */
+    const uint32_t max_index = 255;
+    const hwaddr phb0_alignment = 0x10000000000ULL; /* 1 TiB */
+
+    uint64_t ram_top = MACHINE(spapr)->ram_size;
+    hwaddr phb0_base, phb_base;
+    int i;
+
+    /* Do we have hotpluggable memory? */
+    if (MACHINE(spapr)->maxram_size > ram_top) {
+        /* Can't just use maxram_size, because there may be an
+         * alignment gap between normal and hotpluggable memory
+         * regions */
+        ram_top = spapr->hotplug_memory.base +
+            memory_region_size(&spapr->hotplug_memory.mr);
+    }
+
+    phb0_base = QEMU_ALIGN_UP(ram_top, phb0_alignment);
+
+    if (index > max_index) {
+        error_setg(errp, "\"index\" for PAPR PHB is too large (max %u)",
+                   max_index);
+        return;
+    }
+
+    *buid = base_buid + index;
+    for (i = 0; i < n_dma; ++i) {
+        liobns[i] = SPAPR_PCI_LIOBN(index, i);
+    }
+
+    phb_base = phb0_base + index * phb_spacing;
+    *pio = phb_base + pio_offset;
+    *mmio32 = phb_base + mmio_offset;
+    /*
+     * We don't set the 64-bit MMIO window, relying on the PHB's
+     * fallback behaviour of automatically splitting a large "32-bit"
+     * window into contiguous 32-bit and 64-bit windows
+     */
+}
+
+static void spapr_machine_2_7_instance_options(MachineState *machine)
+{
+    sPAPRMachineState *spapr = SPAPR_MACHINE(machine);
+
+    spapr_machine_2_8_instance_options(machine);
+    spapr->use_hotplug_event_source = false;
+}
+
+static void spapr_machine_2_7_class_options(MachineClass *mc)
+{
+    sPAPRMachineClass *smc = SPAPR_MACHINE_CLASS(mc);
+
+    spapr_machine_2_8_class_options(mc);
+    mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("power7_v2.3");
+    SET_MACHINE_COMPAT(mc, SPAPR_COMPAT_2_7);
+    smc->phb_placement = phb_placement_2_7;
+}
+
+DEFINE_SPAPR_MACHINE(2_7, "2.7", false);
 
 /*
  * pseries-2.6
@@ -2528,12 +3900,13 @@ DEFINE_SPAPR_MACHINE(2_7, "2.7", true);
 
 static void spapr_machine_2_6_instance_options(MachineState *machine)
 {
+    spapr_machine_2_7_instance_options(machine);
 }
 
 static void spapr_machine_2_6_class_options(MachineClass *mc)
 {
     spapr_machine_2_7_class_options(mc);
-    mc->query_hotpluggable_cpus = NULL;
+    mc->has_hotpluggable_cpus = false;
     SET_MACHINE_COMPAT(mc, SPAPR_COMPAT_2_6);
 }
 
@@ -2552,6 +3925,7 @@ DEFINE_SPAPR_MACHINE(2_6, "2.6", false);
 
 static void spapr_machine_2_5_instance_options(MachineState *machine)
 {
+    spapr_machine_2_6_instance_options(machine);
 }
 
 static void spapr_machine_2_5_class_options(MachineClass *mc)
@@ -2601,9 +3975,6 @@ DEFINE_SPAPR_MACHINE(2_4, "2.4", false);
 static void spapr_machine_2_3_instance_options(MachineState *machine)
 {
     spapr_machine_2_4_instance_options(machine);
-    savevm_skip_section_footers();
-    global_state_set_optional();
-    savevm_skip_configuration();
 }
 
 static void spapr_machine_2_3_class_options(MachineClass *mc)

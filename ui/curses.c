@@ -22,7 +22,6 @@
  * THE SOFTWARE.
  */
 #include "qemu/osdep.h"
-#include <curses.h>
 
 #ifndef _WIN32
 #include <sys/ioctl.h>
@@ -34,6 +33,11 @@
 #include "ui/input.h"
 #include "sysemu/sysemu.h"
 
+/* KEY_EVENT is defined in wincon.h and in curses.h. Avoid redefinition. */
+#undef KEY_EVENT
+#include <curses.h>
+#undef KEY_EVENT
+
 #define FONT_HEIGHT 16
 #define FONT_WIDTH 8
 
@@ -43,16 +47,26 @@ static WINDOW *screenpad = NULL;
 static int width, height, gwidth, gheight, invalidate;
 static int px, py, sminx, sminy, smaxx, smaxy;
 
-chtype vga_to_curses[256];
+static chtype vga_to_curses[256];
 
 static void curses_update(DisplayChangeListener *dcl,
                           int x, int y, int w, int h)
 {
-    chtype *line;
+    console_ch_t *line;
+    chtype curses_line[width];
 
-    line = ((chtype *) screen) + y * width;
-    for (h += y; y < h; y ++, line += width)
-        mvwaddchnstr(screenpad, y, 0, line, width);
+    line = screen + y * width;
+    for (h += y; y < h; y ++, line += width) {
+        for (x = 0; x < width; x++) {
+            chtype ch = line[x] & 0xff;
+            chtype at = line[x] & ~0xff;
+            if (vga_to_curses[ch]) {
+                ch = vga_to_curses[ch];
+            }
+            curses_line[x] = ch | at;
+        }
+        mvwaddchnstr(screenpad, y, 0, curses_line, width);
+    }
 
     pnoutrefresh(screenpad, py, px, sminy, sminx, smaxy - 1, smaxx - 1);
     refresh();
@@ -181,7 +195,7 @@ static kbd_layout_t *kbd_layout = NULL;
 
 static void curses_refresh(DisplayChangeListener *dcl)
 {
-    int chr, nextchr, keysym, keycode, keycode_alt;
+    int chr, keysym, keycode, keycode_alt;
 
     curses_winch_check();
 
@@ -195,15 +209,9 @@ static void curses_refresh(DisplayChangeListener *dcl)
 
     graphic_hw_text_update(NULL, screen);
 
-    nextchr = ERR;
     while (1) {
         /* while there are any pending key strokes to process */
-        if (nextchr == ERR)
-            chr = getch();
-        else {
-            chr = nextchr;
-            nextchr = ERR;
-        }
+        chr = getch();
 
         if (chr == ERR)
             break;
@@ -224,13 +232,12 @@ static void curses_refresh(DisplayChangeListener *dcl)
 
         /* alt key */
         if (keycode == 1) {
-            nextchr = getch();
+            int nextchr = getch();
 
             if (nextchr != ERR) {
                 chr = nextchr;
                 keycode_alt = ALT;
-                keycode = curses2keycode[nextchr];
-                nextchr = ERR;
+                keycode = curses2keycode[chr];
 
                 if (keycode != -1) {
                     keycode |= ALT;
@@ -317,7 +324,10 @@ static void curses_refresh(DisplayChangeListener *dcl)
                 qemu_input_event_send_key_delay(0);
             }
         } else {
-            keysym = curses2qemu[chr];
+            keysym = -1;
+            if (chr < CURSES_KEYS) {
+                keysym = curses2qemu[chr];
+            }
             if (keysym == -1)
                 keysym = chr;
 
@@ -373,10 +383,10 @@ static void curses_setup(void)
     /* ACS_* is not constant. So, we can't initialize statically. */
     vga_to_curses['\0'] = ' ';
     vga_to_curses[0x04] = ACS_DIAMOND;
-    vga_to_curses[0x0a] = ACS_RARROW;
-    vga_to_curses[0x0b] = ACS_LARROW;
     vga_to_curses[0x18] = ACS_UARROW;
     vga_to_curses[0x19] = ACS_DARROW;
+    vga_to_curses[0x1a] = ACS_RARROW;
+    vga_to_curses[0x1b] = ACS_LARROW;
     vga_to_curses[0x9c] = ACS_STERLING;
     vga_to_curses[0xb0] = ACS_BOARD;
     vga_to_curses[0xb1] = ACS_CKBOARD;

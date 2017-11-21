@@ -244,10 +244,10 @@ class QAPISchemaGenTypeVisitor(QAPISchemaVisitor):
 do_builtins = False
 
 (input_file, output_dir, do_c, do_h, prefix, opts) = \
-    parse_command_line("b", ["builtins"])
+    parse_command_line('b', ['builtins'])
 
 for o, a in opts:
-    if o in ("-b", "--builtins"):
+    if o in ('-b', '--builtins'):
         do_builtins = True
 
 c_comment = '''
@@ -291,6 +291,10 @@ fdef.write(mcgen('''
 #include "%(prefix)sqapi-visit.h"
 ''',
                  prefix=prefix))
+
+fdecl.write(mcgen('''
+#include "qapi/util.h"
+'''))
 
 schema = QAPISchema(input_file)
 gen = QAPISchemaGenTypeVisitor()

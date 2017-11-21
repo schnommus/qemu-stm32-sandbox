@@ -40,7 +40,7 @@
 #include "hw/sysbus.h"
 #include "hw/block/flash.h"
 #include "sysemu/block-backend.h"
-#include "sysemu/char.h"
+#include "chardev/char.h"
 #include "sysemu/device_tree.h"
 #include "qemu/error-report.h"
 #include "bootparam.h"
@@ -100,7 +100,7 @@ static void lx60_fpga_write(void *opaque, hwaddr addr,
 
     case 0x10: /*board reset*/
         if (val == 0xdead) {
-            qemu_system_reset_request();
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         }
         break;
     }
@@ -147,7 +147,7 @@ static void lx60_net_init(MemoryRegion *address_space,
             sysbus_mmio_get_region(s, 1));
 
     ram = g_malloc(sizeof(*ram));
-    memory_region_init_ram(ram, OBJECT(s), "open_eth.ram", 16384,
+    memory_region_init_ram_nomigrate(ram, OBJECT(s), "open_eth.ram", 16384,
                            &error_fatal);
     vmstate_register_ram_global(ram);
     memory_region_add_subregion(address_space, buffers, ram);
@@ -220,24 +220,14 @@ static void lx_init(const LxBoardDesc *board, MachineState *machine)
     DriveInfo *dinfo;
     pflash_t *flash = NULL;
     QemuOpts *machine_opts = qemu_get_machine_opts();
-    const char *cpu_model = machine->cpu_model;
     const char *kernel_filename = qemu_opt_get(machine_opts, "kernel");
     const char *kernel_cmdline = qemu_opt_get(machine_opts, "append");
     const char *dtb_filename = qemu_opt_get(machine_opts, "dtb");
     const char *initrd_filename = qemu_opt_get(machine_opts, "initrd");
     int n;
 
-    if (!cpu_model) {
-        cpu_model = XTENSA_DEFAULT_CPU_MODEL;
-    }
-
     for (n = 0; n < smp_cpus; n++) {
-        cpu = cpu_xtensa_init(cpu_model);
-        if (cpu == NULL) {
-            error_report("unable to find CPU definition '%s'",
-                         cpu_model);
-            exit(EXIT_FAILURE);
-        }
+        cpu = XTENSA_CPU(cpu_create(machine->cpu_type));
         env = &cpu->env;
 
         env->sregs[PRID] = n;
@@ -251,7 +241,6 @@ static void lx_init(const LxBoardDesc *board, MachineState *machine)
     ram = g_malloc(sizeof(*ram));
     memory_region_init_ram(ram, NULL, "lx60.dram", machine->ram_size,
                            &error_fatal);
-    vmstate_register_ram_global(ram);
     memory_region_add_subregion(system_memory, 0, ram);
 
     system_io = g_malloc(sizeof(*system_io));
@@ -265,7 +254,7 @@ static void lx_init(const LxBoardDesc *board, MachineState *machine)
     }
 
     if (!serial_hds[0]) {
-        serial_hds[0] = qemu_chr_new("serial0", "null", NULL);
+        serial_hds[0] = qemu_chr_new("serial0", "null");
     }
 
     serial_mm_init(system_io, 0x0d050020, 2, xtensa_get_extint(env, 0),
@@ -294,7 +283,6 @@ static void lx_init(const LxBoardDesc *board, MachineState *machine)
         rom = g_malloc(sizeof(*rom));
         memory_region_init_ram(rom, NULL, "lx60.sram", board->sram_size,
                                &error_fatal);
-        vmstate_register_ram_global(rom);
         memory_region_add_subregion(system_memory, 0xfe000000, rom);
 
         if (kernel_cmdline) {
@@ -317,6 +305,7 @@ static void lx_init(const LxBoardDesc *board, MachineState *machine)
             cur_tagptr = put_tag(cur_tagptr, BP_TAG_COMMAND_LINE,
                                  strlen(kernel_cmdline) + 1, kernel_cmdline);
         }
+#ifdef CONFIG_FDT
         if (dtb_filename) {
             int fdt_size;
             void *fdt = load_device_tree(dtb_filename, &fdt_size);
@@ -332,6 +321,14 @@ static void lx_init(const LxBoardDesc *board, MachineState *machine)
                                  sizeof(dtb_addr), &dtb_addr);
             cur_lowmem = QEMU_ALIGN_UP(cur_lowmem + fdt_size, 4096);
         }
+#else
+        if (dtb_filename) {
+            error_report("could not load DTB '%s': "
+                         "FDT support is not configured in QEMU",
+                         dtb_filename);
+            exit(EXIT_FAILURE);
+        }
+#endif
         if (initrd_filename) {
             BpMemInfo initrd_location = { 0 };
             int initrd_size = load_ramdisk(initrd_filename, cur_lowmem,
@@ -452,6 +449,7 @@ static void xtensa_lx60_class_init(ObjectClass *oc, void *data)
     mc->desc = "lx60 EVB (" XTENSA_DEFAULT_CPU_MODEL ")";
     mc->init = xtensa_lx60_init;
     mc->max_cpus = 4;
+    mc->default_cpu_type = XTENSA_DEFAULT_CPU_TYPE;
 }
 
 static const TypeInfo xtensa_lx60_type = {
@@ -467,6 +465,7 @@ static void xtensa_lx200_class_init(ObjectClass *oc, void *data)
     mc->desc = "lx200 EVB (" XTENSA_DEFAULT_CPU_MODEL ")";
     mc->init = xtensa_lx200_init;
     mc->max_cpus = 4;
+    mc->default_cpu_type = XTENSA_DEFAULT_CPU_TYPE;
 }
 
 static const TypeInfo xtensa_lx200_type = {
@@ -482,6 +481,7 @@ static void xtensa_ml605_class_init(ObjectClass *oc, void *data)
     mc->desc = "ml605 EVB (" XTENSA_DEFAULT_CPU_MODEL ")";
     mc->init = xtensa_ml605_init;
     mc->max_cpus = 4;
+    mc->default_cpu_type = XTENSA_DEFAULT_CPU_TYPE;
 }
 
 static const TypeInfo xtensa_ml605_type = {
@@ -497,6 +497,7 @@ static void xtensa_kc705_class_init(ObjectClass *oc, void *data)
     mc->desc = "kc705 EVB (" XTENSA_DEFAULT_CPU_MODEL ")";
     mc->init = xtensa_kc705_init;
     mc->max_cpus = 4;
+    mc->default_cpu_type = XTENSA_DEFAULT_CPU_TYPE;
 }
 
 static const TypeInfo xtensa_kc705_type = {

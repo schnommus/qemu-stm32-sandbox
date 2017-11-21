@@ -54,7 +54,7 @@
 #include "qmp-commands.h"
 #include "x_keymap.h"
 #include "keymaps.h"
-#include "sysemu/char.h"
+#include "chardev/char.h"
 #include "qom/object.h"
 
 #define MAX_VCS 10
@@ -90,11 +90,14 @@
 #ifndef GDK_IS_X11_DISPLAY
 #define GDK_IS_X11_DISPLAY(dpy) (dpy == dpy)
 #endif
+#ifndef GDK_IS_WAYLAND_DISPLAY
+#define GDK_IS_WAYLAND_DISPLAY(dpy) (dpy == dpy)
+#endif
 #ifndef GDK_IS_WIN32_DISPLAY
 #define GDK_IS_WIN32_DISPLAY(dpy) (dpy == dpy)
 #endif
 
-#ifndef GDK_KEY_0
+#if !GTK_CHECK_VERSION(2, 22, 0)
 #define GDK_KEY_0 GDK_0
 #define GDK_KEY_1 GDK_1
 #define GDK_KEY_2 GDK_2
@@ -102,8 +105,10 @@
 #define GDK_KEY_g GDK_g
 #define GDK_KEY_q GDK_q
 #define GDK_KEY_plus GDK_plus
+#define GDK_KEY_equal GDK_equal
 #define GDK_KEY_minus GDK_minus
 #define GDK_KEY_Pause GDK_Pause
+#define GDK_KEY_Delete GDK_Delete
 #endif
 
 /* Some older mingw versions lack this constant or have
@@ -176,6 +181,15 @@ struct GtkDisplayState {
     bool has_evdev;
     bool ignore_keys;
 };
+
+typedef struct VCChardev {
+    Chardev parent;
+    VirtualConsole *console;
+    bool echo;
+} VCChardev;
+
+#define TYPE_CHARDEV_VC "chardev-vc"
+#define VC_CHARDEV(obj) OBJECT_CHECK(VCChardev, (obj), TYPE_CHARDEV_VC)
 
 static void gd_grab_pointer(VirtualConsole *vc, const char *reason);
 static void gd_ungrab_pointer(GtkDisplayState *s);
@@ -655,7 +669,7 @@ static const DisplayChangeListenerOps dcl_gl_area_ops = {
     .dpy_gl_ctx_destroy      = gd_gl_area_destroy_context,
     .dpy_gl_ctx_make_current = gd_gl_area_make_current,
     .dpy_gl_ctx_get_current  = gd_gl_area_get_current_context,
-    .dpy_gl_scanout          = gd_gl_area_scanout,
+    .dpy_gl_scanout_texture  = gd_gl_area_scanout_texture,
     .dpy_gl_update           = gd_gl_area_scanout_flush,
 };
 
@@ -674,7 +688,8 @@ static const DisplayChangeListenerOps dcl_egl_ops = {
     .dpy_gl_ctx_destroy      = qemu_egl_destroy_context,
     .dpy_gl_ctx_make_current = gd_egl_make_current,
     .dpy_gl_ctx_get_current  = qemu_egl_get_current_context,
-    .dpy_gl_scanout          = gd_egl_scanout,
+    .dpy_gl_scanout_disable  = gd_egl_scanout_disable,
+    .dpy_gl_scanout_texture  = gd_egl_scanout_texture,
     .dpy_gl_update           = gd_egl_scanout_flush,
 };
 
@@ -897,9 +912,9 @@ static gboolean gd_motion_event(GtkWidget *widget, GdkEventMotion *motion,
             return TRUE;
         }
         qemu_input_queue_abs(vc->gfx.dcl.con, INPUT_AXIS_X, x,
-                             surface_width(vc->gfx.ds));
+                             0, surface_width(vc->gfx.ds));
         qemu_input_queue_abs(vc->gfx.dcl.con, INPUT_AXIS_Y, y,
-                             surface_height(vc->gfx.ds));
+                             0, surface_height(vc->gfx.ds));
         qemu_input_event_sync();
     } else if (s->last_set && s->ptr_owner == vc) {
         qemu_input_queue_rel(vc->gfx.dcl.con, INPUT_AXIS_X, x - s->last_x);
@@ -912,8 +927,27 @@ static gboolean gd_motion_event(GtkWidget *widget, GdkEventMotion *motion,
 
     if (!qemu_input_is_absolute() && s->ptr_owner == vc) {
         GdkScreen *screen = gtk_widget_get_screen(vc->gfx.drawing_area);
+        int screen_width, screen_height;
+
         int x = (int)motion->x_root;
         int y = (int)motion->y_root;
+
+#if GTK_CHECK_VERSION(3, 22, 0)
+        {
+            GdkDisplay *dpy = gtk_widget_get_display(widget);
+            GdkWindow *win = gtk_widget_get_window(widget);
+            GdkMonitor *monitor = gdk_display_get_monitor_at_window(dpy, win);
+            GdkRectangle geometry;
+            gdk_monitor_get_geometry(monitor, &geometry);
+            screen_width = geometry.width;
+            screen_height = geometry.height;
+        }
+#else
+        {
+            screen_width = gdk_screen_get_width(screen);
+            screen_height = gdk_screen_get_height(screen);
+        }
+#endif
 
         /* In relative mode check to see if client pointer hit
          * one of the screen edges, and if so move it back by
@@ -928,10 +962,10 @@ static gboolean gd_motion_event(GtkWidget *widget, GdkEventMotion *motion,
         if (y == 0) {
             y += 200;
         }
-        if (x == (gdk_screen_get_width(screen) - 1)) {
+        if (x == (screen_width - 1)) {
             x -= 200;
         }
-        if (y == (gdk_screen_get_height(screen) - 1)) {
+        if (y == (screen_height - 1)) {
             y -= 200;
         }
 
@@ -975,6 +1009,10 @@ static gboolean gd_button_event(GtkWidget *widget, GdkEventButton *button,
         btn = INPUT_BUTTON_MIDDLE;
     } else if (button->button == 3) {
         btn = INPUT_BUTTON_RIGHT;
+    } else if (button->button == 8) {
+        btn = INPUT_BUTTON_SIDE;
+    } else if (button->button == 9) {
+        btn = INPUT_BUTTON_EXTRA;
     } else {
         return TRUE;
     }
@@ -995,6 +1033,19 @@ static gboolean gd_scroll_event(GtkWidget *widget, GdkEventScroll *scroll,
         btn = INPUT_BUTTON_WHEEL_UP;
     } else if (scroll->direction == GDK_SCROLL_DOWN) {
         btn = INPUT_BUTTON_WHEEL_DOWN;
+#if GTK_CHECK_VERSION(3, 4, 0)
+    } else if (scroll->direction == GDK_SCROLL_SMOOTH) {
+        gdouble delta_x, delta_y;
+        if (!gdk_event_get_scroll_deltas((GdkEvent *)scroll,
+                                         &delta_x, &delta_y)) {
+            return TRUE;
+        }
+        if (delta_y > 0) {
+            btn = INPUT_BUTTON_WHEEL_DOWN;
+        } else {
+            btn = INPUT_BUTTON_WHEEL_UP;
+        }
+#endif
     } else {
         return TRUE;
     }
@@ -1034,6 +1085,10 @@ static int gd_map_keycode(GtkDisplayState *s, GdkDisplay *dpy, int gdk_keycode)
             qemu_keycode = translate_xfree86_keycode(gdk_keycode - 97);
         }
 #endif
+#ifdef GDK_WINDOWING_WAYLAND
+    } else if (GDK_IS_WAYLAND_DISPLAY(dpy) && gdk_keycode < 158) {
+        qemu_keycode = translate_evdev_keycode(gdk_keycode - 97);
+#endif
     } else if (gdk_keycode == 208) { /* Hiragana_Katakana */
         qemu_keycode = 0x70;
     } else if (gdk_keycode == 211) { /* backslash */
@@ -1051,7 +1106,9 @@ static gboolean gd_text_key_down(GtkWidget *widget,
     VirtualConsole *vc = opaque;
     QemuConsole *con = vc->gfx.dcl.con;
 
-    if (key->length) {
+    if (key->keyval == GDK_KEY_Delete) {
+        kbd_put_qcode_console(con, Q_KEY_CODE_DELETE);
+    } else if (key->length) {
         kbd_put_string_console(con, key->string, key->length);
     } else {
         int num = gd_map_keycode(vc->s, gtk_widget_get_display(widget),
@@ -1285,6 +1342,12 @@ static void gd_menu_zoom_in(GtkMenuItem *item, void *opaque)
     vc->gfx.scale_y += VC_SCALE_STEP;
 
     gd_update_windowsize(vc);
+}
+
+static void gd_accel_zoom_in(void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    gtk_menu_item_activate(GTK_MENU_ITEM(s->zoom_in_item));
 }
 
 static void gd_menu_zoom_out(GtkMenuItem *item, void *opaque)
@@ -1639,7 +1702,12 @@ static void gd_menu_copy(GtkMenuItem *item, void *opaque)
     GtkDisplayState *s = opaque;
     VirtualConsole *vc = gd_vc_find_current(s);
 
+#if VTE_CHECK_VERSION(0, 50, 0)
+    vte_terminal_copy_clipboard_format(VTE_TERMINAL(vc->vte.terminal),
+                                       VTE_FORMAT_TEXT);
+#else
     vte_terminal_copy_clipboard(VTE_TERMINAL(vc->vte.terminal));
+#endif
 }
 
 static void gd_vc_adjustment_changed(GtkAdjustment *adjustment, void *opaque)
@@ -1654,47 +1722,63 @@ static void gd_vc_adjustment_changed(GtkAdjustment *adjustment, void *opaque)
     }
 }
 
-static int gd_vc_chr_write(CharDriverState *chr, const uint8_t *buf, int len)
+static int gd_vc_chr_write(Chardev *chr, const uint8_t *buf, int len)
 {
-    VirtualConsole *vc = chr->opaque;
+    VCChardev *vcd = VC_CHARDEV(chr);
+    VirtualConsole *vc = vcd->console;
 
     vte_terminal_feed(VTE_TERMINAL(vc->vte.terminal), (const char *)buf, len);
     return len;
 }
 
-static void gd_vc_chr_set_echo(CharDriverState *chr, bool echo)
+static void gd_vc_chr_set_echo(Chardev *chr, bool echo)
 {
-    VirtualConsole *vc = chr->opaque;
+    VCChardev *vcd = VC_CHARDEV(chr);
+    VirtualConsole *vc = vcd->console;
 
-    vc->vte.echo = echo;
+    if (vc) {
+        vc->vte.echo = echo;
+    } else {
+        vcd->echo = echo;
+    }
 }
 
 static int nb_vcs;
-static CharDriverState *vcs[MAX_VCS];
-
-static CharDriverState *gd_vc_handler(ChardevVC *vc, Error **errp)
+static Chardev *vcs[MAX_VCS];
+static void gd_vc_open(Chardev *chr,
+                       ChardevBackend *backend,
+                       bool *be_opened,
+                       Error **errp)
 {
-    ChardevCommon *common = qapi_ChardevVC_base(vc);
-    CharDriverState *chr;
-
-    chr = qemu_chr_alloc(common, errp);
-    if (!chr) {
-        return NULL;
+    if (nb_vcs == MAX_VCS) {
+        error_setg(errp, "Maximum number of consoles reached");
+        return;
     }
-
-    chr->chr_write = gd_vc_chr_write;
-    chr->chr_set_echo = gd_vc_chr_set_echo;
-
-    /* Temporary, until gd_vc_vte_init runs.  */
-    chr->opaque = g_new0(VirtualConsole, 1);
-
-    /* defer OPENED events until our vc is fully initialized */
-    chr->explicit_be_open = true;
 
     vcs[nb_vcs++] = chr;
 
-    return chr;
+    /* console/chardev init sometimes completes elsewhere in a 2nd
+     * stage, so defer OPENED events until they are fully initialized
+     */
+    *be_opened = false;
 }
+
+static void char_gd_vc_class_init(ObjectClass *oc, void *data)
+{
+    ChardevClass *cc = CHARDEV_CLASS(oc);
+
+    cc->parse = qemu_chr_parse_vc;
+    cc->open = gd_vc_open;
+    cc->chr_write = gd_vc_chr_write;
+    cc->chr_set_echo = gd_vc_chr_set_echo;
+}
+
+static const TypeInfo char_gd_vc_type_info = {
+    .name = TYPE_CHARDEV_VC,
+    .parent = TYPE_CHARDEV,
+    .instance_size = sizeof(VCChardev),
+    .class_init = char_gd_vc_class_init,
+};
 
 static gboolean gd_vc_in(VteTerminal *terminal, gchar *text, guint size,
                          gpointer user_data)
@@ -1724,21 +1808,19 @@ static gboolean gd_vc_in(VteTerminal *terminal, gchar *text, guint size,
 }
 
 static GSList *gd_vc_vte_init(GtkDisplayState *s, VirtualConsole *vc,
-                              CharDriverState *chr, int idx,
+                              Chardev *chr, int idx,
                               GSList *group, GtkWidget *view_menu)
 {
     char buffer[32];
     GtkWidget *box;
     GtkWidget *scrollbar;
     GtkAdjustment *vadjustment;
-    VirtualConsole *tmp_vc = chr->opaque;
+    VCChardev *vcd = VC_CHARDEV(chr);
 
     vc->s = s;
-    vc->vte.echo = tmp_vc->vte.echo;
-
+    vc->vte.echo = vcd->echo;
     vc->vte.chr = chr;
-    chr->opaque = vc;
-    g_free(tmp_vc);
+    vcd->console = vc;
 
     snprintf(buffer, sizeof(buffer), "vc%d", idx);
     vc->label = g_strdup_printf("%s", vc->vte.chr->label
@@ -1791,10 +1873,7 @@ static GSList *gd_vc_vte_init(GtkDisplayState *s, VirtualConsole *vc,
     gtk_notebook_append_page(GTK_NOTEBOOK(s->notebook), vc->tab_item,
                              gtk_label_new(vc->label));
 
-    qemu_chr_be_generic_open(vc->vte.chr);
-    if (vc->vte.chr->init) {
-        vc->vte.chr->init(vc->vte.chr);
-    }
+    qemu_chr_be_event(vc->vte.chr, CHR_EVENT_OPENED);
 
     return group;
 }
@@ -2037,6 +2116,8 @@ static GtkWidget *gd_create_menu_view(GtkDisplayState *s)
                                  "<QEMU>/View/Zoom In");
     gtk_accel_map_add_entry("<QEMU>/View/Zoom In", GDK_KEY_plus,
                             HOTKEY_MODIFIERS);
+    gtk_accel_group_connect(s->accel_group, GDK_KEY_equal, HOTKEY_MODIFIERS, 0,
+            g_cclosure_new_swap(G_CALLBACK(gd_accel_zoom_in), s, NULL));
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), s->zoom_in_item);
 
     s->zoom_out_item = gtk_menu_item_new_with_mnemonic(_("Zoom _Out"));
@@ -2125,11 +2206,12 @@ static void gd_set_keycode_type(GtkDisplayState *s)
     GdkDisplay *display = gtk_widget_get_display(s->window);
     if (GDK_IS_X11_DISPLAY(display)) {
         Display *x11_display = gdk_x11_display_get_xdisplay(display);
-        XkbDescPtr desc = XkbGetKeyboard(x11_display, XkbGBN_AllComponentsMask,
-                                         XkbUseCoreKbd);
+        XkbDescPtr desc = XkbGetMap(x11_display, XkbGBN_AllComponentsMask,
+                                    XkbUseCoreKbd);
         char *keycodes = NULL;
 
-        if (desc && desc->names) {
+        if (desc &&
+            (XkbGetNames(x11_display, XkbKeycodesNameMask, desc) == Success)) {
             keycodes = XGetAtomName(x11_display, desc->names->keycodes);
         }
         if (keycodes == NULL) {
@@ -2155,6 +2237,8 @@ static gboolean gtkinit;
 
 void gtk_display_init(DisplayState *ds, bool full_screen, bool grab_on_hover)
 {
+    VirtualConsole *vc;
+
     GtkDisplayState *s = g_malloc0(sizeof(*s));
     char *filename;
     GdkDisplay *window_display;
@@ -2175,8 +2259,12 @@ void gtk_display_init(DisplayState *ds, bool full_screen, bool grab_on_hover)
 
     s->free_scale = FALSE;
 
-    /* LC_MESSAGES only. See early_gtk_display_init() for details */
+    /* Mostly LC_MESSAGES only. See early_gtk_display_init() for details. For
+     * LC_CTYPE, we need to make sure that non-ASCII characters are considered
+     * printable, but without changing any of the character classes to make
+     * sure that we don't accidentally break implicit assumptions.  */
     setlocale(LC_MESSAGES, "");
+    setlocale(LC_CTYPE, "C.UTF-8");
     bindtextdomain("qemu", CONFIG_QEMU_LOCALEDIR);
     textdomain("qemu");
 
@@ -2233,9 +2321,11 @@ void gtk_display_init(DisplayState *ds, bool full_screen, bool grab_on_hover)
     }
 #endif
 
+    vc = gd_vc_find_current(s);
+    gtk_widget_set_sensitive(s->view_menu, vc != NULL);
 #ifdef CONFIG_VTE
     gtk_widget_set_sensitive(s->copy_item,
-                             gd_vc_find_current(s)->type == GD_VC_VTE);
+                             vc && vc->type == GD_VC_VTE);
 #endif
 
     if (full_screen) {
@@ -2293,6 +2383,6 @@ void early_gtk_display_init(int opengl)
     }
 
 #if defined(CONFIG_VTE)
-    register_vc_handler(gd_vc_handler);
+    type_register(&char_gd_vc_type_info);
 #endif
 }

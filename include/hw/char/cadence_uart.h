@@ -19,7 +19,7 @@
 #ifndef CADENCE_UART_H
 
 #include "hw/sysbus.h"
-#include "sysemu/char.h"
+#include "chardev/char-fe.h"
 #include "qemu/timer.h"
 
 #define CADENCE_UART_RX_FIFO_SIZE           16
@@ -44,14 +44,14 @@ typedef struct {
     uint32_t rx_count;
     uint32_t tx_count;
     uint64_t char_tx_time;
-    CharDriverState *chr;
+    CharBackend chr;
     qemu_irq irq;
     QEMUTimer *fifo_trigger_handle;
 } CadenceUARTState;
 
 static inline DeviceState *cadence_uart_create(hwaddr addr,
                                         qemu_irq irq,
-                                        CharDriverState *chr)
+                                        Chardev *chr)
 {
     DeviceState *dev;
     SysBusDevice *s;

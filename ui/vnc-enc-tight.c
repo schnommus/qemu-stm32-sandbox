@@ -44,7 +44,6 @@
 #endif
 
 #include "qemu/bswap.h"
-#include "qapi/qmp/qint.h"
 #include "vnc.h"
 #include "vnc-enc-tight.h"
 #include "vnc-palette.h"
@@ -707,10 +706,8 @@ check_solid_tile32(VncState *vs, int x, int y, int w, int h,
 static bool check_solid_tile(VncState *vs, int x, int y, int w, int h,
                              uint32_t* color, bool samecolor)
 {
-    switch (VNC_SERVER_FB_BYTES) {
-    case 4:
-        return check_solid_tile32(vs, x, y, w, h, color, samecolor);
-    }
+    QEMU_BUILD_BUG_ON(VNC_SERVER_FB_BYTES != 4);
+    return check_solid_tile32(vs, x, y, w, h, color, samecolor);
 }
 
 static void find_best_solid_area(VncState *vs, int x, int y, int w, int h,
@@ -982,7 +979,7 @@ static int send_mono_rect(VncState *vs, int x, int y,
     }
 #endif
 
-    bytes = ((w + 7) / 8) * h;
+    bytes = (DIV_ROUND_UP(w, 8)) * h;
 
     vnc_write_u8(vs, (stream | VNC_TIGHT_EXPLICIT_FILTER) << 4);
     vnc_write_u8(vs, VNC_TIGHT_FILTER_PALETTE);

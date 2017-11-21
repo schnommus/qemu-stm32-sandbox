@@ -26,7 +26,8 @@
 #include "hw/hw.h"
 #include "hw/sysbus.h"
 #include "hw/char/escc.h"
-#include "sysemu/char.h"
+#include "chardev/char-fe.h"
+#include "chardev/char-serial.h"
 #include "ui/console.h"
 #include "ui/input.h"
 #include "trace.h"
@@ -88,7 +89,7 @@ typedef struct ChannelState {
     uint32_t reg;
     uint8_t wregs[SERIAL_REGS], rregs[SERIAL_REGS];
     SERIOQueue queue;
-    CharDriverState *chr;
+    CharBackend chr;
     int e0_mode, led_mode, caps_lock_mode, num_lock_mode;
     int disabled;
     int clock;
@@ -416,7 +417,7 @@ static void escc_update_parameters(ChannelState *s)
     int speed, parity, data_bits, stop_bits;
     QEMUSerialSetParams ssp;
 
-    if (!s->chr || s->type != ser)
+    if (!qemu_chr_fe_backend_connected(&s->chr) || s->type != ser)
         return;
 
     if (s->wregs[W_TXCTRL1] & TXCTRL1_PAREN) {
@@ -466,7 +467,7 @@ static void escc_update_parameters(ChannelState *s)
     ssp.data_bits = data_bits;
     ssp.stop_bits = stop_bits;
     trace_escc_update_parameters(CHN_C(s), speed, parity, data_bits, stop_bits);
-    qemu_chr_fe_ioctl(s->chr, CHR_IOCTL_SERIAL_SET_PARAMS, &ssp);
+    qemu_chr_fe_ioctl(&s->chr, CHR_IOCTL_SERIAL_SET_PARAMS, &ssp);
 }
 
 static void escc_mem_write(void *opaque, hwaddr addr,
@@ -556,9 +557,11 @@ static void escc_mem_write(void *opaque, hwaddr addr,
         trace_escc_mem_writeb_data(CHN_C(s), val);
         s->tx = val;
         if (s->wregs[W_TXCTRL2] & TXCTRL2_TXEN) { // tx enabled
-            if (s->chr)
-                qemu_chr_fe_write(s->chr, &s->tx, 1);
-            else if (s->type == kbd && !s->disabled) {
+            if (qemu_chr_fe_backend_connected(&s->chr)) {
+                /* XXX this blocks entire thread. Rewrite to use
+                 * qemu_chr_fe_write and background I/O callbacks */
+                qemu_chr_fe_write_all(&s->chr, &s->tx, 1);
+            } else if (s->type == kbd && !s->disabled) {
                 handle_kbd_command(s, val);
             }
         }
@@ -597,8 +600,7 @@ static uint64_t escc_mem_read(void *opaque, hwaddr addr,
         else
             ret = s->rx;
         trace_escc_mem_readb_data(CHN_C(s), ret);
-        if (s->chr)
-            qemu_chr_accept_input(s->chr);
+        qemu_chr_fe_accept_input(&s->chr);
         return ret;
     default:
         break;
@@ -688,7 +690,7 @@ static const VMStateDescription vmstate_escc = {
 };
 
 MemoryRegion *escc_init(hwaddr base, qemu_irq irqA, qemu_irq irqB,
-              CharDriverState *chrA, CharDriverState *chrB,
+              Chardev *chrA, Chardev *chrB,
               int clock, int it_shift)
 {
     DeviceState *dev;
@@ -720,7 +722,6 @@ static const uint8_t qcode_to_keycode[Q_KEY_CODE__MAX] = {
     [Q_KEY_CODE_SHIFT_R]       = 110,
     [Q_KEY_CODE_ALT]           = 19,
     [Q_KEY_CODE_ALT_R]         = 13,
-    [Q_KEY_CODE_ALTGR]         = 13,
     [Q_KEY_CODE_CTRL]          = 76,
     [Q_KEY_CODE_CTRL_R]        = 76,
     [Q_KEY_CODE_ESC]           = 29,
@@ -847,7 +848,7 @@ static void sunkbd_handle_event(DeviceState *dev, QemuConsole *src,
     assert(evt->type == INPUT_EVENT_KIND_KEY);
     key = evt->u.key.data;
     qcode = qemu_input_key_value_to_qcode(key->key);
-    trace_escc_sunkbd_event_in(qcode, QKeyCode_lookup[qcode],
+    trace_escc_sunkbd_event_in(qcode, QKeyCode_str(qcode),
                                key->down);
 
     if (qcode == Q_KEY_CODE_CAPS_LOCK) {
@@ -1011,10 +1012,11 @@ static void escc_realize(DeviceState *dev, Error **errp)
                           ESCC_SIZE << s->it_shift);
 
     for (i = 0; i < 2; i++) {
-        if (s->chn[i].chr) {
+        if (qemu_chr_fe_backend_connected(&s->chn[i].chr)) {
             s->chn[i].clock = s->frequency / 2;
-            qemu_chr_add_handlers(s->chn[i].chr, serial_can_receive,
-                                  serial_receive1, serial_event, &s->chn[i]);
+            qemu_chr_fe_set_handlers(&s->chn[i].chr, serial_can_receive,
+                                     serial_receive1, serial_event, NULL,
+                                     &s->chn[i], NULL, true);
         }
     }
 

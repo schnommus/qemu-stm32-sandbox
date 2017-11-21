@@ -32,6 +32,8 @@
 #define INTEL_IOMMU_DEVICE(obj) \
      OBJECT_CHECK(IntelIOMMUState, (obj), TYPE_INTEL_IOMMU_DEVICE)
 
+#define TYPE_INTEL_IOMMU_MEMORY_REGION "intel-iommu-iommu-memory-region"
+
 /* DMAR Hardware Unit Definition address (IOMMU unit) */
 #define Q35_HOST_BRIDGE_IOMMU_ADDR  0xfed90000ULL
 
@@ -63,6 +65,7 @@ typedef union VTD_IR_TableEntry VTD_IR_TableEntry;
 typedef union VTD_IR_MSIAddress VTD_IR_MSIAddress;
 typedef struct VTDIrq VTDIrq;
 typedef struct VTD_MSIMessage VTD_MSIMessage;
+typedef struct IntelIOMMUNotifierNode IntelIOMMUNotifierNode;
 
 /* Context-Entry */
 struct VTDContextEntry {
@@ -82,7 +85,9 @@ struct VTDAddressSpace {
     PCIBus *bus;
     uint8_t devfn;
     AddressSpace as;
-    MemoryRegion iommu;
+    IOMMUMemoryRegion iommu;
+    MemoryRegion root;
+    MemoryRegion sys_alias;
     MemoryRegion iommu_ir;      /* Interrupt region: 0xfeeXXXXX */
     IntelIOMMUState *iommu_state;
     VTDContextCacheEntry context_cache_entry;
@@ -98,8 +103,7 @@ struct VTDIOTLBEntry {
     uint16_t domain_id;
     uint64_t slpte;
     uint64_t mask;
-    bool read_flags;
-    bool write_flags;
+    uint8_t access_flags;
 };
 
 /* VT-d Source-ID Qualifier types */
@@ -123,7 +127,6 @@ enum {
 union VTD_IR_TableEntry {
     struct {
 #ifdef HOST_WORDS_BIGENDIAN
-        uint32_t dest_id:32;         /* Destination ID */
         uint32_t __reserved_1:8;     /* Reserved 1 */
         uint32_t vector:8;           /* Interrupt Vector */
         uint32_t irte_mode:1;        /* IRTE Mode */
@@ -147,9 +150,9 @@ union VTD_IR_TableEntry {
         uint32_t irte_mode:1;        /* IRTE Mode */
         uint32_t vector:8;           /* Interrupt Vector */
         uint32_t __reserved_1:8;     /* Reserved 1 */
-        uint32_t dest_id:32;         /* Destination ID */
 #endif
-        uint16_t source_id:16;       /* Source-ID */
+        uint32_t dest_id;            /* Destination ID */
+        uint16_t source_id;          /* Source-ID */
 #ifdef HOST_WORDS_BIGENDIAN
         uint64_t __reserved_2:44;    /* Reserved 2 */
         uint64_t sid_vtype:2;        /* Source-ID Validation Type */
@@ -220,7 +223,7 @@ struct VTD_MSIMessage {
             uint32_t dest:8;
             uint32_t __addr_head:12; /* 0xfee */
 #endif
-            uint32_t __addr_hi:32;
+            uint32_t __addr_hi;
         } QEMU_PACKED;
         uint64_t msi_addr;
     };
@@ -239,7 +242,7 @@ struct VTD_MSIMessage {
             uint16_t level:1;
             uint16_t trigger_mode:1;
 #endif
-            uint16_t __resved1:16;
+            uint16_t __resved1;
         } QEMU_PACKED;
         uint32_t msi_data;
     };
@@ -247,6 +250,11 @@ struct VTD_MSIMessage {
 
 /* When IR is enabled, all MSI/MSI-X data bits should be zero */
 #define VTD_IR_MSI_DATA          (0)
+
+struct IntelIOMMUNotifierNode {
+    VTDAddressSpace *vtd_as;
+    QLIST_ENTRY(IntelIOMMUNotifierNode) next;
+};
 
 /* The iommu (DMAR) device state struct */
 struct IntelIOMMUState {
@@ -257,6 +265,8 @@ struct IntelIOMMUState {
     uint8_t w1cmask[DMAR_REG_SIZE]; /* RW1C(Write 1 to Clear) bytes */
     uint8_t womask[DMAR_REG_SIZE];  /* WO (write only - read returns 0) */
     uint32_t version;
+
+    bool caching_mode;          /* RO - is cap CM enabled? */
 
     dma_addr_t root;                /* Current root table pointer */
     bool root_extended;             /* Type of root table (extended or not) */
@@ -280,15 +290,18 @@ struct IntelIOMMUState {
     uint32_t context_cache_gen;     /* Should be in [1,MAX] */
     GHashTable *iotlb;              /* IOTLB */
 
-    MemoryRegionIOMMUOps iommu_ops;
     GHashTable *vtd_as_by_busptr;   /* VTDBus objects indexed by PCIBus* reference */
     VTDBus *vtd_as_by_bus_num[VTD_PCI_BUS_MAX]; /* VTDBus objects indexed by bus number */
+    /* list of registered notifiers */
+    QLIST_HEAD(, IntelIOMMUNotifierNode) notifiers_list;
 
     /* interrupt remapping */
     bool intr_enabled;              /* Whether guest enabled IR */
     dma_addr_t intr_root;           /* Interrupt remapping table pointer */
     uint32_t intr_size;             /* Number of IR table entries */
     bool intr_eime;                 /* Extended interrupt mode enabled */
+    OnOffAuto intr_eim;             /* Toggle for EIM cabability */
+    bool buggy_eim;                 /* Force buggy EIM unless eim=off */
 };
 
 /* Find the VTD Address space associated with the given bus pointer,

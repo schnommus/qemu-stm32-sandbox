@@ -20,6 +20,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "standard-headers/linux/virtio_mmio.h"
 #include "hw/sysbus.h"
 #include "hw/virtio/virtio.h"
 #include "qemu/host-utils.h"
@@ -52,28 +53,6 @@ do { printf("virtio_mmio: " fmt , ## __VA_ARGS__); } while (0)
 #define VIRTIO_MMIO(obj) \
         OBJECT_CHECK(VirtIOMMIOProxy, (obj), TYPE_VIRTIO_MMIO)
 
-/* Memory mapped register offsets */
-#define VIRTIO_MMIO_MAGIC 0x0
-#define VIRTIO_MMIO_VERSION 0x4
-#define VIRTIO_MMIO_DEVICEID 0x8
-#define VIRTIO_MMIO_VENDORID 0xc
-#define VIRTIO_MMIO_HOSTFEATURES 0x10
-#define VIRTIO_MMIO_HOSTFEATURESSEL 0x14
-#define VIRTIO_MMIO_GUESTFEATURES 0x20
-#define VIRTIO_MMIO_GUESTFEATURESSEL 0x24
-#define VIRTIO_MMIO_GUESTPAGESIZE 0x28
-#define VIRTIO_MMIO_QUEUESEL 0x30
-#define VIRTIO_MMIO_QUEUENUMMAX 0x34
-#define VIRTIO_MMIO_QUEUENUM 0x38
-#define VIRTIO_MMIO_QUEUEALIGN 0x3c
-#define VIRTIO_MMIO_QUEUEPFN 0x40
-#define VIRTIO_MMIO_QUEUENOTIFY 0x50
-#define VIRTIO_MMIO_INTERRUPTSTATUS 0x60
-#define VIRTIO_MMIO_INTERRUPTACK 0x64
-#define VIRTIO_MMIO_STATUS 0x70
-/* Device specific config space starts here */
-#define VIRTIO_MMIO_CONFIG 0x100
-
 #define VIRT_MAGIC 0x74726976 /* 'virt' */
 #define VIRT_VERSION 1
 #define VIRT_VENDOR 0x554D4551 /* 'QEMU' */
@@ -89,38 +68,12 @@ typedef struct {
     uint32_t guest_page_shift;
     /* virtio-bus */
     VirtioBusState bus;
-    bool ioeventfd_disabled;
-    bool ioeventfd_started;
     bool format_transport_address;
 } VirtIOMMIOProxy;
 
-static bool virtio_mmio_ioeventfd_started(DeviceState *d)
+static bool virtio_mmio_ioeventfd_enabled(DeviceState *d)
 {
-    VirtIOMMIOProxy *proxy = VIRTIO_MMIO(d);
-
-    return proxy->ioeventfd_started;
-}
-
-static void virtio_mmio_ioeventfd_set_started(DeviceState *d, bool started,
-                                              bool err)
-{
-    VirtIOMMIOProxy *proxy = VIRTIO_MMIO(d);
-
-    proxy->ioeventfd_started = started;
-}
-
-static bool virtio_mmio_ioeventfd_disabled(DeviceState *d)
-{
-    VirtIOMMIOProxy *proxy = VIRTIO_MMIO(d);
-
-    return !kvm_eventfds_enabled() || proxy->ioeventfd_disabled;
-}
-
-static void virtio_mmio_ioeventfd_set_disabled(DeviceState *d, bool disabled)
-{
-    VirtIOMMIOProxy *proxy = VIRTIO_MMIO(d);
-
-    proxy->ioeventfd_disabled = disabled;
+    return kvm_eventfds_enabled();
 }
 
 static int virtio_mmio_ioeventfd_assign(DeviceState *d,
@@ -130,10 +83,10 @@ static int virtio_mmio_ioeventfd_assign(DeviceState *d,
     VirtIOMMIOProxy *proxy = VIRTIO_MMIO(d);
 
     if (assign) {
-        memory_region_add_eventfd(&proxy->iomem, VIRTIO_MMIO_QUEUENOTIFY, 4,
+        memory_region_add_eventfd(&proxy->iomem, VIRTIO_MMIO_QUEUE_NOTIFY, 4,
                                   true, n, notifier);
     } else {
-        memory_region_del_eventfd(&proxy->iomem, VIRTIO_MMIO_QUEUENOTIFY, 4,
+        memory_region_del_eventfd(&proxy->iomem, VIRTIO_MMIO_QUEUE_NOTIFY, 4,
                                   true, n, notifier);
     }
     return 0;
@@ -166,11 +119,11 @@ static uint64_t virtio_mmio_read(void *opaque, hwaddr offset, unsigned size)
          * device ID of zero means no backend will claim it.
          */
         switch (offset) {
-        case VIRTIO_MMIO_MAGIC:
+        case VIRTIO_MMIO_MAGIC_VALUE:
             return VIRT_MAGIC;
         case VIRTIO_MMIO_VERSION:
             return VIRT_VERSION;
-        case VIRTIO_MMIO_VENDORID:
+        case VIRTIO_MMIO_VENDOR_ID:
             return VIRT_VENDOR;
         default:
             return 0;
@@ -195,40 +148,40 @@ static uint64_t virtio_mmio_read(void *opaque, hwaddr offset, unsigned size)
         return 0;
     }
     switch (offset) {
-    case VIRTIO_MMIO_MAGIC:
+    case VIRTIO_MMIO_MAGIC_VALUE:
         return VIRT_MAGIC;
     case VIRTIO_MMIO_VERSION:
         return VIRT_VERSION;
-    case VIRTIO_MMIO_DEVICEID:
+    case VIRTIO_MMIO_DEVICE_ID:
         return vdev->device_id;
-    case VIRTIO_MMIO_VENDORID:
+    case VIRTIO_MMIO_VENDOR_ID:
         return VIRT_VENDOR;
-    case VIRTIO_MMIO_HOSTFEATURES:
+    case VIRTIO_MMIO_DEVICE_FEATURES:
         if (proxy->host_features_sel) {
             return 0;
         }
         return vdev->host_features;
-    case VIRTIO_MMIO_QUEUENUMMAX:
+    case VIRTIO_MMIO_QUEUE_NUM_MAX:
         if (!virtio_queue_get_num(vdev, vdev->queue_sel)) {
             return 0;
         }
         return VIRTQUEUE_MAX_SIZE;
-    case VIRTIO_MMIO_QUEUEPFN:
+    case VIRTIO_MMIO_QUEUE_PFN:
         return virtio_queue_get_addr(vdev, vdev->queue_sel)
             >> proxy->guest_page_shift;
-    case VIRTIO_MMIO_INTERRUPTSTATUS:
-        return vdev->isr;
+    case VIRTIO_MMIO_INTERRUPT_STATUS:
+        return atomic_read(&vdev->isr);
     case VIRTIO_MMIO_STATUS:
         return vdev->status;
-    case VIRTIO_MMIO_HOSTFEATURESSEL:
-    case VIRTIO_MMIO_GUESTFEATURES:
-    case VIRTIO_MMIO_GUESTFEATURESSEL:
-    case VIRTIO_MMIO_GUESTPAGESIZE:
-    case VIRTIO_MMIO_QUEUESEL:
-    case VIRTIO_MMIO_QUEUENUM:
-    case VIRTIO_MMIO_QUEUEALIGN:
-    case VIRTIO_MMIO_QUEUENOTIFY:
-    case VIRTIO_MMIO_INTERRUPTACK:
+    case VIRTIO_MMIO_DEVICE_FEATURES_SEL:
+    case VIRTIO_MMIO_DRIVER_FEATURES:
+    case VIRTIO_MMIO_DRIVER_FEATURES_SEL:
+    case VIRTIO_MMIO_GUEST_PAGE_SIZE:
+    case VIRTIO_MMIO_QUEUE_SEL:
+    case VIRTIO_MMIO_QUEUE_NUM:
+    case VIRTIO_MMIO_QUEUE_ALIGN:
+    case VIRTIO_MMIO_QUEUE_NOTIFY:
+    case VIRTIO_MMIO_INTERRUPT_ACK:
         DPRINTF("read of write-only register\n");
         return 0;
     default:
@@ -277,18 +230,18 @@ static void virtio_mmio_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
     switch (offset) {
-    case VIRTIO_MMIO_HOSTFEATURESSEL:
+    case VIRTIO_MMIO_DEVICE_FEATURES_SEL:
         proxy->host_features_sel = value;
         break;
-    case VIRTIO_MMIO_GUESTFEATURES:
+    case VIRTIO_MMIO_DRIVER_FEATURES:
         if (!proxy->guest_features_sel) {
             virtio_set_features(vdev, value);
         }
         break;
-    case VIRTIO_MMIO_GUESTFEATURESSEL:
+    case VIRTIO_MMIO_DRIVER_FEATURES_SEL:
         proxy->guest_features_sel = value;
         break;
-    case VIRTIO_MMIO_GUESTPAGESIZE:
+    case VIRTIO_MMIO_GUEST_PAGE_SIZE:
         proxy->guest_page_shift = ctz32(value);
         if (proxy->guest_page_shift > 31) {
             proxy->guest_page_shift = 0;
@@ -296,22 +249,22 @@ static void virtio_mmio_write(void *opaque, hwaddr offset, uint64_t value,
         DPRINTF("guest page size %" PRIx64 " shift %d\n", value,
                 proxy->guest_page_shift);
         break;
-    case VIRTIO_MMIO_QUEUESEL:
+    case VIRTIO_MMIO_QUEUE_SEL:
         if (value < VIRTIO_QUEUE_MAX) {
             vdev->queue_sel = value;
         }
         break;
-    case VIRTIO_MMIO_QUEUENUM:
+    case VIRTIO_MMIO_QUEUE_NUM:
         DPRINTF("mmio_queue write %d max %d\n", (int)value, VIRTQUEUE_MAX_SIZE);
         virtio_queue_set_num(vdev, vdev->queue_sel, value);
         /* Note: only call this function for legacy devices */
         virtio_queue_update_rings(vdev, vdev->queue_sel);
         break;
-    case VIRTIO_MMIO_QUEUEALIGN:
+    case VIRTIO_MMIO_QUEUE_ALIGN:
         /* Note: this is only valid for legacy devices */
         virtio_queue_set_align(vdev, vdev->queue_sel, value);
         break;
-    case VIRTIO_MMIO_QUEUEPFN:
+    case VIRTIO_MMIO_QUEUE_PFN:
         if (value == 0) {
             virtio_reset(vdev);
         } else {
@@ -319,13 +272,13 @@ static void virtio_mmio_write(void *opaque, hwaddr offset, uint64_t value,
                                   value << proxy->guest_page_shift);
         }
         break;
-    case VIRTIO_MMIO_QUEUENOTIFY:
+    case VIRTIO_MMIO_QUEUE_NOTIFY:
         if (value < VIRTIO_QUEUE_MAX) {
             virtio_queue_notify(vdev, value);
         }
         break;
-    case VIRTIO_MMIO_INTERRUPTACK:
-        vdev->isr &= ~value;
+    case VIRTIO_MMIO_INTERRUPT_ACK:
+        atomic_and(&vdev->isr, ~value);
         virtio_update_irq(vdev);
         break;
     case VIRTIO_MMIO_STATUS:
@@ -343,13 +296,13 @@ static void virtio_mmio_write(void *opaque, hwaddr offset, uint64_t value,
             virtio_reset(vdev);
         }
         break;
-    case VIRTIO_MMIO_MAGIC:
+    case VIRTIO_MMIO_MAGIC_VALUE:
     case VIRTIO_MMIO_VERSION:
-    case VIRTIO_MMIO_DEVICEID:
-    case VIRTIO_MMIO_VENDORID:
-    case VIRTIO_MMIO_HOSTFEATURES:
-    case VIRTIO_MMIO_QUEUENUMMAX:
-    case VIRTIO_MMIO_INTERRUPTSTATUS:
+    case VIRTIO_MMIO_DEVICE_ID:
+    case VIRTIO_MMIO_VENDOR_ID:
+    case VIRTIO_MMIO_DEVICE_FEATURES:
+    case VIRTIO_MMIO_QUEUE_NUM_MAX:
+    case VIRTIO_MMIO_INTERRUPT_STATUS:
         DPRINTF("write to readonly register\n");
         break;
 
@@ -373,7 +326,7 @@ static void virtio_mmio_update_irq(DeviceState *opaque, uint16_t vector)
     if (!vdev) {
         return;
     }
-    level = (vdev->isr != 0);
+    level = (atomic_read(&vdev->isr) != 0);
     DPRINTF("virtio_mmio setting IRQ %d\n", level);
     qemu_set_irq(proxy->irq, level);
 }
@@ -428,7 +381,7 @@ static int virtio_mmio_set_guest_notifier(DeviceState *d, int n, bool assign,
         event_notifier_cleanup(notifier);
     }
 
-    if (vdc->guest_notifier_mask) {
+    if (vdc->guest_notifier_mask && vdev->use_guest_notifier_mask) {
         vdc->guest_notifier_mask(vdev, n, !assign);
     }
 
@@ -557,10 +510,7 @@ static void virtio_mmio_bus_class_init(ObjectClass *klass, void *data)
     k->save_config = virtio_mmio_save_config;
     k->load_config = virtio_mmio_load_config;
     k->set_guest_notifiers = virtio_mmio_set_guest_notifiers;
-    k->ioeventfd_started = virtio_mmio_ioeventfd_started;
-    k->ioeventfd_set_started = virtio_mmio_ioeventfd_set_started;
-    k->ioeventfd_disabled = virtio_mmio_ioeventfd_disabled;
-    k->ioeventfd_set_disabled = virtio_mmio_ioeventfd_set_disabled;
+    k->ioeventfd_enabled = virtio_mmio_ioeventfd_enabled;
     k->ioeventfd_assign = virtio_mmio_ioeventfd_assign;
     k->has_variable_vring_alignment = true;
     bus_class->max_dev = 1;

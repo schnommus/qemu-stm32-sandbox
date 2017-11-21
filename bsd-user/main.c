@@ -25,7 +25,6 @@
 #include "qemu/config-file.h"
 #include "qemu/path.h"
 #include "qemu/help_option.h"
-/* For tb_lock */
 #include "cpu.h"
 #include "exec/exec-all.h"
 #include "tcg.h"
@@ -67,23 +66,6 @@ int cpu_get_pic_interrupt(CPUX86State *env)
 }
 #endif
 
-/* These are no-ops because we are not threadsafe.  */
-static inline void cpu_exec_start(CPUArchState *env)
-{
-}
-
-static inline void cpu_exec_end(CPUArchState *env)
-{
-}
-
-static inline void start_exclusive(void)
-{
-}
-
-static inline void end_exclusive(void)
-{
-}
-
 void fork_start(void)
 {
 }
@@ -93,14 +75,6 @@ void fork_end(int child)
     if (child) {
         gdbserver_fork(thread_cpu);
     }
-}
-
-void cpu_list_lock(void)
-{
-}
-
-void cpu_list_unlock(void)
-{
 }
 
 #ifdef TARGET_I386
@@ -172,7 +146,11 @@ void cpu_loop(CPUX86State *env)
     //target_siginfo_t info;
 
     for(;;) {
+        cpu_exec_start(cs);
         trapnr = cpu_exec(cs);
+        cpu_exec_end(cs);
+        process_queued_cpu_work(cs);
+
         switch(trapnr) {
         case 0x80:
             /* syscall from int $0x80 */
@@ -513,7 +491,10 @@ void cpu_loop(CPUSPARCState *env)
     //target_siginfo_t info;
 
     while (1) {
+        cpu_exec_start(cs);
         trapnr = cpu_exec(cs);
+        cpu_exec_end(cs);
+        process_queued_cpu_work(cs);
 
         switch (trapnr) {
 #ifndef TARGET_SPARC64
@@ -638,9 +619,10 @@ void cpu_loop(CPUSPARCState *env)
             break;
         case EXCP_DEBUG:
             {
-                int sig;
-
-                sig = gdb_handlesig(cs, TARGET_SIGTRAP);
+#if 0
+                int sig =
+#endif
+                gdb_handlesig(cs, TARGET_SIGTRAP);
 #if 0
                 if (sig)
                   {
@@ -669,7 +651,7 @@ void cpu_loop(CPUSPARCState *env)
 static void usage(void)
 {
     printf("qemu-" TARGET_NAME " version " QEMU_VERSION QEMU_PKGVERSION
-           ", " QEMU_COPYRIGHT "\n"
+           "\n" QEMU_COPYRIGHT "\n"
            "usage: qemu-" TARGET_NAME " [options] program [arguments...]\n"
            "BSD CPU emulator (compiled for %s emulation)\n"
            "\n"
@@ -704,6 +686,8 @@ static void usage(void)
            "    -E var1=val2 -E var2=val2 -U LD_PRELOAD -U LD_DEBUG\n"
            "Note that if you provide several changes to single variable\n"
            "last change will stay in effect.\n"
+           "\n"
+           QEMU_HELP_BOTTOM "\n"
            ,
            TARGET_NAME,
            interp_prefix,
@@ -712,6 +696,16 @@ static void usage(void)
 }
 
 THREAD CPUState *thread_cpu;
+
+bool qemu_cpu_is_self(CPUState *cpu)
+{
+    return thread_cpu == cpu;
+}
+
+void qemu_cpu_kick(CPUState *cpu)
+{
+    cpu_exit(cpu);
+}
 
 /* Assumes contents are already zeroed.  */
 void init_task_state(TaskState *ts)
@@ -748,12 +742,11 @@ int main(int argc, char **argv)
     if (argc <= 1)
         usage();
 
+    module_call_init(MODULE_INIT_TRACE);
+    qemu_init_cpu_list();
     module_call_init(MODULE_INIT_QOM);
 
-    if ((envlist = envlist_create()) == NULL) {
-        (void) fprintf(stderr, "Unable to allocate envlist\n");
-        exit(1);
-    }
+    envlist = envlist_create();
 
     /* add current environment into the list */
     for (wrk = environ; *wrk != NULL; wrk++) {
@@ -791,10 +784,7 @@ int main(int argc, char **argv)
                 usage();
         } else if (!strcmp(r, "ignore-environment")) {
             envlist_free(envlist);
-            if ((envlist = envlist_create()) == NULL) {
-                (void) fprintf(stderr, "Unable to allocate envlist\n");
-                exit(1);
-            }
+            envlist = envlist_create();
         } else if (!strcmp(r, "U")) {
             r = argv[optind++];
             if (envlist_unsetenv(envlist, r) != 0)
@@ -912,10 +902,6 @@ int main(int argc, char **argv)
     /* NOTE: we need to init the CPU at this stage to get
        qemu_host_page_size */
     cpu = cpu_init(cpu_model);
-    if (!cpu) {
-        fprintf(stderr, "Unable to find CPU definition\n");
-        exit(1);
-    }
     env = cpu->env_ptr;
 #if defined(TARGET_SPARC) || defined(TARGET_PPC)
     cpu_reset(cpu);
@@ -962,10 +948,10 @@ int main(int argc, char **argv)
     }
 
     for (wrk = target_environ; *wrk; wrk++) {
-        free(*wrk);
+        g_free(*wrk);
     }
 
-    free(target_environ);
+    g_free(target_environ);
 
     if (qemu_loglevel_mask(CPU_LOG_PAGE)) {
         qemu_log("guest_base  0x%lx\n", guest_base);
@@ -991,7 +977,8 @@ int main(int argc, char **argv)
     /* Now that we've loaded the binary, GUEST_BASE is fixed.  Delay
        generating the prologue until now so that the prologue can take
        the real value of GUEST_BASE into account.  */
-    tcg_prologue_init(&tcg_ctx);
+    tcg_prologue_init(tcg_ctx);
+    tcg_region_init();
 
     /* build Task State */
     memset(ts, 0, sizeof(TaskState));
@@ -1133,7 +1120,6 @@ int main(int argc, char **argv)
         gdbserver_start (gdbstub_port);
         gdb_handlesig(cpu, 0);
     }
-    trace_init_vcpu_events();
     cpu_loop(env);
     /* never exits */
     return 0;

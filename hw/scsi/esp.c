@@ -406,11 +406,9 @@ uint64_t esp_reg_read(ESPState *s, uint32_t saddr)
             /* Data out.  */
             qemu_log_mask(LOG_UNIMP, "esp: PIO data read not implemented\n");
             s->rregs[ESP_FIFO] = 0;
-            esp_raise_irq(s);
         } else if (s->ti_rptr < s->ti_wptr) {
             s->ti_size--;
             s->rregs[ESP_FIFO] = s->ti_buf[s->ti_rptr++];
-            esp_raise_irq(s);
         }
         if (s->ti_rptr == s->ti_wptr) {
             s->ti_rptr = 0;
@@ -594,19 +592,6 @@ const VMStateDescription vmstate_esp = {
     }
 };
 
-#define TYPE_ESP "esp"
-#define ESP(obj) OBJECT_CHECK(SysBusESPState, (obj), TYPE_ESP)
-
-typedef struct {
-    /*< private >*/
-    SysBusDevice parent_obj;
-    /*< public >*/
-
-    MemoryRegion iomem;
-    uint32_t it_shift;
-    ESPState esp;
-} SysBusESPState;
-
 static void sysbus_esp_mem_write(void *opaque, hwaddr addr,
                                  uint64_t val, unsigned int size)
 {
@@ -646,7 +631,7 @@ void esp_init(hwaddr espaddr, int it_shift,
     ESPState *esp;
 
     dev = qdev_create(NULL, TYPE_ESP);
-    sysbus = ESP(dev);
+    sysbus = ESP_STATE(dev);
     esp = &sysbus->esp;
     esp->dma_memory_read = dma_memory_read;
     esp->dma_memory_write = dma_memory_write;
@@ -674,7 +659,7 @@ static const struct SCSIBusInfo esp_scsi_info = {
 
 static void sysbus_esp_gpio_demux(void *opaque, int irq, int level)
 {
-    SysBusESPState *sysbus = ESP(opaque);
+    SysBusESPState *sysbus = ESP_STATE(opaque);
     ESPState *s = &sysbus->esp;
 
     switch (irq) {
@@ -690,9 +675,8 @@ static void sysbus_esp_gpio_demux(void *opaque, int irq, int level)
 static void sysbus_esp_realize(DeviceState *dev, Error **errp)
 {
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
-    SysBusESPState *sysbus = ESP(dev);
+    SysBusESPState *sysbus = ESP_STATE(dev);
     ESPState *s = &sysbus->esp;
-    Error *err = NULL;
 
     sysbus_init_irq(sbd, &s->irq);
     assert(sysbus->it_shift != -1);
@@ -705,16 +689,11 @@ static void sysbus_esp_realize(DeviceState *dev, Error **errp)
     qdev_init_gpio_in(dev, sysbus_esp_gpio_demux, 2);
 
     scsi_bus_new(&s->bus, sizeof(s->bus), dev, &esp_scsi_info, NULL);
-    scsi_bus_legacy_handle_cmdline(&s->bus, &err);
-    if (err != NULL) {
-        error_propagate(errp, err);
-        return;
-    }
 }
 
 static void sysbus_esp_hard_reset(DeviceState *dev)
 {
-    SysBusESPState *sysbus = ESP(dev);
+    SysBusESPState *sysbus = ESP_STATE(dev);
     esp_hard_reset(&sysbus->esp);
 }
 

@@ -28,10 +28,10 @@
 #include "qemu/bswap.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
-#include <zlib.h>
-#ifdef CONFIG_BZIP2
-#include <bzlib.h>
-#endif
+#include "dmg.h"
+
+int (*dmg_uncompress_bz2)(char *next_in, unsigned int avail_in,
+                          char *next_out, unsigned int avail_out);
 
 enum {
     /* Limit chunk sizes to prevent unreasonable amounts of memory being used
@@ -40,31 +40,6 @@ enum {
     DMG_LENGTHS_MAX = 64 * 1024 * 1024, /* 64 MB */
     DMG_SECTORCOUNTS_MAX = DMG_LENGTHS_MAX / 512,
 };
-
-typedef struct BDRVDMGState {
-    CoMutex lock;
-    /* each chunk contains a certain number of sectors,
-     * offsets[i] is the offset in the .dmg file,
-     * lengths[i] is the length of the compressed chunk,
-     * sectors[i] is the sector beginning at offsets[i],
-     * sectorcounts[i] is the number of sectors in that chunk,
-     * the sectors array is ordered
-     * 0<=i<n_chunks */
-
-    uint32_t n_chunks;
-    uint32_t* types;
-    uint64_t* offsets;
-    uint64_t* lengths;
-    uint64_t* sectors;
-    uint64_t* sectorcounts;
-    uint32_t current_chunk;
-    uint8_t *compressed_chunk;
-    uint8_t *uncompressed_chunk;
-    z_stream zstream;
-#ifdef CONFIG_BZIP2
-    bz_stream bzstream;
-#endif
-} BDRVDMGState;
 
 static int dmg_probe(const uint8_t *buf, int buf_size, const char *filename)
 {
@@ -136,7 +111,7 @@ static void update_max_chunk_size(BDRVDMGState *s, uint32_t chunk,
         uncompressed_sectors = s->sectorcounts[chunk];
         break;
     case 1: /* copy */
-        uncompressed_sectors = (s->lengths[chunk] + 511) / 512;
+        uncompressed_sectors = DIV_ROUND_UP(s->lengths[chunk], 512);
         break;
     case 2: /* zero */
         /* as the all-zeroes block may be large, it is treated specially: the
@@ -210,10 +185,9 @@ static bool dmg_is_known_block_type(uint32_t entry_type)
     case 0x00000001:    /* uncompressed */
     case 0x00000002:    /* zeroes */
     case 0x80000005:    /* zlib */
-#ifdef CONFIG_BZIP2
-    case 0x80000006:    /* bzip2 */
-#endif
         return true;
+    case 0x80000006:    /* bzip2 */
+        return !!dmg_uncompress_bz2;
     default:
         return false;
     }
@@ -439,7 +413,24 @@ static int dmg_open(BlockDriverState *bs, QDict *options, int flags,
     int64_t offset;
     int ret;
 
-    bs->read_only = true;
+    bs->file = bdrv_open_child(NULL, options, "file", bs, &child_file,
+                               false, errp);
+    if (!bs->file) {
+        return -EINVAL;
+    }
+
+    if (!bdrv_is_read_only(bs)) {
+        error_report("Opening dmg images without an explicit read-only=on "
+                     "option is deprecated. Future versions will refuse to "
+                     "open the image instead of automatically marking the "
+                     "image read-only.");
+        ret = bdrv_set_read_only(bs, true, errp);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
+    block_module_load_one("dmg-bz2");
 
     s->n_chunks = 0;
     s->offsets = s->lengths = s->sectors = s->sectorcounts = NULL;
@@ -587,9 +578,6 @@ static inline int dmg_read_chunk(BlockDriverState *bs, uint64_t sector_num)
     if (!is_sector_in_chunk(s, s->current_chunk, sector_num)) {
         int ret;
         uint32_t chunk = search_chunk(s, sector_num);
-#ifdef CONFIG_BZIP2
-        uint64_t total_out;
-#endif
 
         if (chunk >= s->n_chunks) {
             return -1;
@@ -620,8 +608,10 @@ static inline int dmg_read_chunk(BlockDriverState *bs, uint64_t sector_num)
                 return -1;
             }
             break; }
-#ifdef CONFIG_BZIP2
         case 0x80000006: /* bzip2 compressed */
+            if (!dmg_uncompress_bz2) {
+                break;
+            }
             /* we need to buffer, because only the chunk as whole can be
              * inflated. */
             ret = bdrv_pread(bs->file, s->offsets[chunk],
@@ -630,24 +620,15 @@ static inline int dmg_read_chunk(BlockDriverState *bs, uint64_t sector_num)
                 return -1;
             }
 
-            ret = BZ2_bzDecompressInit(&s->bzstream, 0, 0);
-            if (ret != BZ_OK) {
-                return -1;
-            }
-            s->bzstream.next_in = (char *)s->compressed_chunk;
-            s->bzstream.avail_in = (unsigned int) s->lengths[chunk];
-            s->bzstream.next_out = (char *)s->uncompressed_chunk;
-            s->bzstream.avail_out = (unsigned int) 512 * s->sectorcounts[chunk];
-            ret = BZ2_bzDecompress(&s->bzstream);
-            total_out = ((uint64_t)s->bzstream.total_out_hi32 << 32) +
-                        s->bzstream.total_out_lo32;
-            BZ2_bzDecompressEnd(&s->bzstream);
-            if (ret != BZ_STREAM_END ||
-                total_out != 512 * s->sectorcounts[chunk]) {
-                return -1;
+            ret = dmg_uncompress_bz2((char *)s->compressed_chunk,
+                                     (unsigned int) s->lengths[chunk],
+                                     (char *)s->uncompressed_chunk,
+                                     (unsigned int)
+                                         (512 * s->sectorcounts[chunk]));
+            if (ret < 0) {
+                return ret;
             }
             break;
-#endif /* CONFIG_BZIP2 */
         case 1: /* copy */
             ret = bdrv_pread(bs->file, s->offsets[chunk],
                              s->uncompressed_chunk, s->lengths[chunk]);
@@ -726,6 +707,7 @@ static BlockDriver bdrv_dmg = {
     .bdrv_probe     = dmg_probe,
     .bdrv_open      = dmg_open,
     .bdrv_refresh_limits = dmg_refresh_limits,
+    .bdrv_child_perm     = bdrv_format_default_perms,
     .bdrv_co_preadv = dmg_co_preadv,
     .bdrv_close     = dmg_close,
 };

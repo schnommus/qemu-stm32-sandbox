@@ -16,6 +16,7 @@
 #include "qapi/qmp/qerror.h"
 #include "qemu/base64.h"
 #include "qemu/cutils.h"
+#include "qemu/atomic.h"
 
 /* Maximum captured guest-exec out_data/err_data - 16MB */
 #define GUEST_EXEC_MAX_OUTPUT (16*1024*1024)
@@ -74,7 +75,7 @@ struct GuestAgentInfo *qmp_guest_info(Error **errp)
     GuestAgentInfo *info = g_new0(GuestAgentInfo, 1);
 
     info->version = g_strdup(QEMU_VERSION);
-    qmp_for_each_command(qmp_command_info, info);
+    qmp_for_each_command(&ga_commands, qmp_command_info, info);
     return info;
 }
 
@@ -82,7 +83,7 @@ struct GuestExecIOData {
     guchar *data;
     gsize size;
     gsize length;
-    gint closed;
+    bool closed;
     bool truncated;
     const char *name;
 };
@@ -93,7 +94,7 @@ struct GuestExecInfo {
     int64_t pid_numeric;
     gint status;
     bool has_output;
-    gint finished;
+    bool finished;
     GuestExecIOData in;
     GuestExecIOData out;
     GuestExecIOData err;
@@ -156,13 +157,13 @@ GuestExecStatus *qmp_guest_exec_status(int64_t pid, Error **err)
 
     ges = g_new0(GuestExecStatus, 1);
 
-    bool finished = g_atomic_int_get(&gei->finished);
+    bool finished = atomic_mb_read(&gei->finished);
 
     /* need to wait till output channels are closed
      * to be sure we captured all output at this point */
     if (gei->has_output) {
-        finished = finished && g_atomic_int_get(&gei->out.closed);
-        finished = finished && g_atomic_int_get(&gei->err.closed);
+        finished = finished && atomic_mb_read(&gei->out.closed);
+        finished = finished && atomic_mb_read(&gei->err.closed);
     }
 
     ges->exited = finished;
@@ -264,7 +265,7 @@ static void guest_exec_child_watch(GPid pid, gint status, gpointer data)
             (int32_t)gpid_to_int64(pid), (uint32_t)status);
 
     gei->status = status;
-    gei->finished = true;
+    atomic_mb_set(&gei->finished, true);
 
     g_spawn_close_pid(pid);
 }
@@ -320,7 +321,7 @@ static gboolean guest_exec_input_watch(GIOChannel *ch,
 done:
     g_io_channel_shutdown(ch, true, NULL);
     g_io_channel_unref(ch);
-    g_atomic_int_set(&p->closed, 1);
+    atomic_mb_set(&p->closed, true);
     g_free(p->data);
 
     return false;
@@ -374,7 +375,7 @@ static gboolean guest_exec_output_watch(GIOChannel *ch,
 close:
     g_io_channel_shutdown(ch, true, NULL);
     g_io_channel_unref(ch);
-    g_atomic_int_set(&p->closed, 1);
+    atomic_mb_set(&p->closed, true);
     return false;
 }
 
@@ -484,7 +485,7 @@ int ga_parse_whence(GuestFileWhence *whence, Error **errp)
 {
     /* Exploit the fact that we picked values to match QGA_SEEK_*. */
     if (whence->type == QTYPE_QSTRING) {
-        whence->type = QTYPE_QINT;
+        whence->type = QTYPE_QNUM;
         whence->u.value = whence->u.name;
     }
     switch (whence->u.value) {
@@ -497,4 +498,53 @@ int ga_parse_whence(GuestFileWhence *whence, Error **errp)
     }
     error_setg(errp, "invalid whence code %"PRId64, whence->u.value);
     return -1;
+}
+
+GuestHostName *qmp_guest_get_host_name(Error **err)
+{
+    GuestHostName *result = NULL;
+    gchar const *hostname = g_get_host_name();
+    if (hostname != NULL) {
+        result = g_new0(GuestHostName, 1);
+        result->host_name = g_strdup(hostname);
+    }
+    return result;
+}
+
+GuestTimezone *qmp_guest_get_timezone(Error **errp)
+{
+#if GLIB_CHECK_VERSION(2, 28, 0)
+    GuestTimezone *info = NULL;
+    GTimeZone *tz = NULL;
+    gint64 now = 0;
+    gint32 intv = 0;
+    gchar const *name = NULL;
+
+    info = g_new0(GuestTimezone, 1);
+    tz = g_time_zone_new_local();
+    if (tz == NULL) {
+        error_setg(errp, QERR_QGA_COMMAND_FAILED,
+                   "Couldn't retrieve local timezone");
+        goto error;
+    }
+
+    now = g_get_real_time() / G_USEC_PER_SEC;
+    intv = g_time_zone_find_interval(tz, G_TIME_TYPE_UNIVERSAL, now);
+    info->offset = g_time_zone_get_offset(tz, intv);
+    name = g_time_zone_get_abbreviation(tz, intv);
+    if (name != NULL) {
+        info->has_zone = true;
+        info->zone = g_strdup(name);
+    }
+    g_time_zone_unref(tz);
+
+    return info;
+
+error:
+    g_free(info);
+    return NULL;
+#else
+    error_setg(errp, QERR_UNSUPPORTED);
+    return NULL;
+#endif
 }

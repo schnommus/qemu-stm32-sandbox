@@ -18,8 +18,10 @@
 #include "qemu/cutils.h"
 #include "monitor/monitor.h"
 #include "sysemu/sysemu.h"
+#include "qemu/config-file.h"
+#include "qemu/uuid.h"
 #include "qmp-commands.h"
-#include "sysemu/char.h"
+#include "chardev/char.h"
 #include "ui/qemu-spice.h"
 #include "ui/vnc.h"
 #include "sysemu/kvm.h"
@@ -30,7 +32,7 @@
 #include "qom/qom-qobject.h"
 #include "qapi/qmp/qerror.h"
 #include "qapi/qmp/qobject.h"
-#include "qapi/qmp-input-visitor.h"
+#include "qapi/qobject-input-visitor.h"
 #include "hw/boards.h"
 #include "qom/object_interfaces.h"
 #include "hw/mem/pc-dimm.h"
@@ -51,21 +53,11 @@ NameInfo *qmp_query_name(Error **errp)
 VersionInfo *qmp_query_version(Error **errp)
 {
     VersionInfo *info = g_new0(VersionInfo, 1);
-    const char *version = QEMU_VERSION;
-    const char *tmp;
-    int err;
 
     info->qemu = g_new0(VersionTriple, 1);
-    err = qemu_strtoll(version, &tmp, 10, &info->qemu->major);
-    assert(err == 0);
-    tmp++;
-
-    err = qemu_strtoll(tmp, &tmp, 10, &info->qemu->minor);
-    assert(err == 0);
-    tmp++;
-
-    err = qemu_strtoll(tmp, &tmp, 10, &info->qemu->micro);
-    assert(err == 0);
+    info->qemu->major = QEMU_VERSION_MAJOR;
+    info->qemu->minor = QEMU_VERSION_MINOR;
+    info->qemu->micro = QEMU_VERSION_MICRO;
     info->package = g_strdup(QEMU_PKGVERSION);
 
     return info;
@@ -84,22 +76,15 @@ KvmInfo *qmp_query_kvm(Error **errp)
 UuidInfo *qmp_query_uuid(Error **errp)
 {
     UuidInfo *info = g_malloc0(sizeof(*info));
-    char uuid[64];
 
-    snprintf(uuid, sizeof(uuid), UUID_FMT, qemu_uuid[0], qemu_uuid[1],
-                   qemu_uuid[2], qemu_uuid[3], qemu_uuid[4], qemu_uuid[5],
-                   qemu_uuid[6], qemu_uuid[7], qemu_uuid[8], qemu_uuid[9],
-                   qemu_uuid[10], qemu_uuid[11], qemu_uuid[12], qemu_uuid[13],
-                   qemu_uuid[14], qemu_uuid[15]);
-
-    info->UUID = g_strdup(uuid);
+    info->UUID = qemu_uuid_unparse_strdup(&qemu_uuid);
     return info;
 }
 
 void qmp_quit(Error **errp)
 {
     no_shutdown = 0;
-    qemu_system_shutdown_request();
+    qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_QMP);
 }
 
 void qmp_stop(Error **errp)
@@ -120,7 +105,7 @@ void qmp_stop(Error **errp)
 
 void qmp_system_reset(Error **errp)
 {
-    qemu_system_reset_request();
+    qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_QMP);
 }
 
 void qmp_system_powerdown(Error **erp)
@@ -179,10 +164,8 @@ SpiceInfo *qmp_query_spice(Error **errp)
 
 void qmp_cont(Error **errp)
 {
-    Error *local_err = NULL;
     BlockBackend *blk;
-    BlockDriverState *bs;
-    BdrvNextIterator it;
+    Error *local_err = NULL;
 
     /* if there is a dump in background, we should wait until the dump
      * finished */
@@ -202,24 +185,16 @@ void qmp_cont(Error **errp)
         blk_iostatus_reset(blk);
     }
 
-    for (bs = bdrv_first(&it); bs; bs = bdrv_next(&it)) {
-        bdrv_add_key(bs, NULL, &local_err);
-        if (local_err) {
-            error_propagate(errp, local_err);
-            return;
-        }
-    }
-
     /* Continuing after completed migration. Images have been inactivated to
-     * allow the destination to take control. Need to get control back now. */
-    if (runstate_check(RUN_STATE_FINISH_MIGRATE) ||
-        runstate_check(RUN_STATE_POSTMIGRATE))
-    {
-        bdrv_invalidate_cache_all(&local_err);
-        if (local_err) {
-            error_propagate(errp, local_err);
-            return;
-        }
+     * allow the destination to take control. Need to get control back now.
+     *
+     * If there are no inactive block nodes (e.g. because the VM was just
+     * paused rather than completing a migration), bdrv_inactivate_all() simply
+     * doesn't do anything. */
+    bdrv_invalidate_cache_all(&local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
     }
 
     if (runstate_check(RUN_STATE_INMIGRATE)) {
@@ -446,8 +421,8 @@ void qmp_change(const char *device, const char *target,
     if (strcmp(device, "vnc") == 0) {
         qmp_change_vnc(target, has_arg, arg, errp);
     } else {
-        qmp_blockdev_change_medium(device, target, has_arg, arg, false, 0,
-                                   errp);
+        qmp_blockdev_change_medium(true, device, false, NULL, target,
+                                   has_arg, arg, false, 0, errp);
     }
 }
 
@@ -455,9 +430,15 @@ static void qom_list_types_tramp(ObjectClass *klass, void *data)
 {
     ObjectTypeInfoList *e, **pret = data;
     ObjectTypeInfo *info;
+    ObjectClass *parent = object_class_get_parent(klass);
 
     info = g_malloc0(sizeof(*info));
     info->name = g_strdup(object_class_get_name(klass));
+    info->has_abstract = info->abstract = object_class_is_abstract(klass);
+    if (parent) {
+        info->has_parent = true;
+        info->parent = g_strdup(object_class_get_name(parent));
+    }
 
     e = g_malloc0(sizeof(*e));
     e->value = info;
@@ -505,13 +486,14 @@ static DevicePropertyInfo *make_device_property_info(ObjectClass *klass,
              * for removal.  This conditional should be removed along with
              * it.
              */
-            if (!prop->info->set) {
+            if (!prop->info->set && !prop->info->create) {
                 return NULL;           /* no way to set it, don't show */
             }
 
             info = g_malloc0(sizeof(*info));
             info->name = g_strdup(prop->name);
-            info->type = g_strdup(prop->info->name);
+            info->type = default_type ? g_strdup(default_type)
+                                      : g_strdup(prop->info->name);
             info->has_description = !!prop->info->description;
             info->description = g_strdup(prop->info->description);
             return info;
@@ -547,18 +529,13 @@ DevicePropertyInfoList *qmp_device_list_properties(const char *typename,
 
     klass = object_class_dynamic_cast(klass, TYPE_DEVICE);
     if (klass == NULL) {
-        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "name", TYPE_DEVICE);
+        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "typename", TYPE_DEVICE);
         return NULL;
     }
 
     if (object_class_is_abstract(klass)) {
-        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "name",
+        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "typename",
                    "non-abstract device type");
-        return NULL;
-    }
-
-    if (DEVICE_CLASS(klass)->cannot_destroy_with_object_finalize_yet) {
-        error_setg(errp, "Can't list properties of device '%s'", typename);
         return NULL;
     }
 
@@ -607,11 +584,32 @@ CpuDefinitionInfoList *qmp_query_cpu_definitions(Error **errp)
     return arch_query_cpu_definitions(errp);
 }
 
+CpuModelExpansionInfo *qmp_query_cpu_model_expansion(CpuModelExpansionType type,
+                                                     CpuModelInfo *model,
+                                                     Error **errp)
+{
+    return arch_query_cpu_model_expansion(type, model, errp);
+}
+
+CpuModelCompareInfo *qmp_query_cpu_model_comparison(CpuModelInfo *modela,
+                                                    CpuModelInfo *modelb,
+                                                    Error **errp)
+{
+    return arch_query_cpu_model_comparison(modela, modelb, errp);
+}
+
+CpuModelBaselineInfo *qmp_query_cpu_model_baseline(CpuModelInfo *modela,
+                                                   CpuModelInfo *modelb,
+                                                   Error **errp)
+{
+    return arch_query_cpu_model_baseline(modela, modelb, errp);
+}
+
 void qmp_add_client(const char *protocol, const char *fdname,
                     bool has_skipauth, bool skipauth, bool has_tls, bool tls,
                     Error **errp)
 {
-    CharDriverState *s;
+    Chardev *s;
     int fd;
 
     fd = monitor_get_fd(cur_mon, fdname, errp);
@@ -669,7 +667,7 @@ void qmp_object_add(const char *type, const char *id,
         pdict = qdict_new();
     }
 
-    v = qmp_input_visitor_new(QOBJECT(pdict), true);
+    v = qobject_input_visitor_new(QOBJECT(pdict));
     obj = user_creatable_add_type(type, id, pdict, v, errp);
     visit_free(v);
     if (obj) {
@@ -710,4 +708,17 @@ ACPIOSTInfoList *qmp_query_acpi_ospm_status(Error **errp)
     }
 
     return head;
+}
+
+MemoryInfo *qmp_query_memory_size_summary(Error **errp)
+{
+    MemoryInfo *mem_info = g_malloc0(sizeof(MemoryInfo));
+
+    mem_info->base_memory = ram_size;
+
+    mem_info->plugged_memory = get_plugged_memory_size();
+    mem_info->has_plugged_memory =
+        mem_info->plugged_memory != (uint64_t)-1;
+
+    return mem_info;
 }

@@ -29,6 +29,7 @@
 #include "cpu.h"
 #include "exec/tb-context.h"
 #include "qemu/bitops.h"
+#include "tcg-mo.h"
 #include "tcg-target.h"
 
 /* XXX: make safe guess about sizes */
@@ -49,8 +50,6 @@
 #define MAX_OPC_PARAM (4 + (MAX_OPC_PARAM_PER_ARG * MAX_OPC_PARAM_ARGS))
 #define OPC_BUF_SIZE 640
 #define OPC_MAX_SIZE (OPC_BUF_SIZE - MAX_OP_PER_INSTR)
-
-#define OPPARAM_BUF_SIZE (OPC_BUF_SIZE * MAX_OPC_PARAM)
 
 #define CPU_TEMP_BUF_NLONGS 128
 
@@ -77,6 +76,15 @@ typedef uint64_t tcg_target_ulong;
 #define TCG_PRIld PRId64
 #else
 #error unsupported
+#endif
+
+/* Oversized TCG guests make things like MTTCG hard
+ * as we can't use atomics for cputlb updates.
+ */
+#if TARGET_LONG_BITS > TCG_TARGET_REG_BITS
+#define TCG_OVERSIZED_GUEST 1
+#else
+#define TCG_OVERSIZED_GUEST 0
 #endif
 
 #if TCG_TARGET_NB_REGS <= 32
@@ -111,7 +119,12 @@ typedef uint64_t TCGRegSet;
 #define TCG_TARGET_HAS_eqv_i64          0
 #define TCG_TARGET_HAS_nand_i64         0
 #define TCG_TARGET_HAS_nor_i64          0
+#define TCG_TARGET_HAS_clz_i64          0
+#define TCG_TARGET_HAS_ctz_i64          0
+#define TCG_TARGET_HAS_ctpop_i64        0
 #define TCG_TARGET_HAS_deposit_i64      0
+#define TCG_TARGET_HAS_extract_i64      0
+#define TCG_TARGET_HAS_sextract_i64     0
 #define TCG_TARGET_HAS_movcond_i64      0
 #define TCG_TARGET_HAS_add2_i64         0
 #define TCG_TARGET_HAS_sub2_i64         0
@@ -129,6 +142,12 @@ typedef uint64_t TCGRegSet;
 #endif
 #ifndef TCG_TARGET_deposit_i64_valid
 #define TCG_TARGET_deposit_i64_valid(ofs, len) 1
+#endif
+#ifndef TCG_TARGET_extract_i32_valid
+#define TCG_TARGET_extract_i32_valid(ofs, len) 1
+#endif
+#ifndef TCG_TARGET_extract_i64_valid
+#define TCG_TARGET_extract_i64_valid(ofs, len) 1
 #endif
 
 /* Only one of DIV or DIV2 should be defined.  */
@@ -165,16 +184,9 @@ typedef enum TCGOpcode {
     NB_OPS,
 } TCGOpcode;
 
-#define tcg_regset_clear(d) (d) = 0
-#define tcg_regset_set(d, s) (d) = (s)
-#define tcg_regset_set32(d, reg, val32) (d) |= (val32) << (reg)
-#define tcg_regset_set_reg(d, r) (d) |= 1L << (r)
-#define tcg_regset_reset_reg(d, r) (d) &= ~(1L << (r))
-#define tcg_regset_test_reg(d, r) (((d) >> (r)) & 1)
-#define tcg_regset_or(d, a, b) (d) = (a) | (b)
-#define tcg_regset_and(d, a, b) (d) = (a) & (b)
-#define tcg_regset_andnot(d, a, b) (d) = (a) & ~(b)
-#define tcg_regset_not(d, a) (d) = ~(a)
+#define tcg_regset_set_reg(d, r)   ((d) |= (TCGRegSet)1 << (r))
+#define tcg_regset_reset_reg(d, r) ((d) &= ~((TCGRegSet)1 << (r)))
+#define tcg_regset_test_reg(d, r)  (((d) >> (r)) & 1)
 
 #ifndef TCG_TARGET_INSN_UNIT_SIZE
 # error "Missing TCG_TARGET_INSN_UNIT_SIZE"
@@ -287,20 +299,19 @@ typedef enum TCGMemOp {
      * MO_ALIGN accesses will result in a call to the CPU's
      * do_unaligned_access hook if the guest address is not aligned.
      * The default depends on whether the target CPU defines ALIGNED_ONLY.
+     *
      * Some architectures (e.g. ARMv8) need the address which is aligned
      * to a size more than the size of the memory access.
-     * To support such check it's enough the current costless alignment
-     * check implementation in QEMU, but we need to support
-     * an alignment size specifying.
-     * MO_ALIGN supposes a natural alignment
-     * (i.e. the alignment size is the size of a memory access).
-     * Note that an alignment size must be equal or greater
-     * than an access size.
+     * Some architectures (e.g. SPARCv9) need an address which is aligned,
+     * but less strictly than the natural alignment.
+     *
+     * MO_ALIGN supposes the alignment size is the size of a memory access.
+     *
      * There are three options:
-     * - an alignment to the size of an access (MO_ALIGN);
-     * - an alignment to the specified size that is equal or greater than
-     *   an access size (MO_ALIGN_x where 'x' is a size in bytes);
      * - unaligned access permitted (MO_UNALN).
+     * - an alignment to the size of an access (MO_ALIGN);
+     * - an alignment to a specified size, which may be more or less than
+     *   the access size (MO_ALIGN_x where 'x' is a size in bytes);
      */
     MO_ASHIFT = 4,
     MO_AMASK = 7 << MO_ASHIFT,
@@ -353,50 +364,57 @@ typedef enum TCGMemOp {
  * @memop: TCGMemOp value
  *
  * Extract the alignment size from the memop.
- *
- * Returns: 0 in case of byte access (which is always aligned);
- *          positive value - number of alignment bits;
- *          negative value if unaligned access enabled
- *          and this is not a byte access.
  */
-static inline int get_alignment_bits(TCGMemOp memop)
+static inline unsigned get_alignment_bits(TCGMemOp memop)
 {
-    int a = memop & MO_AMASK;
-    int s = memop & MO_SIZE;
-    int r;
+    unsigned a = memop & MO_AMASK;
 
     if (a == MO_UNALN) {
-        /* Negative value if unaligned access enabled,
-         * or zero value in case of byte access.
-         */
-        return -s;
+        /* No alignment required.  */
+        a = 0;
     } else if (a == MO_ALIGN) {
-        /* A natural alignment: return a number of access size bits */
-        r = s;
+        /* A natural alignment requirement.  */
+        a = memop & MO_SIZE;
     } else {
-        /* Specific alignment size. It must be equal or greater
-         * than the access size.
-         */
-        r = a >> MO_ASHIFT;
-        tcg_debug_assert(r >= s);
+        /* A specific alignment requirement.  */
+        a = a >> MO_ASHIFT;
     }
 #if defined(CONFIG_SOFTMMU)
     /* The requested alignment cannot overlap the TLB flags.  */
-    tcg_debug_assert((TLB_FLAGS_MASK & ((1 << r) - 1)) == 0);
+    tcg_debug_assert((TLB_FLAGS_MASK & ((1 << a) - 1)) == 0);
 #endif
-    return r;
+    return a;
 }
 
 typedef tcg_target_ulong TCGArg;
 
-/* Define a type and accessor macros for variables.  Using pointer types
-   is nice because it gives some level of type safely.  Converting to and
-   from intptr_t rather than int reduces the number of sign-extension
-   instructions that get implied on 64-bit hosts.  Users of tcg_gen_* don't
-   need to know about any of this, and should treat TCGv as an opaque type.
-   In addition we do typechecking for different types of variables.  TCGv_i32
-   and TCGv_i64 are 32/64-bit variables respectively.  TCGv and TCGv_ptr
-   are aliases for target_ulong and host pointer sized values respectively.  */
+/* Define type and accessor macros for TCG variables.
+
+   TCG variables are the inputs and outputs of TCG ops, as described
+   in tcg/README. Target CPU front-end code uses these types to deal
+   with TCG variables as it emits TCG code via the tcg_gen_* functions.
+   They come in several flavours:
+    * TCGv_i32 : 32 bit integer type
+    * TCGv_i64 : 64 bit integer type
+    * TCGv_ptr : a host pointer type
+    * TCGv : an integer type the same size as target_ulong
+             (an alias for either TCGv_i32 or TCGv_i64)
+   The compiler's type checking will complain if you mix them
+   up and pass the wrong sized TCGv to a function.
+
+   Users of tcg_gen_* don't need to know about any of the internal
+   details of these, and should treat them as opaque types.
+   You won't be able to look inside them in a debugger either.
+
+   Internal implementation details follow:
+
+   Note that there is no definition of the structs TCGv_i32_d etc anywhere.
+   This is deliberate, because the values we store in variables of type
+   TCGv_i32 are not really pointers-to-structures. They're just small
+   integers, but keeping them in pointer types like this means that the
+   compiler will complain if you accidentally pass a TCGv_i32 to a
+   function which takes a TCGv_i64, and so on. Only the internals of
+   TCG need to care about the actual contents of the types.  */
 
 typedef struct TCGv_i32_d *TCGv_i32;
 typedef struct TCGv_i64_d *TCGv_i64;
@@ -410,53 +428,14 @@ typedef TCGv_ptr TCGv_env;
 #error Unhandled TARGET_LONG_BITS value
 #endif
 
-static inline TCGv_i32 QEMU_ARTIFICIAL MAKE_TCGV_I32(intptr_t i)
-{
-    return (TCGv_i32)i;
-}
+/* See the comment before tcgv_i32_temp.  */
+#define TCGV_UNUSED_I32(x) (x = (TCGv_i32)NULL)
+#define TCGV_UNUSED_I64(x) (x = (TCGv_i64)NULL)
+#define TCGV_UNUSED_PTR(x) (x = (TCGv_ptr)NULL)
 
-static inline TCGv_i64 QEMU_ARTIFICIAL MAKE_TCGV_I64(intptr_t i)
-{
-    return (TCGv_i64)i;
-}
-
-static inline TCGv_ptr QEMU_ARTIFICIAL MAKE_TCGV_PTR(intptr_t i)
-{
-    return (TCGv_ptr)i;
-}
-
-static inline intptr_t QEMU_ARTIFICIAL GET_TCGV_I32(TCGv_i32 t)
-{
-    return (intptr_t)t;
-}
-
-static inline intptr_t QEMU_ARTIFICIAL GET_TCGV_I64(TCGv_i64 t)
-{
-    return (intptr_t)t;
-}
-
-static inline intptr_t QEMU_ARTIFICIAL GET_TCGV_PTR(TCGv_ptr t)
-{
-    return (intptr_t)t;
-}
-
-#if TCG_TARGET_REG_BITS == 32
-#define TCGV_LOW(t) MAKE_TCGV_I32(GET_TCGV_I64(t))
-#define TCGV_HIGH(t) MAKE_TCGV_I32(GET_TCGV_I64(t) + 1)
-#endif
-
-#define TCGV_EQUAL_I32(a, b) (GET_TCGV_I32(a) == GET_TCGV_I32(b))
-#define TCGV_EQUAL_I64(a, b) (GET_TCGV_I64(a) == GET_TCGV_I64(b))
-#define TCGV_EQUAL_PTR(a, b) (GET_TCGV_PTR(a) == GET_TCGV_PTR(b))
-
-/* Dummy definition to avoid compiler warnings.  */
-#define TCGV_UNUSED_I32(x) x = MAKE_TCGV_I32(-1)
-#define TCGV_UNUSED_I64(x) x = MAKE_TCGV_I64(-1)
-#define TCGV_UNUSED_PTR(x) x = MAKE_TCGV_PTR(-1)
-
-#define TCGV_IS_UNUSED_I32(x) (GET_TCGV_I32(x) == -1)
-#define TCGV_IS_UNUSED_I64(x) (GET_TCGV_I64(x) == -1)
-#define TCGV_IS_UNUSED_PTR(x) (GET_TCGV_PTR(x) == -1)
+#define TCGV_IS_UNUSED_I32(x) ((x) == (TCGv_i32)NULL)
+#define TCGV_IS_UNUSED_I64(x) ((x) == (TCGv_i64)NULL)
+#define TCGV_IS_UNUSED_PTR(x) ((x) == (TCGv_ptr)NULL)
 
 /* call flags */
 /* Helper does not read globals (either directly or through an exception). It
@@ -474,9 +453,8 @@ static inline intptr_t QEMU_ARTIFICIAL GET_TCGV_PTR(TCGv_ptr t)
 #define TCG_CALL_NO_RWG_SE      (TCG_CALL_NO_RWG | TCG_CALL_NO_SE)
 #define TCG_CALL_NO_WG_SE       (TCG_CALL_NO_WG | TCG_CALL_NO_SE)
 
-/* used to align parameters */
-#define TCG_CALL_DUMMY_TCGV     MAKE_TCGV_I32(-1)
-#define TCG_CALL_DUMMY_ARG      ((TCGArg)(-1))
+/* Used to align parameters.  See the comment before tcgv_i32_temp.  */
+#define TCG_CALL_DUMMY_ARG      ((TCGArg)0)
 
 /* Conditions.  Note that these are laid out for easy manipulation by
    the functions below:
@@ -558,15 +536,25 @@ typedef struct TCGTemp {
     unsigned int indirect_base:1;
     unsigned int mem_coherent:1;
     unsigned int mem_allocated:1;
-    unsigned int temp_local:1; /* If true, the temp is saved across
-                                  basic blocks. Otherwise, it is not
-                                  preserved across basic blocks. */
-    unsigned int temp_allocated:1; /* never used for code gen */
+    /* If true, the temp is saved across both basic blocks and
+       translation blocks.  */
+    unsigned int temp_global:1;
+    /* If true, the temp is saved across basic blocks but dead
+       at the end of translation blocks.  If false, the temp is
+       dead at the end of basic blocks.  */
+    unsigned int temp_local:1;
+    unsigned int temp_allocated:1;
 
     tcg_target_long val;
     struct TCGTemp *mem_base;
     intptr_t mem_offset;
     const char *name;
+
+    /* Pass-specific information that can be stored for a temporary.
+       One word worth of integer data, and one pointer to data
+       allocated separately.  */
+    uintptr_t state;
+    void *state_ptr;
 } TCGTemp;
 
 typedef struct TCGContext TCGContext;
@@ -583,60 +571,35 @@ typedef struct TCGTempSet {
 #define SYNC_ARG  1
 typedef uint16_t TCGLifeData;
 
-/* The layout here is designed to avoid crossing of a 32-bit boundary.
-   If we do so, gcc adds padding, expanding the size to 12.  */
+/* The layout here is designed to avoid a bitfield crossing of
+   a 32-bit boundary, which would cause GCC to add extra padding.  */
 typedef struct TCGOp {
     TCGOpcode opc   : 8;        /*  8 */
 
-    /* Index of the prev/next op, or 0 for the end of the list.  */
-    unsigned prev   : 10;       /* 18 */
-    unsigned next   : 10;       /* 28 */
-
     /* The number of out and in parameter for a call.  */
-    unsigned calli  : 4;        /* 32 */
-    unsigned callo  : 2;        /* 34 */
+    unsigned calli  : 4;        /* 12 */
+    unsigned callo  : 2;        /* 14 */
+    unsigned        : 2;        /* 16 */
 
-    /* Index of the arguments for this op, or 0 for zero-operand ops.  */
-    unsigned args   : 14;       /* 48 */
+    /* Index of the prev/next op, or 0 for the end of the list.  */
+    unsigned prev   : 16;       /* 32 */
+    unsigned next   : 16;       /* 48 */
 
     /* Lifetime data of the operands.  */
     unsigned life   : 16;       /* 64 */
+
+    /* Arguments for the opcode.  */
+    TCGArg args[MAX_OPC_PARAM];
 } TCGOp;
+
+/* Make sure that we don't expand the structure without noticing.  */
+QEMU_BUILD_BUG_ON(sizeof(TCGOp) != 8 + sizeof(TCGArg) * MAX_OPC_PARAM);
 
 /* Make sure operands fit in the bitfields above.  */
 QEMU_BUILD_BUG_ON(NB_OPS > (1 << 8));
-QEMU_BUILD_BUG_ON(OPC_BUF_SIZE > (1 << 10));
-QEMU_BUILD_BUG_ON(OPPARAM_BUF_SIZE > (1 << 14));
+QEMU_BUILD_BUG_ON(OPC_BUF_SIZE > (1 << 16));
 
-/* Make sure that we don't overflow 64 bits without noticing.  */
-QEMU_BUILD_BUG_ON(sizeof(TCGOp) > 8);
-
-struct TCGContext {
-    uint8_t *pool_cur, *pool_end;
-    TCGPool *pool_first, *pool_current, *pool_first_large;
-    int nb_labels;
-    int nb_globals;
-    int nb_temps;
-    int nb_indirects;
-
-    /* goto_tb support */
-    tcg_insn_unit *code_buf;
-    uint16_t *tb_jmp_reset_offset; /* tb->jmp_reset_offset */
-    uint16_t *tb_jmp_insn_offset; /* tb->jmp_insn_offset if USE_DIRECT_JUMP */
-    uintptr_t *tb_jmp_target_addr; /* tb->jmp_target_addr if !USE_DIRECT_JUMP */
-
-    TCGRegSet reserved_regs;
-    intptr_t current_frame_offset;
-    intptr_t frame_start;
-    intptr_t frame_end;
-    TCGTemp *frame_temp;
-
-    tcg_insn_unit *code_ptr;
-
-    GHashTable *helpers;
-
-#ifdef CONFIG_PROFILER
-    /* profiling info */
+typedef struct TCGProfile {
     int64_t tb_count1;
     int64_t tb_count;
     int64_t op_count; /* total insn count */
@@ -653,6 +616,34 @@ struct TCGContext {
     int64_t opt_time;
     int64_t restore_count;
     int64_t restore_time;
+    int64_t table_op_count[NB_OPS];
+} TCGProfile;
+
+struct TCGContext {
+    uint8_t *pool_cur, *pool_end;
+    TCGPool *pool_first, *pool_current, *pool_first_large;
+    int nb_labels;
+    int nb_globals;
+    int nb_temps;
+    int nb_indirects;
+
+    /* goto_tb support */
+    tcg_insn_unit *code_buf;
+    uint16_t *tb_jmp_reset_offset; /* tb->jmp_reset_offset */
+    uintptr_t *tb_jmp_insn_offset; /* tb->jmp_target_arg if direct_jump */
+    uintptr_t *tb_jmp_target_addr; /* tb->jmp_target_arg if !direct_jump */
+
+    TCGRegSet reserved_regs;
+    uint32_t tb_cflags; /* cflags of the current TB */
+    intptr_t current_frame_offset;
+    intptr_t frame_start;
+    intptr_t frame_end;
+    TCGTemp *frame_temp;
+
+    tcg_insn_unit *code_ptr;
+
+#ifdef CONFIG_PROFILER
+    TCGProfile prof;
 #endif
 
 #ifdef CONFIG_DEBUG_TCG
@@ -661,29 +652,33 @@ struct TCGContext {
 #endif
 
     int gen_next_op_idx;
-    int gen_next_parm_idx;
 
     /* Code generation.  Note that we specifically do not use tcg_insn_unit
        here, because there's too much arithmetic throughout that relies
        on addition and subtraction working on bytes.  Rely on the GCC
        extension that allows arithmetic on void*.  */
-    int code_gen_max_blocks;
     void *code_gen_prologue;
+    void *code_gen_epilogue;
     void *code_gen_buffer;
     size_t code_gen_buffer_size;
     void *code_gen_ptr;
+    void *data_gen_ptr;
 
     /* Threshold to flush the translated code buffer.  */
     void *code_gen_highwater;
 
-    TBContext tb_ctx;
-
     /* Track which vCPU triggers events */
     CPUState *cpu;                      /* *_trans */
-    TCGv_env tcg_env;                   /* *_exec  */
 
-    /* The TCGBackendData structure is private to tcg-target.inc.c.  */
-    struct TCGBackendData *be;
+    /* These structures are private to tcg-target.inc.c.  */
+#ifdef TCG_TARGET_NEED_LDST_LABELS
+    struct TCGLabelQemuLdst *ldst_labels;
+#endif
+#ifdef TCG_TARGET_NEED_POOL_LABELS
+    struct TCGLabelPoolData *pool_labels;
+#endif
+
+    TCGLabel *exitreq_label;
 
     TCGTempSet free_temps[TCG_TYPE_COUNT * 2];
     TCGTemp temps[TCG_MAX_TEMPS]; /* globals first, temps after */
@@ -693,24 +688,105 @@ struct TCGContext {
     TCGTemp *reg_to_temp[TCG_TARGET_NB_REGS];
 
     TCGOp gen_op_buf[OPC_BUF_SIZE];
-    TCGArg gen_opparam_buf[OPPARAM_BUF_SIZE];
 
     uint16_t gen_insn_end_off[TCG_MAX_INSNS];
     target_ulong gen_insn_data[TCG_MAX_INSNS][TARGET_INSN_START_WORDS];
 };
 
-extern TCGContext tcg_ctx;
+extern TCGContext tcg_init_ctx;
+extern __thread TCGContext *tcg_ctx;
+extern TCGv_env cpu_env;
+
+static inline size_t temp_idx(TCGTemp *ts)
+{
+    ptrdiff_t n = ts - tcg_ctx->temps;
+    tcg_debug_assert(n >= 0 && n < tcg_ctx->nb_temps);
+    return n;
+}
+
+static inline TCGArg temp_arg(TCGTemp *ts)
+{
+    return (uintptr_t)ts;
+}
+
+static inline TCGTemp *arg_temp(TCGArg a)
+{
+    return (TCGTemp *)(uintptr_t)a;
+}
+
+/* Using the offset of a temporary, relative to TCGContext, rather than
+   its index means that we don't use 0.  That leaves offset 0 free for
+   a NULL representation without having to leave index 0 unused.  */
+static inline TCGTemp *tcgv_i32_temp(TCGv_i32 v)
+{
+    uintptr_t o = (uintptr_t)v;
+    TCGTemp *t = (void *)tcg_ctx + o;
+    tcg_debug_assert(offsetof(TCGContext, temps[temp_idx(t)]) == o);
+    return t;
+}
+
+static inline TCGTemp *tcgv_i64_temp(TCGv_i64 v)
+{
+    return tcgv_i32_temp((TCGv_i32)v);
+}
+
+static inline TCGTemp *tcgv_ptr_temp(TCGv_ptr v)
+{
+    return tcgv_i32_temp((TCGv_i32)v);
+}
+
+static inline TCGArg tcgv_i32_arg(TCGv_i32 v)
+{
+    return temp_arg(tcgv_i32_temp(v));
+}
+
+static inline TCGArg tcgv_i64_arg(TCGv_i64 v)
+{
+    return temp_arg(tcgv_i64_temp(v));
+}
+
+static inline TCGArg tcgv_ptr_arg(TCGv_ptr v)
+{
+    return temp_arg(tcgv_ptr_temp(v));
+}
+
+static inline TCGv_i32 temp_tcgv_i32(TCGTemp *t)
+{
+    (void)temp_idx(t); /* trigger embedded assert */
+    return (TCGv_i32)((void *)t - (void *)tcg_ctx);
+}
+
+static inline TCGv_i64 temp_tcgv_i64(TCGTemp *t)
+{
+    return (TCGv_i64)temp_tcgv_i32(t);
+}
+
+static inline TCGv_ptr temp_tcgv_ptr(TCGTemp *t)
+{
+    return (TCGv_ptr)temp_tcgv_i32(t);
+}
+
+#if TCG_TARGET_REG_BITS == 32
+static inline TCGv_i32 TCGV_LOW(TCGv_i64 t)
+{
+    return temp_tcgv_i32(tcgv_i64_temp(t));
+}
+
+static inline TCGv_i32 TCGV_HIGH(TCGv_i64 t)
+{
+    return temp_tcgv_i32(tcgv_i64_temp(t) + 1);
+}
+#endif
 
 static inline void tcg_set_insn_param(int op_idx, int arg, TCGArg v)
 {
-    int op_argi = tcg_ctx.gen_op_buf[op_idx].args;
-    tcg_ctx.gen_opparam_buf[op_argi + arg] = v;
+    tcg_ctx->gen_op_buf[op_idx].args[arg] = v;
 }
 
 /* The number of opcodes emitted so far.  */
 static inline int tcg_op_buf_count(void)
 {
-    return tcg_ctx.gen_next_op_idx;
+    return tcg_ctx->gen_next_op_idx;
 }
 
 /* Test for whether to terminate the TB for using too many opcodes.  */
@@ -721,23 +797,30 @@ static inline bool tcg_op_buf_full(void)
 
 /* pool based memory allocation */
 
+/* user-mode: tb_lock must be held for tcg_malloc_internal. */
 void *tcg_malloc_internal(TCGContext *s, int size);
 void tcg_pool_reset(TCGContext *s);
-void tcg_pool_delete(TCGContext *s);
+TranslationBlock *tcg_tb_alloc(TCGContext *s);
 
-void tb_lock(void);
-void tb_unlock(void);
-void tb_lock_reset(void);
+void tcg_region_init(void);
+void tcg_region_reset_all(void);
 
+size_t tcg_code_size(void);
+size_t tcg_code_capacity(void);
+
+/* user-mode: Called with tb_lock held.  */
 static inline void *tcg_malloc(int size)
 {
-    TCGContext *s = &tcg_ctx;
+    TCGContext *s = tcg_ctx;
     uint8_t *ptr, *ptr_end;
-    size = (size + sizeof(long) - 1) & ~(sizeof(long) - 1);
+
+    /* ??? This is a weak placeholder for minimum malloc alignment.  */
+    size = QEMU_ALIGN_UP(size, 8);
+
     ptr = s->pool_cur;
     ptr_end = ptr + size;
     if (unlikely(ptr_end > s->pool_end)) {
-        return tcg_malloc_internal(&tcg_ctx, size);
+        return tcg_malloc_internal(tcg_ctx, size);
     } else {
         s->pool_cur = ptr_end;
         return ptr;
@@ -745,6 +828,7 @@ static inline void *tcg_malloc(int size)
 }
 
 void tcg_context_init(TCGContext *s);
+void tcg_register_thread(void);
 void tcg_prologue_init(TCGContext *s);
 void tcg_func_start(TCGContext *s);
 
@@ -752,10 +836,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb);
 
 void tcg_set_frame(TCGContext *s, TCGReg reg, intptr_t start, intptr_t size);
 
-int tcg_global_mem_new_internal(TCGType, TCGv_ptr, intptr_t, const char *);
-
-TCGv_i32 tcg_global_reg_new_i32(TCGReg reg, const char *name);
-TCGv_i64 tcg_global_reg_new_i64(TCGReg reg, const char *name);
+TCGTemp *tcg_global_mem_new_internal(TCGType, TCGv_ptr,
+                                     intptr_t, const char *);
 
 TCGv_i32 tcg_temp_new_internal_i32(int temp_local);
 TCGv_i64 tcg_temp_new_internal_i64(int temp_local);
@@ -766,8 +848,8 @@ void tcg_temp_free_i64(TCGv_i64 arg);
 static inline TCGv_i32 tcg_global_mem_new_i32(TCGv_ptr reg, intptr_t offset,
                                               const char *name)
 {
-    int idx = tcg_global_mem_new_internal(TCG_TYPE_I32, reg, offset, name);
-    return MAKE_TCGV_I32(idx);
+    TCGTemp *t = tcg_global_mem_new_internal(TCG_TYPE_I32, reg, offset, name);
+    return temp_tcgv_i32(t);
 }
 
 static inline TCGv_i32 tcg_temp_new_i32(void)
@@ -783,8 +865,8 @@ static inline TCGv_i32 tcg_temp_local_new_i32(void)
 static inline TCGv_i64 tcg_global_mem_new_i64(TCGv_ptr reg, intptr_t offset,
                                               const char *name)
 {
-    int idx = tcg_global_mem_new_internal(TCG_TYPE_I64, reg, offset, name);
-    return MAKE_TCGV_I64(idx);
+    TCGTemp *t = tcg_global_mem_new_internal(TCG_TYPE_I64, reg, offset, name);
+    return temp_tcgv_i64(t);
 }
 
 static inline TCGv_i64 tcg_temp_new_i64(void)
@@ -815,6 +897,7 @@ void tcg_dump_op_count(FILE *f, fprintf_function cpu_fprintf);
 
 #define TCG_CT_ALIAS  0x80
 #define TCG_CT_IALIAS 0x40
+#define TCG_CT_NEWREG 0x20 /* output requires a new register */
 #define TCG_CT_REG    0x01
 #define TCG_CT_CONST  0x02 /* any constant of register size */
 
@@ -869,34 +952,29 @@ do {\
     abort();\
 } while (0)
 
-void tcg_add_target_add_op_defs(const TCGTargetOpDef *tdefs);
-
 #if UINTPTR_MAX == UINT32_MAX
-#define TCGV_NAT_TO_PTR(n) MAKE_TCGV_PTR(GET_TCGV_I32(n))
-#define TCGV_PTR_TO_NAT(n) MAKE_TCGV_I32(GET_TCGV_PTR(n))
+static inline TCGv_ptr TCGV_NAT_TO_PTR(TCGv_i32 n) { return (TCGv_ptr)n; }
+static inline TCGv_i32 TCGV_PTR_TO_NAT(TCGv_ptr n) { return (TCGv_i32)n; }
 
 #define tcg_const_ptr(V) TCGV_NAT_TO_PTR(tcg_const_i32((intptr_t)(V)))
-#define tcg_global_reg_new_ptr(R, N) \
-    TCGV_NAT_TO_PTR(tcg_global_reg_new_i32((R), (N)))
 #define tcg_global_mem_new_ptr(R, O, N) \
     TCGV_NAT_TO_PTR(tcg_global_mem_new_i32((R), (O), (N)))
 #define tcg_temp_new_ptr() TCGV_NAT_TO_PTR(tcg_temp_new_i32())
 #define tcg_temp_free_ptr(T) tcg_temp_free_i32(TCGV_PTR_TO_NAT(T))
 #else
-#define TCGV_NAT_TO_PTR(n) MAKE_TCGV_PTR(GET_TCGV_I64(n))
-#define TCGV_PTR_TO_NAT(n) MAKE_TCGV_I64(GET_TCGV_PTR(n))
+static inline TCGv_ptr TCGV_NAT_TO_PTR(TCGv_i64 n) { return (TCGv_ptr)n; }
+static inline TCGv_i64 TCGV_PTR_TO_NAT(TCGv_ptr n) { return (TCGv_i64)n; }
 
 #define tcg_const_ptr(V) TCGV_NAT_TO_PTR(tcg_const_i64((intptr_t)(V)))
-#define tcg_global_reg_new_ptr(R, N) \
-    TCGV_NAT_TO_PTR(tcg_global_reg_new_i64((R), (N)))
 #define tcg_global_mem_new_ptr(R, O, N) \
     TCGV_NAT_TO_PTR(tcg_global_mem_new_i64((R), (O), (N)))
 #define tcg_temp_new_ptr() TCGV_NAT_TO_PTR(tcg_temp_new_i64())
 #define tcg_temp_free_ptr(T) tcg_temp_free_i64(TCGV_PTR_TO_NAT(T))
 #endif
 
-void tcg_gen_callN(TCGContext *s, void *func,
-                   TCGArg ret, int nargs, TCGArg *args);
+bool tcg_op_supported(TCGOpcode op);
+
+void tcg_gen_callN(void *func, TCGTemp *ret, int nargs, TCGTemp **args);
 
 void tcg_op_remove(TCGContext *s, TCGOp *op);
 TCGOp *tcg_op_insert_before(TCGContext *s, TCGOp *op, TCGOpcode opc, int narg);
@@ -907,7 +985,6 @@ void tcg_optimize(TCGContext *s);
 /* only used for debugging purposes */
 void tcg_dump_ops(TCGContext *s);
 
-void dump_ops(const uint16_t *opc_buf, const TCGArg *opparam_buf);
 TCGv_i32 tcg_const_i32(int32_t val);
 TCGv_i64 tcg_const_i64(int64_t val);
 TCGv_i32 tcg_const_local_i32(int32_t val);
@@ -1071,14 +1148,13 @@ static inline unsigned get_mmuidx(TCGMemOpIdx oi)
 #define TB_EXIT_MASK 3
 #define TB_EXIT_IDX0 0
 #define TB_EXIT_IDX1 1
-#define TB_EXIT_ICOUNT_EXPIRED 2
 #define TB_EXIT_REQUESTED 3
 
 #ifdef HAVE_TCG_QEMU_TB_EXEC
 uintptr_t tcg_qemu_tb_exec(CPUArchState *env, uint8_t *tb_ptr);
 #else
 # define tcg_qemu_tb_exec(env, tb_ptr) \
-    ((uintptr_t (*)(void *, void *))tcg_ctx.code_gen_prologue)(env, tb_ptr)
+    ((uintptr_t (*)(void *, void *))tcg_ctx->code_gen_prologue)(env, tb_ptr)
 #endif
 
 void tcg_register_jit(void *buf, size_t buf_size);
@@ -1174,6 +1250,90 @@ uint64_t helper_be_ldq_cmmu(CPUArchState *env, target_ulong addr,
 # define helper_ret_ldq_cmmu  helper_le_ldq_cmmu
 #endif
 
+uint32_t helper_atomic_cmpxchgb_mmu(CPUArchState *env, target_ulong addr,
+                                    uint32_t cmpv, uint32_t newv,
+                                    TCGMemOpIdx oi, uintptr_t retaddr);
+uint32_t helper_atomic_cmpxchgw_le_mmu(CPUArchState *env, target_ulong addr,
+                                       uint32_t cmpv, uint32_t newv,
+                                       TCGMemOpIdx oi, uintptr_t retaddr);
+uint32_t helper_atomic_cmpxchgl_le_mmu(CPUArchState *env, target_ulong addr,
+                                       uint32_t cmpv, uint32_t newv,
+                                       TCGMemOpIdx oi, uintptr_t retaddr);
+uint64_t helper_atomic_cmpxchgq_le_mmu(CPUArchState *env, target_ulong addr,
+                                       uint64_t cmpv, uint64_t newv,
+                                       TCGMemOpIdx oi, uintptr_t retaddr);
+uint32_t helper_atomic_cmpxchgw_be_mmu(CPUArchState *env, target_ulong addr,
+                                       uint32_t cmpv, uint32_t newv,
+                                       TCGMemOpIdx oi, uintptr_t retaddr);
+uint32_t helper_atomic_cmpxchgl_be_mmu(CPUArchState *env, target_ulong addr,
+                                       uint32_t cmpv, uint32_t newv,
+                                       TCGMemOpIdx oi, uintptr_t retaddr);
+uint64_t helper_atomic_cmpxchgq_be_mmu(CPUArchState *env, target_ulong addr,
+                                       uint64_t cmpv, uint64_t newv,
+                                       TCGMemOpIdx oi, uintptr_t retaddr);
+
+#define GEN_ATOMIC_HELPER(NAME, TYPE, SUFFIX)         \
+TYPE helper_atomic_ ## NAME ## SUFFIX ## _mmu         \
+    (CPUArchState *env, target_ulong addr, TYPE val,  \
+     TCGMemOpIdx oi, uintptr_t retaddr);
+
+#ifdef CONFIG_ATOMIC64
+#define GEN_ATOMIC_HELPER_ALL(NAME)          \
+    GEN_ATOMIC_HELPER(NAME, uint32_t, b)     \
+    GEN_ATOMIC_HELPER(NAME, uint32_t, w_le)  \
+    GEN_ATOMIC_HELPER(NAME, uint32_t, w_be)  \
+    GEN_ATOMIC_HELPER(NAME, uint32_t, l_le)  \
+    GEN_ATOMIC_HELPER(NAME, uint32_t, l_be)  \
+    GEN_ATOMIC_HELPER(NAME, uint64_t, q_le)  \
+    GEN_ATOMIC_HELPER(NAME, uint64_t, q_be)
+#else
+#define GEN_ATOMIC_HELPER_ALL(NAME)          \
+    GEN_ATOMIC_HELPER(NAME, uint32_t, b)     \
+    GEN_ATOMIC_HELPER(NAME, uint32_t, w_le)  \
+    GEN_ATOMIC_HELPER(NAME, uint32_t, w_be)  \
+    GEN_ATOMIC_HELPER(NAME, uint32_t, l_le)  \
+    GEN_ATOMIC_HELPER(NAME, uint32_t, l_be)
+#endif
+
+GEN_ATOMIC_HELPER_ALL(fetch_add)
+GEN_ATOMIC_HELPER_ALL(fetch_sub)
+GEN_ATOMIC_HELPER_ALL(fetch_and)
+GEN_ATOMIC_HELPER_ALL(fetch_or)
+GEN_ATOMIC_HELPER_ALL(fetch_xor)
+
+GEN_ATOMIC_HELPER_ALL(add_fetch)
+GEN_ATOMIC_HELPER_ALL(sub_fetch)
+GEN_ATOMIC_HELPER_ALL(and_fetch)
+GEN_ATOMIC_HELPER_ALL(or_fetch)
+GEN_ATOMIC_HELPER_ALL(xor_fetch)
+
+GEN_ATOMIC_HELPER_ALL(xchg)
+
+#undef GEN_ATOMIC_HELPER_ALL
+#undef GEN_ATOMIC_HELPER
 #endif /* CONFIG_SOFTMMU */
+
+#ifdef CONFIG_ATOMIC128
+#include "qemu/int128.h"
+
+/* These aren't really a "proper" helpers because TCG cannot manage Int128.
+   However, use the same format as the others, for use by the backends. */
+Int128 helper_atomic_cmpxchgo_le_mmu(CPUArchState *env, target_ulong addr,
+                                     Int128 cmpv, Int128 newv,
+                                     TCGMemOpIdx oi, uintptr_t retaddr);
+Int128 helper_atomic_cmpxchgo_be_mmu(CPUArchState *env, target_ulong addr,
+                                     Int128 cmpv, Int128 newv,
+                                     TCGMemOpIdx oi, uintptr_t retaddr);
+
+Int128 helper_atomic_ldo_le_mmu(CPUArchState *env, target_ulong addr,
+                                TCGMemOpIdx oi, uintptr_t retaddr);
+Int128 helper_atomic_ldo_be_mmu(CPUArchState *env, target_ulong addr,
+                                TCGMemOpIdx oi, uintptr_t retaddr);
+void helper_atomic_sto_le_mmu(CPUArchState *env, target_ulong addr, Int128 val,
+                              TCGMemOpIdx oi, uintptr_t retaddr);
+void helper_atomic_sto_be_mmu(CPUArchState *env, target_ulong addr, Int128 val,
+                              TCGMemOpIdx oi, uintptr_t retaddr);
+
+#endif /* CONFIG_ATOMIC128 */
 
 #endif /* TCG_H */

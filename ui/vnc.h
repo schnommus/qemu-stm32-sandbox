@@ -146,15 +146,18 @@ struct VncDisplay
     int num_exclusive;
     int connections_limit;
     VncSharePolicy share_policy;
-    QIOChannelSocket *lsock;
-    guint lsock_tag;
-    QIOChannelSocket *lwebsock;
-    guint lwebsock_tag;
-    bool ws_enabled;
+    size_t nlsock;
+    QIOChannelSocket **lsock;
+    guint *lsock_tag;
+    size_t nlwebsock;
+    QIOChannelSocket **lwebsock;
+    guint *lwebsock_tag;
     DisplaySurface *ds;
     DisplayChangeListener dcl;
     kbd_layout_t *kbd_layout;
     int lock_key_sync;
+    QEMUPutLEDEntry *led;
+    int ledstate;
     int key_delay_ms;
     QemuMutex mutex;
 
@@ -167,14 +170,13 @@ struct VncDisplay
 
     const char *id;
     QTAILQ_ENTRY(VncDisplay) next;
-    bool enabled;
     bool is_unix;
     char *password;
     time_t expires;
     int auth;
     int subauth; /* Used by VeNCrypt */
     int ws_auth; /* Used by websockets */
-    bool ws_tls; /* Used by websockets */
+    int ws_subauth; /* Used by websockets */
     bool lossy;
     bool non_adaptive;
     QCryptoTLSCreds *tlscreds;
@@ -306,10 +308,8 @@ struct VncState
     size_t read_handler_expect;
     /* input */
     uint8_t modifiers_state[256];
-    QEMUPutLEDEntry *led;
 
     bool abort;
-    bool initialized;
     QemuMutex output_mutex;
     QEMUBH *bh;
     Buffer jobs_buffer;
@@ -518,7 +518,7 @@ void vnc_write_u8(VncState *vs, uint8_t value);
 void vnc_flush(VncState *vs);
 void vnc_read_when(VncState *vs, VncReadEvent *func, size_t expecting);
 void vnc_disconnect_finish(VncState *vs);
-void vnc_init_state(VncState *vs);
+void vnc_start_protocol(VncState *vs);
 
 
 /* Buffer I/O functions */

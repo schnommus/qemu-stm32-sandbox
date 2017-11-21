@@ -16,6 +16,7 @@
 
 #include "hw/sysbus.h"
 #include "hw/qdev.h"
+#include "target/s390x/cpu-qom.h"
 
 #define SCLP_CMD_CODE_MASK                      0xffff00ff
 
@@ -44,10 +45,10 @@
 #define SCLP_CMDW_DECONFIGURE_CPU               0x00100001
 
 /* SCLP PCI codes */
-#define SCLP_HAS_PCI_RECONFIG                   0x0000000040000000ULL
-#define SCLP_CMDW_CONFIGURE_PCI                 0x001a0001
-#define SCLP_CMDW_DECONFIGURE_PCI               0x001b0001
-#define SCLP_RECONFIG_PCI_ATPYE                 2
+#define SCLP_HAS_IOA_RECONFIG                   0x0000000040000000ULL
+#define SCLP_CMDW_CONFIGURE_IOA                 0x001a0001
+#define SCLP_CMDW_DECONFIGURE_IOA               0x001b0001
+#define SCLP_RECONFIG_PCI_ATYPE                 2
 
 /* SCLP response codes */
 #define SCLP_RC_NORMAL_READ_COMPLETION          0x0010
@@ -59,6 +60,7 @@
 #define SCLP_RC_INSUFFICIENT_SCCB_LENGTH        0x0300
 #define SCLP_RC_STANDBY_READ_COMPLETION         0x0410
 #define SCLP_RC_ADAPTER_IN_RESERVED_STATE       0x05f0
+#define SCLP_RC_ADAPTER_TYPE_NOT_RECOGNIZED     0x06f0
 #define SCLP_RC_ADAPTER_ID_NOT_RECOGNIZED       0x09f0
 #define SCLP_RC_INVALID_FUNCTION                0x40f0
 #define SCLP_RC_NO_EVENT_BUFFERS_STORED         0x60f0
@@ -98,11 +100,14 @@ typedef struct SCCBHeader {
 } QEMU_PACKED SCCBHeader;
 
 #define SCCB_DATA_LEN (SCCB_SIZE - sizeof(SCCBHeader))
+#define SCCB_CPU_FEATURE_LEN 6
 
 /* CPU information */
 typedef struct CPUEntry {
     uint8_t address;
-    uint8_t reserved0[13];
+    uint8_t reserved0;
+    uint8_t features[SCCB_CPU_FEATURE_LEN];
+    uint8_t reserved2[6];
     uint8_t type;
     uint8_t reserved1;
 } QEMU_PACKED CPUEntry;
@@ -118,12 +123,17 @@ typedef struct ReadInfo {
     uint8_t  loadparm[8];               /* 24-31 */
     uint8_t  _reserved3[48 - 32];       /* 32-47 */
     uint64_t facilities;                /* 48-55 */
-    uint8_t  _reserved0[100 - 56];
+    uint8_t  _reserved0[76 - 56];       /* 56-75 */
+    uint32_t ibc_val;
+    uint8_t  conf_char[99 - 80];        /* 80-98 */
+    uint8_t mha_pow;
     uint32_t rnsize2;
     uint64_t rnmax2;
-    uint8_t  _reserved4[120-112];       /* 112-119 */
+    uint8_t  _reserved6[116 - 112];     /* 112-115 */
+    uint8_t  conf_char_ext[120 - 116];   /* 116-119 */
     uint16_t highest_cpu;
-    uint8_t  _reserved5[128 - 122];     /* 122-127 */
+    uint8_t  _reserved5[124 - 122];     /* 122-123 */
+    uint32_t hmfai;
     struct CPUEntry entries[0];
 } QEMU_PACKED ReadInfo;
 
@@ -158,6 +168,14 @@ typedef struct AssignStorage {
     SCCBHeader h;
     uint16_t rn;
 } QEMU_PACKED AssignStorage;
+
+typedef struct IoaCfgSccb {
+    SCCBHeader header;
+    uint8_t atype;
+    uint8_t reserved1;
+    uint16_t reserved2;
+    uint32_t aid;
+} QEMU_PACKED IoaCfgSccb;
 
 typedef struct SCCB {
     SCCBHeader h;
@@ -225,5 +243,6 @@ sclpMemoryHotplugDev *init_sclp_memory_hotplug_dev(void);
 sclpMemoryHotplugDev *get_sclp_memory_hotplug_dev(void);
 void sclp_service_interrupt(uint32_t sccb);
 void raise_irq_cpu_hotplug(void);
+int sclp_service_call(CPUS390XState *env, uint64_t sccb, uint32_t code);
 
 #endif

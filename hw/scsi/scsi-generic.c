@@ -34,15 +34,7 @@ do { printf("scsi-generic: " fmt , ## __VA_ARGS__); } while (0)
 do { fprintf(stderr, "scsi-generic: " fmt , ## __VA_ARGS__); } while (0)
 
 #include <scsi/sg.h>
-#include "block/scsi.h"
-
-#define SG_ERR_DRIVER_TIMEOUT  0x06
-#define SG_ERR_DRIVER_SENSE    0x08
-
-#define SG_ERR_DID_OK          0x00
-#define SG_ERR_DID_NO_CONNECT  0x01
-#define SG_ERR_DID_BUS_BUSY    0x02
-#define SG_ERR_DID_TIME_OUT    0x03
+#include "scsi/constants.h"
 
 #ifndef MAX_UINT
 #define MAX_UINT ((unsigned int)-1)
@@ -89,6 +81,7 @@ static void scsi_free_request(SCSIRequest *req)
 static void scsi_command_complete_noio(SCSIGenericReq *r, int ret)
 {
     int status;
+    SCSISense sense;
 
     assert(r->req.aiocb == NULL);
 
@@ -96,42 +89,15 @@ static void scsi_command_complete_noio(SCSIGenericReq *r, int ret)
         scsi_req_cancel_complete(&r->req);
         goto done;
     }
-    if (r->io_header.driver_status & SG_ERR_DRIVER_SENSE) {
-        r->req.sense_len = r->io_header.sb_len_wr;
+    status = sg_io_sense_from_errno(-ret, &r->io_header, &sense);
+    if (status == CHECK_CONDITION) {
+        if (r->io_header.driver_status & SG_ERR_DRIVER_SENSE) {
+            r->req.sense_len = r->io_header.sb_len_wr;
+        } else {
+            scsi_req_build_sense(&r->req, sense);
+        }
     }
 
-    if (ret != 0) {
-        switch (ret) {
-        case -EDOM:
-            status = TASK_SET_FULL;
-            break;
-        case -ENOMEM:
-            status = CHECK_CONDITION;
-            scsi_req_build_sense(&r->req, SENSE_CODE(TARGET_FAILURE));
-            break;
-        default:
-            status = CHECK_CONDITION;
-            scsi_req_build_sense(&r->req, SENSE_CODE(IO_ERROR));
-            break;
-        }
-    } else {
-        if (r->io_header.host_status == SG_ERR_DID_NO_CONNECT ||
-            r->io_header.host_status == SG_ERR_DID_BUS_BUSY ||
-            r->io_header.host_status == SG_ERR_DID_TIME_OUT ||
-            (r->io_header.driver_status & SG_ERR_DRIVER_TIMEOUT)) {
-            status = BUSY;
-            BADF("Driver Timeout\n");
-        } else if (r->io_header.host_status) {
-            status = CHECK_CONDITION;
-            scsi_req_build_sense(&r->req, SENSE_CODE(I_T_NEXUS_LOSS));
-        } else if (r->io_header.status) {
-            status = r->io_header.status;
-        } else if (r->io_header.driver_status & SG_ERR_DRIVER_SENSE) {
-            status = CHECK_CONDITION;
-        } else {
-            status = GOOD;
-        }
-    }
     DPRINTF("Command complete 0x%p tag=0x%x status=%d\n",
             r, r->req.tag, status);
 
@@ -143,10 +109,14 @@ done:
 static void scsi_command_complete(void *opaque, int ret)
 {
     SCSIGenericReq *r = (SCSIGenericReq *)opaque;
+    SCSIDevice *s = r->req.dev;
 
     assert(r->req.aiocb != NULL);
     r->req.aiocb = NULL;
+
+    aio_context_acquire(blk_get_aio_context(s->conf.blk));
     scsi_command_complete_noio(r, ret);
+    aio_context_release(blk_get_aio_context(s->conf.blk));
 }
 
 static int execute_command(BlockBackend *blk,
@@ -182,9 +152,11 @@ static void scsi_read_complete(void * opaque, int ret)
     assert(r->req.aiocb != NULL);
     r->req.aiocb = NULL;
 
+    aio_context_acquire(blk_get_aio_context(s->conf.blk));
+
     if (ret || r->req.io_canceled) {
         scsi_command_complete_noio(r, ret);
-        return;
+        goto done;
     }
 
     len = r->io_header.dxfer_len - r->io_header.resid;
@@ -193,7 +165,7 @@ static void scsi_read_complete(void * opaque, int ret)
     r->len = -1;
     if (len == 0) {
         scsi_command_complete_noio(r, 0);
-        return;
+        goto done;
     }
 
     /* Snoop READ CAPACITY output to set the blocksize.  */
@@ -231,12 +203,14 @@ static void scsi_read_complete(void * opaque, int ret)
         assert(max_transfer);
         stl_be_p(&r->buf[8], max_transfer);
         /* Also take care of the opt xfer len. */
-        if (ldl_be_p(&r->buf[12]) > max_transfer) {
-            stl_be_p(&r->buf[12], max_transfer);
-        }
+        stl_be_p(&r->buf[12],
+                 MIN_NON_ZERO(max_transfer, ldl_be_p(&r->buf[12])));
     }
     scsi_req_data(&r->req, len);
     scsi_req_unref(&r->req);
+
+done:
+    aio_context_release(blk_get_aio_context(s->conf.blk));
 }
 
 /* Read more data from scsi device into buffer.  */
@@ -246,7 +220,7 @@ static void scsi_read_data(SCSIRequest *req)
     SCSIDevice *s = r->req.dev;
     int ret;
 
-    DPRINTF("scsi_read_data 0x%x\n", req->tag);
+    DPRINTF("scsi_read_data tag=0x%x\n", req->tag);
 
     /* The request is used as the AIO opaque value, so add a ref.  */
     scsi_req_ref(&r->req);
@@ -272,9 +246,11 @@ static void scsi_write_complete(void * opaque, int ret)
     assert(r->req.aiocb != NULL);
     r->req.aiocb = NULL;
 
+    aio_context_acquire(blk_get_aio_context(s->conf.blk));
+
     if (ret || r->req.io_canceled) {
         scsi_command_complete_noio(r, ret);
-        return;
+        goto done;
     }
 
     if (r->req.cmd.buf[0] == MODE_SELECT && r->req.cmd.buf[4] == 12 &&
@@ -284,6 +260,9 @@ static void scsi_write_complete(void * opaque, int ret)
     }
 
     scsi_command_complete_noio(r, ret);
+
+done:
+    aio_context_release(blk_get_aio_context(s->conf.blk));
 }
 
 /* Write data to a scsi device.  Returns nonzero on failure.
@@ -294,7 +273,7 @@ static void scsi_write_data(SCSIRequest *req)
     SCSIDevice *s = r->req.dev;
     int ret;
 
-    DPRINTF("scsi_write_data 0x%x\n", req->tag);
+    DPRINTF("scsi_write_data tag=0x%x\n", req->tag);
     if (r->len == 0) {
         r->len = r->buflen;
         scsi_req_data(&r->req, r->len);
@@ -329,6 +308,7 @@ static int32_t scsi_send_command(SCSIRequest *req, uint8_t *cmd)
     int ret;
 
 #ifdef DEBUG_SCSI
+    DPRINTF("Command: data=0x%02x", cmd[0]);
     {
         int i;
         for (i = 1; i < r->req.cmd.len; i++) {
@@ -392,7 +372,7 @@ static int read_naa_id(const uint8_t *p, uint64_t *p_wwn)
         }
         *p_wwn = 0;
         for (i = 8; i < 24; i++) {
-            char c = toupper(p[i]);
+            char c = qemu_toupper(p[i]);
             c -= (c >= '0' && c <= '9' ? '0' : 'A' - 10);
             *p_wwn = (*p_wwn << 4) | c;
         }

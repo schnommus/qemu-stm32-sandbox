@@ -15,7 +15,7 @@ not a straightforward operation.
 This document attempts to give an overview of the L2 and refcount
 caches, and how to configure them.
 
-Please refer to the docs/specs/qcow2.txt file for an in-depth
+Please refer to the docs/interop/qcow2.txt file for an in-depth
 technical description of the qcow2 file format.
 
 
@@ -160,5 +160,6 @@ If unset, the default value for this parameter is 0 and it disables
 this feature.
 
 Note that this functionality currently relies on the MADV_DONTNEED
-argument for madvise() to actually free the memory, so it is not
-useful in systems that don't follow that behavior.
+argument for madvise() to actually free the memory. This is a
+Linux-specific feature, so cache-clean-interval is not supported in
+other systems.

@@ -28,6 +28,8 @@
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
 #include "qemu/help_option.h"
+#include "sysemu/block-backend.h"
+#include "migration/misc.h"
 
 /*
  * Aliases were a bad idea from the start.  Let's keep them
@@ -44,7 +46,6 @@ typedef struct QDevAlias
 static const QDevAlias qdev_alias_table[] = {
     { "e1000", "e1000-82540em" },
     { "ich9-ahci", "ahci" },
-    { "kvm-pci-assign", "pci-assign" },
     { "lsi53c895a", "lsi" },
     { "virtio-9p-ccw", "virtio-9p", QEMU_ARCH_S390X },
     { "virtio-9p-pci", "virtio-9p", QEMU_ARCH_ALL & ~QEMU_ARCH_S390X },
@@ -112,7 +113,7 @@ static void qdev_print_devinfo(DeviceClass *dc)
     if (dc->desc) {
         error_printf(", desc \"%s\"", dc->desc);
     }
-    if (dc->cannot_instantiate_with_device_add_yet) {
+    if (!dc->user_creatable) {
         error_printf(", no-user");
     }
     error_printf("\n");
@@ -135,6 +136,7 @@ static void qdev_print_devinfos(bool show_no_user)
         [DEVICE_CATEGORY_DISPLAY] = "Display",
         [DEVICE_CATEGORY_SOUND]   = "Sound",
         [DEVICE_CATEGORY_MISC]    = "Misc",
+        [DEVICE_CATEGORY_CPU]     = "CPU",
         [DEVICE_CATEGORY_MAX]     = "Uncategorized",
     };
     GSList *list, *elt;
@@ -153,7 +155,7 @@ static void qdev_print_devinfos(bool show_no_user)
                  ? !test_bit(i, dc->categories)
                  : !bitmap_empty(dc->categories, DEVICE_CATEGORY_MAX))
                 || (!show_no_user
-                    && dc->cannot_instantiate_with_device_add_yet)) {
+                    && !dc->user_creatable)) {
                 continue;
             }
             if (!cat_printed) {
@@ -238,7 +240,7 @@ static DeviceClass *qdev_get_device_class(const char **driver, Error **errp)
     }
 
     dc = DEVICE_CLASS(oc);
-    if (dc->cannot_instantiate_with_device_add_yet ||
+    if (!dc->user_creatable ||
         (qdev_hotplug && !dc->hotpluggable)) {
         error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "driver",
                    "pluggable device type");
@@ -538,10 +540,28 @@ static BusState *qbus_find(const char *path, Error **errp)
     return bus;
 }
 
+void qdev_set_id(DeviceState *dev, const char *id)
+{
+    if (id) {
+        dev->id = id;
+    }
+
+    if (dev->id) {
+        object_property_add_child(qdev_get_peripheral(), dev->id,
+                                  OBJECT(dev), NULL);
+    } else {
+        static int anon_count;
+        gchar *name = g_strdup_printf("device[%d]", anon_count++);
+        object_property_add_child(qdev_get_peripheral_anon(), name,
+                                  OBJECT(dev), NULL);
+        g_free(name);
+    }
+}
+
 DeviceState *qdev_device_add(QemuOpts *opts, Error **errp)
 {
     DeviceClass *dc;
-    const char *driver, *path, *id;
+    const char *driver, *path;
     DeviceState *dev;
     BusState *bus = NULL;
     Error *err = NULL;
@@ -583,6 +603,11 @@ DeviceState *qdev_device_add(QemuOpts *opts, Error **errp)
         return NULL;
     }
 
+    if (!migration_is_idle()) {
+        error_setg(errp, "device_add not allowed while migrating");
+        return NULL;
+    }
+
     /* create device */
     dev = DEVICE(object_new(driver));
 
@@ -590,21 +615,7 @@ DeviceState *qdev_device_add(QemuOpts *opts, Error **errp)
         qdev_set_parent_bus(dev, bus);
     }
 
-    id = qemu_opts_id(opts);
-    if (id) {
-        dev->id = id;
-    }
-
-    if (dev->id) {
-        object_property_add_child(qdev_get_peripheral(), dev->id,
-                                  OBJECT(dev), NULL);
-    } else {
-        static int anon_count;
-        gchar *name = g_strdup_printf("device[%d]", anon_count++);
-        object_property_add_child(qdev_get_peripheral_anon(), name,
-                                  OBJECT(dev), NULL);
-        g_free(name);
-    }
+    qdev_set_id(dev, qemu_opts_id(opts));
 
     /* set properties */
     if (qemu_opt_foreach(opts, set_property, dev, &err)) {
@@ -801,7 +812,7 @@ void qmp_device_add(QDict *qdict, QObject **ret_data, Error **errp)
     object_unref(OBJECT(dev));
 }
 
-void qmp_device_del(const char *id, Error **errp)
+static DeviceState *find_device_state(const char *id, Error **errp)
 {
     Object *obj;
 
@@ -819,15 +830,79 @@ void qmp_device_del(const char *id, Error **errp)
     if (!obj) {
         error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
                   "Device '%s' not found", id);
-        return;
+        return NULL;
     }
 
     if (!object_dynamic_cast(obj, TYPE_DEVICE)) {
         error_setg(errp, "%s is not a hotpluggable device", id);
+        return NULL;
+    }
+
+    return DEVICE(obj);
+}
+
+void qdev_unplug(DeviceState *dev, Error **errp)
+{
+    DeviceClass *dc = DEVICE_GET_CLASS(dev);
+    HotplugHandler *hotplug_ctrl;
+    HotplugHandlerClass *hdc;
+
+    if (dev->parent_bus && !qbus_is_hotpluggable(dev->parent_bus)) {
+        error_setg(errp, QERR_BUS_NO_HOTPLUG, dev->parent_bus->name);
         return;
     }
 
-    qdev_unplug(DEVICE(obj), errp);
+    if (!dc->hotpluggable) {
+        error_setg(errp, QERR_DEVICE_NO_HOTPLUG,
+                   object_get_typename(OBJECT(dev)));
+        return;
+    }
+
+    if (!migration_is_idle()) {
+        error_setg(errp, "device_del not allowed while migrating");
+        return;
+    }
+
+    qdev_hot_removed = true;
+
+    hotplug_ctrl = qdev_get_hotplug_handler(dev);
+    /* hotpluggable device MUST have HotplugHandler, if it doesn't
+     * then something is very wrong with it */
+    g_assert(hotplug_ctrl);
+
+    /* If device supports async unplug just request it to be done,
+     * otherwise just remove it synchronously */
+    hdc = HOTPLUG_HANDLER_GET_CLASS(hotplug_ctrl);
+    if (hdc->unplug_request) {
+        hotplug_handler_unplug_request(hotplug_ctrl, dev, errp);
+    } else {
+        hotplug_handler_unplug(hotplug_ctrl, dev, errp);
+    }
+}
+
+void qmp_device_del(const char *id, Error **errp)
+{
+    DeviceState *dev = find_device_state(id, errp);
+    if (dev != NULL) {
+        qdev_unplug(dev, errp);
+    }
+}
+
+BlockBackend *blk_by_qdev_id(const char *id, Error **errp)
+{
+    DeviceState *dev;
+    BlockBackend *blk;
+
+    dev = find_device_state(id, errp);
+    if (dev == NULL) {
+        return NULL;
+    }
+
+    blk = blk_by_dev(dev);
+    if (!blk) {
+        error_setg(errp, "Device does not have a block device backend");
+    }
+    return blk;
 }
 
 void qdev_machine_init(void)

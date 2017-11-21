@@ -33,7 +33,6 @@
 #include "sysemu/sysemu.h"
 #include "hw/acpi/acpi.h"
 #include "hw/acpi/tco.h"
-#include "sysemu/kvm.h"
 #include "exec/address-spaces.h"
 
 #include "hw/i386/ich9.h"
@@ -306,7 +305,8 @@ void ich9_pm_init(PCIDevice *lpc_pci, ICH9LPCPMRegs *pm,
 
     if (pm->acpi_memory_hotplug.is_enabled) {
         acpi_memory_hotplug_init(pci_address_space_io(lpc_pci), OBJECT(lpc_pci),
-                                 &pm->acpi_memory_hotplug);
+                                 &pm->acpi_memory_hotplug,
+                                 ACPI_MEMORY_HOTPLUG_BASE);
     }
 }
 
@@ -490,8 +490,12 @@ void ich9_pm_device_plug_cb(HotplugHandler *hotplug_dev, DeviceState *dev,
 
     if (lpc->pm.acpi_memory_hotplug.is_enabled &&
         object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
-        acpi_memory_plug_cb(hotplug_dev, &lpc->pm.acpi_memory_hotplug,
-                            dev, errp);
+        if (object_dynamic_cast(OBJECT(dev), TYPE_NVDIMM)) {
+            nvdimm_acpi_plug_cb(hotplug_dev, dev);
+        } else {
+            acpi_memory_plug_cb(hotplug_dev, &lpc->pm.acpi_memory_hotplug,
+                                dev, errp);
+        }
     } else if (object_dynamic_cast(OBJECT(dev), TYPE_CPU)) {
         if (lpc->pm.cpu_hotplug_legacy) {
             legacy_acpi_cpu_plug_cb(hotplug_dev, &lpc->pm.gpe_cpu, dev, errp);

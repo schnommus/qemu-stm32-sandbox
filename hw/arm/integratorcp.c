@@ -53,6 +53,26 @@ static uint8_t integrator_spd[128] = {
    0xe, 4, 0x1c, 1, 2, 0x20, 0xc0, 0, 0, 0, 0, 0x30, 0x28, 0x30, 0x28, 0x40
 };
 
+static const VMStateDescription vmstate_integratorcm = {
+    .name = "integratorcm",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields      = (VMStateField[]) {
+        VMSTATE_UINT32(cm_osc, IntegratorCMState),
+        VMSTATE_UINT32(cm_ctrl, IntegratorCMState),
+        VMSTATE_UINT32(cm_lock, IntegratorCMState),
+        VMSTATE_UINT32(cm_auxosc, IntegratorCMState),
+        VMSTATE_UINT32(cm_sdram, IntegratorCMState),
+        VMSTATE_UINT32(cm_init, IntegratorCMState),
+        VMSTATE_UINT32(cm_flags, IntegratorCMState),
+        VMSTATE_UINT32(cm_nvflags, IntegratorCMState),
+        VMSTATE_UINT32(int_level, IntegratorCMState),
+        VMSTATE_UINT32(irq_enabled, IntegratorCMState),
+        VMSTATE_UINT32(fiq_enabled, IntegratorCMState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static uint64_t integratorcm_read(void *opaque, hwaddr offset,
                                   unsigned size)
 {
@@ -138,7 +158,7 @@ static void integratorcm_do_remap(IntegratorCMState *s)
 static void integratorcm_set_ctrl(IntegratorCMState *s, uint32_t value)
 {
     if (value & 8) {
-        qemu_system_reset_request();
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     }
     if ((s->cm_ctrl ^ value) & 1) {
         /* (value & 1) != 0 means the green "MISC LED" is lit.
@@ -252,6 +272,25 @@ static void integratorcm_init(Object *obj)
     /* ??? What should the high bits of this value be?  */
     s->cm_auxosc = 0x0007feff;
     s->cm_sdram = 0x00011122;
+    memcpy(integrator_spd + 73, "QEMU-MEMORY", 11);
+    s->cm_init = 0x00000112;
+    s->cm_refcnt_offset = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), 24,
+                                   1000);
+    memory_region_init_ram(&s->flash, obj, "integrator.flash", 0x100000,
+                           &error_fatal);
+
+    memory_region_init_io(&s->iomem, obj, &integratorcm_ops, s,
+                          "integratorcm", 0x00800000);
+    sysbus_init_mmio(dev, &s->iomem);
+
+    integratorcm_do_remap(s);
+    /* ??? Save/restore.  */
+}
+
+static void integratorcm_realize(DeviceState *d, Error **errp)
+{
+    IntegratorCMState *s = INTEGRATOR_CM(d);
+
     if (s->memsz >= 256) {
         integrator_spd[31] = 64;
         s->cm_sdram |= 0x10;
@@ -267,20 +306,6 @@ static void integratorcm_init(Object *obj)
     } else {
         integrator_spd[31] = 2;
     }
-    memcpy(integrator_spd + 73, "QEMU-MEMORY", 11);
-    s->cm_init = 0x00000112;
-    s->cm_refcnt_offset = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), 24,
-                                   1000);
-    memory_region_init_ram(&s->flash, obj, "integrator.flash", 0x100000,
-                           &error_fatal);
-    vmstate_register_ram_global(&s->flash);
-
-    memory_region_init_io(&s->iomem, obj, &integratorcm_ops, s,
-                          "integratorcm", 0x00800000);
-    sysbus_init_mmio(dev, &s->iomem);
-
-    integratorcm_do_remap(s);
-    /* ??? Save/restore.  */
 }
 
 /* Integrator/CP hardware emulation.  */
@@ -302,6 +327,18 @@ typedef struct icp_pic_state {
     qemu_irq parent_irq;
     qemu_irq parent_fiq;
 } icp_pic_state;
+
+static const VMStateDescription vmstate_icp_pic = {
+    .name = "icp_pic",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields      = (VMStateField[]) {
+        VMSTATE_UINT32(level, icp_pic_state),
+        VMSTATE_UINT32(irq_enabled, icp_pic_state),
+        VMSTATE_UINT32(fiq_enabled, icp_pic_state),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static void icp_pic_update(icp_pic_state *s)
 {
@@ -432,6 +469,16 @@ typedef struct ICPCtrlRegsState {
 #define ICP_INTREG_WPROT        (1 << 0)
 #define ICP_INTREG_CARDIN       (1 << 3)
 
+static const VMStateDescription vmstate_icp_control = {
+    .name = "icp_control",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields      = (VMStateField[]) {
+        VMSTATE_UINT32(intreg_state, ICPCtrlRegsState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static uint64_t icp_control_read(void *opaque, hwaddr offset,
                                  unsigned size)
 {
@@ -525,11 +572,9 @@ static struct arm_boot_info integrator_binfo = {
 static void integratorcp_init(MachineState *machine)
 {
     ram_addr_t ram_size = machine->ram_size;
-    const char *cpu_model = machine->cpu_model;
     const char *kernel_filename = machine->kernel_filename;
     const char *kernel_cmdline = machine->kernel_cmdline;
     const char *initrd_filename = machine->initrd_filename;
-    ObjectClass *cpu_oc;
     Object *cpuobj;
     ARMCPU *cpu;
     MemoryRegion *address_space_mem = get_system_memory();
@@ -539,17 +584,7 @@ static void integratorcp_init(MachineState *machine)
     DeviceState *dev, *sic, *icp;
     int i;
 
-    if (!cpu_model) {
-        cpu_model = "arm926";
-    }
-
-    cpu_oc = cpu_class_by_name(TYPE_ARM_CPU, cpu_model);
-    if (!cpu_oc) {
-        fprintf(stderr, "Unable to find CPU definition\n");
-        exit(1);
-    }
-
-    cpuobj = object_new(object_class_get_name(cpu_oc));
+    cpuobj = object_new(machine->cpu_type);
 
     /* By default ARM1176 CPUs have EL3 enabled.  This board does not
      * currently support EL3 so the CPU EL3 property is disabled before
@@ -619,6 +654,8 @@ static void integratorcp_machine_init(MachineClass *mc)
 {
     mc->desc = "ARM Integrator/CP (ARM926EJ-S)";
     mc->init = integratorcp_init;
+    mc->ignore_memory_transaction_failures = true;
+    mc->default_cpu_type = ARM_CPU_TYPE_NAME("arm926");
 }
 
 DEFINE_MACHINE("integratorcp", integratorcp_machine_init)
@@ -633,6 +670,22 @@ static void core_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->props = core_properties;
+    dc->realize = integratorcm_realize;
+    dc->vmsd = &vmstate_integratorcm;
+}
+
+static void icp_pic_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->vmsd = &vmstate_icp_pic;
+}
+
+static void icp_control_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->vmsd = &vmstate_icp_control;
 }
 
 static const TypeInfo core_info = {
@@ -648,6 +701,7 @@ static const TypeInfo icp_pic_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(icp_pic_state),
     .instance_init = icp_pic_init,
+    .class_init    = icp_pic_class_init,
 };
 
 static const TypeInfo icp_ctrl_regs_info = {
@@ -655,6 +709,7 @@ static const TypeInfo icp_ctrl_regs_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(ICPCtrlRegsState),
     .instance_init = icp_control_init,
+    .class_init    = icp_control_class_init,
 };
 
 static void integratorcp_register_types(void)

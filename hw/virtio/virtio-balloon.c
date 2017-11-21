@@ -26,6 +26,7 @@
 #include "qapi/visitor.h"
 #include "qapi-event.h"
 #include "trace.h"
+#include "qemu/error-report.h"
 
 #include "hw/virtio/virtio-bus.h"
 #include "hw/virtio/virtio-access.h"
@@ -34,13 +35,11 @@
 
 static void balloon_page(void *addr, int deflate)
 {
-#if defined(__linux__)
     if (!qemu_balloon_is_inhibited() && (!kvm_enabled() ||
                                          kvm_has_sync_mmu())) {
         qemu_madvise(addr, BALLOON_PAGE_SIZE,
                 deflate ? QEMU_MADV_WILLNEED : QEMU_MADV_DONTNEED);
     }
-#endif
 }
 
 static const char *balloon_stat_names[] = {
@@ -230,8 +229,13 @@ static void virtio_balloon_handle_output(VirtIODevice *vdev, VirtQueue *vq)
 
             /* FIXME: remove get_system_memory(), but how? */
             section = memory_region_find(get_system_memory(), pa, 1);
-            if (!int128_nz(section.size) || !memory_region_is_ram(section.mr))
+            if (!int128_nz(section.size) ||
+                !memory_region_is_ram(section.mr) ||
+                memory_region_is_rom(section.mr) ||
+                memory_region_is_romd(section.mr)) {
+                trace_virtio_balloon_bad_addr(pa);
                 continue;
+            }
 
             trace_virtio_balloon_handle_output(memory_region_name(section.mr),
                                                pa);
@@ -289,7 +293,7 @@ static void virtio_balloon_receive_stats(VirtIODevice *vdev, VirtQueue *vq)
     s->stats_vq_offset = offset;
 
     if (qemu_gettimeofday(&tv) < 0) {
-        fprintf(stderr, "warning: %s: failed to get time of day\n", __func__);
+        warn_report("%s: failed to get time of day", __func__);
         goto out;
     }
 
@@ -396,32 +400,27 @@ static void virtio_balloon_to_target(void *opaque, ram_addr_t target)
     trace_virtio_balloon_to_target(target, dev->num_pages);
 }
 
-static void virtio_balloon_save_device(VirtIODevice *vdev, QEMUFile *f)
+static int virtio_balloon_post_load_device(void *opaque, int version_id)
 {
-    VirtIOBalloon *s = VIRTIO_BALLOON(vdev);
-
-    qemu_put_be32(f, s->num_pages);
-    qemu_put_be32(f, s->actual);
-}
-
-static int virtio_balloon_load(QEMUFile *f, void *opaque, size_t size)
-{
-    return virtio_load(VIRTIO_DEVICE(opaque), f, 1);
-}
-
-static int virtio_balloon_load_device(VirtIODevice *vdev, QEMUFile *f,
-                                      int version_id)
-{
-    VirtIOBalloon *s = VIRTIO_BALLOON(vdev);
-
-    s->num_pages = qemu_get_be32(f);
-    s->actual = qemu_get_be32(f);
+    VirtIOBalloon *s = VIRTIO_BALLOON(opaque);
 
     if (balloon_stats_enabled(s)) {
         balloon_stats_change_timer(s, s->stats_poll_interval);
     }
     return 0;
 }
+
+static const VMStateDescription vmstate_virtio_balloon_device = {
+    .name = "virtio-balloon-device",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = virtio_balloon_post_load_device,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32(num_pages, VirtIOBalloon),
+        VMSTATE_UINT32(actual, VirtIOBalloon),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static void virtio_balloon_device_realize(DeviceState *dev, Error **errp)
 {
@@ -463,9 +462,21 @@ static void virtio_balloon_device_reset(VirtIODevice *vdev)
     VirtIOBalloon *s = VIRTIO_BALLOON(vdev);
 
     if (s->stats_vq_elem != NULL) {
-        virtqueue_discard(s->svq, s->stats_vq_elem, 0);
+        virtqueue_unpop(s->svq, s->stats_vq_elem, 0);
         g_free(s->stats_vq_elem);
         s->stats_vq_elem = NULL;
+    }
+}
+
+static void virtio_balloon_set_status(VirtIODevice *vdev, uint8_t status)
+{
+    VirtIOBalloon *s = VIRTIO_BALLOON(vdev);
+
+    if (!s->stats_vq_elem && vdev->vm_running &&
+        (status & VIRTIO_CONFIG_S_DRIVER_OK) && virtqueue_rewind(s->svq, 1)) {
+        /* poll stats queue for the element we have discarded when the VM
+         * was stopped */
+        virtio_balloon_receive_stats(vdev, s->svq);
     }
 }
 
@@ -482,7 +493,15 @@ static void virtio_balloon_instance_init(Object *obj)
                         NULL, s, NULL);
 }
 
-VMSTATE_VIRTIO_DEVICE(balloon, 1, virtio_balloon_load, virtio_vmstate_save);
+static const VMStateDescription vmstate_virtio_balloon = {
+    .name = "virtio-balloon",
+    .minimum_version_id = 1,
+    .version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_VIRTIO_DEVICE,
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static Property virtio_balloon_properties[] = {
     DEFINE_PROP_BIT("deflate-on-oom", VirtIOBalloon, host_features,
@@ -504,8 +523,8 @@ static void virtio_balloon_class_init(ObjectClass *klass, void *data)
     vdc->get_config = virtio_balloon_get_config;
     vdc->set_config = virtio_balloon_set_config;
     vdc->get_features = virtio_balloon_get_features;
-    vdc->save = virtio_balloon_save_device;
-    vdc->load = virtio_balloon_load_device;
+    vdc->set_status = virtio_balloon_set_status;
+    vdc->vmsd = &vmstate_virtio_balloon_device;
 }
 
 static const TypeInfo virtio_balloon_info = {

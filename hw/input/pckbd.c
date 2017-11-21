@@ -226,7 +226,7 @@ static void outport_write(KBDState *s, uint32_t val)
     s->outport = val;
     qemu_set_irq(s->a20_out, (val >> 1) & 1);
     if (!(val & 1)) {
-        qemu_system_reset_request();
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     }
 }
 
@@ -301,7 +301,7 @@ static void kbd_write_command(void *opaque, hwaddr addr,
         s->outport &= ~KBD_OUT_A20;
         break;
     case KBD_CCMD_RESET:
-        qemu_system_reset_request();
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         break;
     case KBD_CCMD_NO_OP:
         /* ignore that */
@@ -499,9 +499,9 @@ void i8042_isa_mouse_fake_event(void *opaque)
     ps2_mouse_fake_event(s->mouse);
 }
 
-void i8042_setup_a20_line(ISADevice *dev, qemu_irq *a20_out)
+void i8042_setup_a20_line(ISADevice *dev, qemu_irq a20_out)
 {
-    qdev_connect_gpio_out_named(DEVICE(dev), I8042_A20_LINE, 0, *a20_out);
+    qdev_connect_gpio_out_named(DEVICE(dev), I8042_A20_LINE, 0, a20_out);
 }
 
 static const VMStateDescription vmstate_kbd_isa = {

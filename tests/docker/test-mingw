@@ -15,8 +15,11 @@
 
 requires mingw dtc
 
+cd "$BUILD_DIR"
+DEF_TARGET_LIST="x86_64-softmmu,aarch64-softmmu"
+
 for prefix in x86_64-w64-mingw32- i686-w64-mingw32-; do
-    TARGET_LIST=x86_64-softmmu,aarch64-softmmu \
+    TARGET_LIST=${TARGET_LIST:-$DEF_TARGET_LIST} \
         build_qemu --cross-prefix=$prefix \
         --enable-trace-backends=simple \
         --enable-debug \
@@ -28,6 +31,7 @@ for prefix in x86_64-w64-mingw32- i686-w64-mingw32-; do
         --enable-guest-agent \
         --with-sdlabi=1.2 \
         --with-gtkabi=2.0
+    install_qemu
     make clean
 
 done

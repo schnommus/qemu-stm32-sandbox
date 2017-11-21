@@ -109,7 +109,7 @@ static uint32_t mb_add_cmdline(MultibootState *s, const char *cmdline)
     hwaddr p = s->offset_cmdlines;
     char *b = (char *)s->mb_buf + p;
 
-    get_opt_value(b, strlen(cmdline) + 1, cmdline);
+    memcpy(b, cmdline, strlen(cmdline) + 1);
     s->offset_cmdlines += strlen(b) + 1;
     return s->mb_buf_phys + p;
 }
@@ -221,15 +221,34 @@ int load_multiboot(FWCfgState *fw_cfg,
         uint32_t mh_header_addr = ldl_p(header+i+12);
         uint32_t mh_load_end_addr = ldl_p(header+i+20);
         uint32_t mh_bss_end_addr = ldl_p(header+i+24);
+
         mh_load_addr = ldl_p(header+i+16);
+        if (mh_header_addr < mh_load_addr) {
+            fprintf(stderr, "invalid mh_load_addr address\n");
+            exit(1);
+        }
+
         uint32_t mb_kernel_text_offset = i - (mh_header_addr - mh_load_addr);
         uint32_t mb_load_size = 0;
         mh_entry_addr = ldl_p(header+i+28);
 
         if (mh_load_end_addr) {
+            if (mh_bss_end_addr < mh_load_addr) {
+                fprintf(stderr, "invalid mh_bss_end_addr address\n");
+                exit(1);
+            }
             mb_kernel_size = mh_bss_end_addr - mh_load_addr;
+
+            if (mh_load_end_addr < mh_load_addr) {
+                fprintf(stderr, "invalid mh_load_end_addr address\n");
+                exit(1);
+            }
             mb_load_size = mh_load_end_addr - mh_load_addr;
         } else {
+            if (kernel_file_size < mb_kernel_text_offset) {
+                fprintf(stderr, "invalid kernel_file_size\n");
+                exit(1);
+            }
             mb_kernel_size = kernel_file_size - mb_kernel_text_offset;
             mb_load_size = mb_kernel_size;
         }
@@ -287,7 +306,8 @@ int load_multiboot(FWCfgState *fw_cfg,
     mbs.offset_bootloader = mbs.offset_cmdlines + cmdline_len;
 
     if (initrd_filename) {
-        char *next_initrd, not_last;
+        const char *next_initrd;
+        char not_last, tmpbuf[strlen(initrd_filename) + 1];
 
         mbs.offset_mods = mbs.mb_buf_size;
 
@@ -296,25 +316,24 @@ int load_multiboot(FWCfgState *fw_cfg,
             int mb_mod_length;
             uint32_t offs = mbs.mb_buf_size;
 
-            next_initrd = (char *)get_opt_value(NULL, 0, initrd_filename);
+            next_initrd = get_opt_value(tmpbuf, sizeof(tmpbuf), initrd_filename);
             not_last = *next_initrd;
-            *next_initrd = '\0';
             /* if a space comes after the module filename, treat everything
                after that as parameters */
-            hwaddr c = mb_add_cmdline(&mbs, initrd_filename);
-            if ((next_space = strchr(initrd_filename, ' ')))
+            hwaddr c = mb_add_cmdline(&mbs, tmpbuf);
+            if ((next_space = strchr(tmpbuf, ' ')))
                 *next_space = '\0';
-            mb_debug("multiboot loading module: %s\n", initrd_filename);
-            mb_mod_length = get_image_size(initrd_filename);
+            mb_debug("multiboot loading module: %s\n", tmpbuf);
+            mb_mod_length = get_image_size(tmpbuf);
             if (mb_mod_length < 0) {
-                fprintf(stderr, "Failed to open file '%s'\n", initrd_filename);
+                fprintf(stderr, "Failed to open file '%s'\n", tmpbuf);
                 exit(1);
             }
 
             mbs.mb_buf_size = TARGET_PAGE_ALIGN(mb_mod_length + mbs.mb_buf_size);
             mbs.mb_buf = g_realloc(mbs.mb_buf, mbs.mb_buf_size);
 
-            load_image(initrd_filename, (unsigned char *)mbs.mb_buf + offs);
+            load_image(tmpbuf, (unsigned char *)mbs.mb_buf + offs);
             mb_add_mod(&mbs, mbs.mb_buf_phys + offs,
                        mbs.mb_buf_phys + offs + mb_mod_length, c);
 
@@ -352,8 +371,7 @@ int load_multiboot(FWCfgState *fw_cfg,
     mb_debug("           mb_mods_count = %d\n", mbs.mb_mods_count);
 
     /* save bootinfo off the stack */
-    mb_bootinfo_data = g_malloc(sizeof(bootinfo));
-    memcpy(mb_bootinfo_data, bootinfo, sizeof(bootinfo));
+    mb_bootinfo_data = g_memdup(bootinfo, sizeof(bootinfo));
 
     /* Pass variables to option rom */
     fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_ENTRY, mh_entry_addr);

@@ -1,4 +1,5 @@
 /*
+ *  Copyright (C) 2016-2017 Red Hat, Inc.
  *  Copyright (C) 2005  Anthony Liguori <anthony@codemonkey.ws>
  *
  *  Network Block Device Client Side
@@ -18,28 +19,8 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "trace.h"
 #include "nbd-internal.h"
-
-static int nbd_errno_to_system_errno(int err)
-{
-    switch (err) {
-    case NBD_SUCCESS:
-        return 0;
-    case NBD_EPERM:
-        return EPERM;
-    case NBD_EIO:
-        return EIO;
-    case NBD_ENOMEM:
-        return ENOMEM;
-    case NBD_ENOSPC:
-        return ENOSPC;
-    default:
-        TRACE("Squashing unexpected error %d to EINVAL", err);
-        /* fallthrough */
-    case NBD_EINVAL:
-        return EINVAL;
-    }
-}
 
 /* Definitions for opaque data types */
 
@@ -74,321 +55,527 @@ static QTAILQ_HEAD(, NBDExport) exports = QTAILQ_HEAD_INITIALIZER(exports);
 
 */
 
-
-/* If type represents success, return 1 without further action.
- * If type represents an error reply, consume the rest of the packet on ioc.
- * Then return 0 for unsupported (so the client can fall back to
- * other approaches), or -1 with errp set for other errors.
- */
-static int nbd_handle_reply_err(QIOChannel *ioc, uint32_t opt, uint32_t type,
-                                Error **errp)
+/* Send an option request.
+ *
+ * The request is for option @opt, with @data containing @len bytes of
+ * additional payload for the request (@len may be -1 to treat @data as
+ * a C string; and @data may be NULL if @len is 0).
+ * Return 0 if successful, -1 with errp set if it is impossible to
+ * continue. */
+static int nbd_send_option_request(QIOChannel *ioc, uint32_t opt,
+                                   uint32_t len, const char *data,
+                                   Error **errp)
 {
-    uint32_t len;
-    char *msg = NULL;
-    int result = -1;
+    nbd_option req;
+    QEMU_BUILD_BUG_ON(sizeof(req) != 16);
 
-    if (!(type & (1 << 31))) {
-        return 1;
+    if (len == -1) {
+        req.length = len = strlen(data);
     }
+    trace_nbd_send_option_request(opt, nbd_opt_lookup(opt), len);
 
-    if (read_sync(ioc, &len, sizeof(len)) != sizeof(len)) {
-        error_setg(errp, "failed to read option length");
-        return -1;
-    }
-    len = be32_to_cpu(len);
-    if (len) {
-        if (len > NBD_MAX_BUFFER_SIZE) {
-            error_setg(errp, "server's error message is too long");
-            goto cleanup;
-        }
-        msg = g_malloc(len + 1);
-        if (read_sync(ioc, msg, len) != len) {
-            error_setg(errp, "failed to read option error message");
-            goto cleanup;
-        }
-        msg[len] = '\0';
-    }
+    stq_be_p(&req.magic, NBD_OPTS_MAGIC);
+    stl_be_p(&req.option, opt);
+    stl_be_p(&req.length, len);
 
-    switch (type) {
-    case NBD_REP_ERR_UNSUP:
-        TRACE("server doesn't understand request %" PRIx32
-              ", attempting fallback", opt);
-        result = 0;
-        goto cleanup;
-
-    case NBD_REP_ERR_POLICY:
-        error_setg(errp, "Denied by server for option %" PRIx32, opt);
-        break;
-
-    case NBD_REP_ERR_INVALID:
-        error_setg(errp, "Invalid data length for option %" PRIx32, opt);
-        break;
-
-    case NBD_REP_ERR_TLS_REQD:
-        error_setg(errp, "TLS negotiation required before option %" PRIx32,
-                   opt);
-        break;
-
-    default:
-        error_setg(errp, "Unknown error code when asking for option %" PRIx32,
-                   opt);
-        break;
-    }
-
-    if (msg) {
-        error_append_hint(errp, "%s\n", msg);
-    }
-
- cleanup:
-    g_free(msg);
-    return result;
-}
-
-static int nbd_receive_list(QIOChannel *ioc, char **name, Error **errp)
-{
-    uint64_t magic;
-    uint32_t opt;
-    uint32_t type;
-    uint32_t len;
-    uint32_t namelen;
-    int error;
-
-    *name = NULL;
-    if (read_sync(ioc, &magic, sizeof(magic)) != sizeof(magic)) {
-        error_setg(errp, "failed to read list option magic");
-        return -1;
-    }
-    magic = be64_to_cpu(magic);
-    if (magic != NBD_REP_MAGIC) {
-        error_setg(errp, "Unexpected option list magic");
-        return -1;
-    }
-    if (read_sync(ioc, &opt, sizeof(opt)) != sizeof(opt)) {
-        error_setg(errp, "failed to read list option");
-        return -1;
-    }
-    opt = be32_to_cpu(opt);
-    if (opt != NBD_OPT_LIST) {
-        error_setg(errp, "Unexpected option type %" PRIx32 " expected %x",
-                   opt, NBD_OPT_LIST);
+    if (nbd_write(ioc, &req, sizeof(req), errp) < 0) {
+        error_prepend(errp, "Failed to send option request header: ");
         return -1;
     }
 
-    if (read_sync(ioc, &type, sizeof(type)) != sizeof(type)) {
-        error_setg(errp, "failed to read list option type");
-        return -1;
-    }
-    type = be32_to_cpu(type);
-    error = nbd_handle_reply_err(ioc, opt, type, errp);
-    if (error <= 0) {
-        return error;
-    }
-
-    if (read_sync(ioc, &len, sizeof(len)) != sizeof(len)) {
-        error_setg(errp, "failed to read option length");
-        return -1;
-    }
-    len = be32_to_cpu(len);
-
-    if (type == NBD_REP_ACK) {
-        if (len != 0) {
-            error_setg(errp, "length too long for option end");
-            return -1;
-        }
-    } else if (type == NBD_REP_SERVER) {
-        if (len < sizeof(namelen) || len > NBD_MAX_BUFFER_SIZE) {
-            error_setg(errp, "incorrect option length");
-            return -1;
-        }
-        if (read_sync(ioc, &namelen, sizeof(namelen)) != sizeof(namelen)) {
-            error_setg(errp, "failed to read option name length");
-            return -1;
-        }
-        namelen = be32_to_cpu(namelen);
-        len -= sizeof(namelen);
-        if (len < namelen) {
-            error_setg(errp, "incorrect option name length");
-            return -1;
-        }
-        if (namelen > NBD_MAX_NAME_SIZE) {
-            error_setg(errp, "export name length too long %" PRIu32, namelen);
-            return -1;
-        }
-
-        *name = g_new0(char, namelen + 1);
-        if (read_sync(ioc, *name, namelen) != namelen) {
-            error_setg(errp, "failed to read export name");
-            g_free(*name);
-            *name = NULL;
-            return -1;
-        }
-        (*name)[namelen] = '\0';
-        len -= namelen;
-        if (len) {
-            char *buf = g_malloc(len + 1);
-            if (read_sync(ioc, buf, len) != len) {
-                error_setg(errp, "failed to read export description");
-                g_free(*name);
-                g_free(buf);
-                *name = NULL;
-                return -1;
-            }
-            buf[len] = '\0';
-            TRACE("Ignoring export description: %s", buf);
-            g_free(buf);
-        }
-    } else {
-        error_setg(errp, "Unexpected reply type %" PRIx32 " expected %x",
-                   type, NBD_REP_SERVER);
-        return -1;
-    }
-    return 1;
-}
-
-
-static int nbd_receive_query_exports(QIOChannel *ioc,
-                                     const char *wantname,
-                                     Error **errp)
-{
-    uint64_t magic = cpu_to_be64(NBD_OPTS_MAGIC);
-    uint32_t opt = cpu_to_be32(NBD_OPT_LIST);
-    uint32_t length = 0;
-    bool foundExport = false;
-
-    TRACE("Querying export list");
-    if (write_sync(ioc, &magic, sizeof(magic)) != sizeof(magic)) {
-        error_setg(errp, "Failed to send list option magic");
-        return -1;
-    }
-
-    if (write_sync(ioc, &opt, sizeof(opt)) != sizeof(opt)) {
-        error_setg(errp, "Failed to send list option number");
-        return -1;
-    }
-
-    if (write_sync(ioc, &length, sizeof(length)) != sizeof(length)) {
-        error_setg(errp, "Failed to send list option length");
-        return -1;
-    }
-
-    TRACE("Reading available export names");
-    while (1) {
-        char *name = NULL;
-        int ret = nbd_receive_list(ioc, &name, errp);
-
-        if (ret < 0) {
-            g_free(name);
-            name = NULL;
-            return -1;
-        }
-        if (ret == 0) {
-            /* Server doesn't support export listing, so
-             * we will just assume an export with our
-             * wanted name exists */
-            foundExport = true;
-            break;
-        }
-        if (name == NULL) {
-            TRACE("End of export name list");
-            break;
-        }
-        if (g_str_equal(name, wantname)) {
-            foundExport = true;
-            TRACE("Found desired export name '%s'", name);
-        } else {
-            TRACE("Ignored export name '%s'", name);
-        }
-        g_free(name);
-    }
-
-    if (!foundExport) {
-        error_setg(errp, "No export with name '%s' available", wantname);
+    if (len && nbd_write(ioc, (char *) data, len, errp) < 0) {
+        error_prepend(errp, "Failed to send option request data: ");
         return -1;
     }
 
     return 0;
 }
 
+/* Send NBD_OPT_ABORT as a courtesy to let the server know that we are
+ * not going to attempt further negotiation. */
+static void nbd_send_opt_abort(QIOChannel *ioc)
+{
+    /* Technically, a compliant server is supposed to reply to us; but
+     * older servers disconnected instead. At any rate, we're allowed
+     * to disconnect without waiting for the server reply, so we don't
+     * even care if the request makes it to the server, let alone
+     * waiting around for whether the server replies. */
+    nbd_send_option_request(ioc, NBD_OPT_ABORT, 0, NULL, NULL);
+}
+
+
+/* Receive the header of an option reply, which should match the given
+ * opt.  Read through the length field, but NOT the length bytes of
+ * payload. Return 0 if successful, -1 with errp set if it is
+ * impossible to continue. */
+static int nbd_receive_option_reply(QIOChannel *ioc, uint32_t opt,
+                                    nbd_opt_reply *reply, Error **errp)
+{
+    QEMU_BUILD_BUG_ON(sizeof(*reply) != 20);
+    if (nbd_read(ioc, reply, sizeof(*reply), errp) < 0) {
+        error_prepend(errp, "failed to read option reply: ");
+        nbd_send_opt_abort(ioc);
+        return -1;
+    }
+    be64_to_cpus(&reply->magic);
+    be32_to_cpus(&reply->option);
+    be32_to_cpus(&reply->type);
+    be32_to_cpus(&reply->length);
+
+    trace_nbd_receive_option_reply(reply->option, nbd_opt_lookup(reply->option),
+                                   reply->type, nbd_rep_lookup(reply->type),
+                                   reply->length);
+
+    if (reply->magic != NBD_REP_MAGIC) {
+        error_setg(errp, "Unexpected option reply magic");
+        nbd_send_opt_abort(ioc);
+        return -1;
+    }
+    if (reply->option != opt) {
+        error_setg(errp, "Unexpected option type %x expected %x",
+                   reply->option, opt);
+        nbd_send_opt_abort(ioc);
+        return -1;
+    }
+    return 0;
+}
+
+/* If reply represents success, return 1 without further action.
+ * If reply represents an error, consume the optional payload of
+ * the packet on ioc.  Then return 0 for unsupported (so the client
+ * can fall back to other approaches), or -1 with errp set for other
+ * errors.
+ */
+static int nbd_handle_reply_err(QIOChannel *ioc, nbd_opt_reply *reply,
+                                Error **errp)
+{
+    char *msg = NULL;
+    int result = -1;
+
+    if (!(reply->type & (1 << 31))) {
+        return 1;
+    }
+
+    if (reply->length) {
+        if (reply->length > NBD_MAX_BUFFER_SIZE) {
+            error_setg(errp, "server error 0x%" PRIx32
+                       " (%s) message is too long",
+                       reply->type, nbd_rep_lookup(reply->type));
+            goto cleanup;
+        }
+        msg = g_malloc(reply->length + 1);
+        if (nbd_read(ioc, msg, reply->length, errp) < 0) {
+            error_prepend(errp, "failed to read option error 0x%" PRIx32
+                          " (%s) message: ",
+                          reply->type, nbd_rep_lookup(reply->type));
+            goto cleanup;
+        }
+        msg[reply->length] = '\0';
+    }
+
+    switch (reply->type) {
+    case NBD_REP_ERR_UNSUP:
+        trace_nbd_reply_err_unsup(reply->option, nbd_opt_lookup(reply->option));
+        result = 0;
+        goto cleanup;
+
+    case NBD_REP_ERR_POLICY:
+        error_setg(errp, "Denied by server for option %" PRIx32 " (%s)",
+                   reply->option, nbd_opt_lookup(reply->option));
+        break;
+
+    case NBD_REP_ERR_INVALID:
+        error_setg(errp, "Invalid data length for option %" PRIx32 " (%s)",
+                   reply->option, nbd_opt_lookup(reply->option));
+        break;
+
+    case NBD_REP_ERR_PLATFORM:
+        error_setg(errp, "Server lacks support for option %" PRIx32 " (%s)",
+                   reply->option, nbd_opt_lookup(reply->option));
+        break;
+
+    case NBD_REP_ERR_TLS_REQD:
+        error_setg(errp, "TLS negotiation required before option %" PRIx32
+                   " (%s)", reply->option, nbd_opt_lookup(reply->option));
+        break;
+
+    case NBD_REP_ERR_UNKNOWN:
+        error_setg(errp, "Requested export not available");
+        break;
+
+    case NBD_REP_ERR_SHUTDOWN:
+        error_setg(errp, "Server shutting down before option %" PRIx32 " (%s)",
+                   reply->option, nbd_opt_lookup(reply->option));
+        break;
+
+    case NBD_REP_ERR_BLOCK_SIZE_REQD:
+        error_setg(errp, "Server requires INFO_BLOCK_SIZE for option %" PRIx32
+                   " (%s)", reply->option, nbd_opt_lookup(reply->option));
+        break;
+
+    default:
+        error_setg(errp, "Unknown error code when asking for option %" PRIx32
+                   " (%s)", reply->option, nbd_opt_lookup(reply->option));
+        break;
+    }
+
+    if (msg) {
+        error_append_hint(errp, "server reported: %s\n", msg);
+    }
+
+ cleanup:
+    g_free(msg);
+    if (result < 0) {
+        nbd_send_opt_abort(ioc);
+    }
+    return result;
+}
+
+/* Process another portion of the NBD_OPT_LIST reply.  Set *@match if
+ * the current reply matches @want or if the server does not support
+ * NBD_OPT_LIST, otherwise leave @match alone.  Return 0 if iteration
+ * is complete, positive if more replies are expected, or negative
+ * with @errp set if an unrecoverable error occurred. */
+static int nbd_receive_list(QIOChannel *ioc, const char *want, bool *match,
+                            Error **errp)
+{
+    nbd_opt_reply reply;
+    uint32_t len;
+    uint32_t namelen;
+    char name[NBD_MAX_NAME_SIZE + 1];
+    int error;
+
+    if (nbd_receive_option_reply(ioc, NBD_OPT_LIST, &reply, errp) < 0) {
+        return -1;
+    }
+    error = nbd_handle_reply_err(ioc, &reply, errp);
+    if (error <= 0) {
+        /* The server did not support NBD_OPT_LIST, so set *match on
+         * the assumption that any name will be accepted.  */
+        *match = true;
+        return error;
+    }
+    len = reply.length;
+
+    if (reply.type == NBD_REP_ACK) {
+        if (len != 0) {
+            error_setg(errp, "length too long for option end");
+            nbd_send_opt_abort(ioc);
+            return -1;
+        }
+        return 0;
+    } else if (reply.type != NBD_REP_SERVER) {
+        error_setg(errp, "Unexpected reply type %" PRIx32 " expected %x",
+                   reply.type, NBD_REP_SERVER);
+        nbd_send_opt_abort(ioc);
+        return -1;
+    }
+
+    if (len < sizeof(namelen) || len > NBD_MAX_BUFFER_SIZE) {
+        error_setg(errp, "incorrect option length %" PRIu32, len);
+        nbd_send_opt_abort(ioc);
+        return -1;
+    }
+    if (nbd_read(ioc, &namelen, sizeof(namelen), errp) < 0) {
+        error_prepend(errp, "failed to read option name length: ");
+        nbd_send_opt_abort(ioc);
+        return -1;
+    }
+    namelen = be32_to_cpu(namelen);
+    len -= sizeof(namelen);
+    if (len < namelen) {
+        error_setg(errp, "incorrect option name length");
+        nbd_send_opt_abort(ioc);
+        return -1;
+    }
+    if (namelen != strlen(want)) {
+        if (nbd_drop(ioc, len, errp) < 0) {
+            error_prepend(errp,
+                          "failed to skip export name with wrong length: ");
+            nbd_send_opt_abort(ioc);
+            return -1;
+        }
+        return 1;
+    }
+
+    assert(namelen < sizeof(name));
+    if (nbd_read(ioc, name, namelen, errp) < 0) {
+        error_prepend(errp, "failed to read export name: ");
+        nbd_send_opt_abort(ioc);
+        return -1;
+    }
+    name[namelen] = '\0';
+    len -= namelen;
+    if (nbd_drop(ioc, len, errp) < 0) {
+        error_prepend(errp, "failed to read export description: ");
+        nbd_send_opt_abort(ioc);
+        return -1;
+    }
+    if (!strcmp(name, want)) {
+        *match = true;
+    }
+    return 1;
+}
+
+
+/* Returns -1 if NBD_OPT_GO proves the export @wantname cannot be
+ * used, 0 if NBD_OPT_GO is unsupported (fall back to NBD_OPT_LIST and
+ * NBD_OPT_EXPORT_NAME in that case), and > 0 if the export is good to
+ * go (with @info populated). */
+static int nbd_opt_go(QIOChannel *ioc, const char *wantname,
+                      NBDExportInfo *info, Error **errp)
+{
+    nbd_opt_reply reply;
+    uint32_t len = strlen(wantname);
+    uint16_t type;
+    int error;
+    char *buf;
+
+    /* The protocol requires that the server send NBD_INFO_EXPORT with
+     * a non-zero flags (at least NBD_FLAG_HAS_FLAGS must be set); so
+     * flags still 0 is a witness of a broken server. */
+    info->flags = 0;
+
+    trace_nbd_opt_go_start(wantname);
+    buf = g_malloc(4 + len + 2 + 2 * info->request_sizes + 1);
+    stl_be_p(buf, len);
+    memcpy(buf + 4, wantname, len);
+    /* At most one request, everything else up to server */
+    stw_be_p(buf + 4 + len, info->request_sizes);
+    if (info->request_sizes) {
+        stw_be_p(buf + 4 + len + 2, NBD_INFO_BLOCK_SIZE);
+    }
+    error = nbd_send_option_request(ioc, NBD_OPT_GO,
+                                    4 + len + 2 + 2 * info->request_sizes,
+                                    buf, errp);
+    g_free(buf);
+    if (error < 0) {
+        return -1;
+    }
+
+    while (1) {
+        if (nbd_receive_option_reply(ioc, NBD_OPT_GO, &reply, errp) < 0) {
+            return -1;
+        }
+        error = nbd_handle_reply_err(ioc, &reply, errp);
+        if (error <= 0) {
+            return error;
+        }
+        len = reply.length;
+
+        if (reply.type == NBD_REP_ACK) {
+            /* Server is done sending info and moved into transmission
+               phase, but make sure it sent flags */
+            if (len) {
+                error_setg(errp, "server sent invalid NBD_REP_ACK");
+                return -1;
+            }
+            if (!info->flags) {
+                error_setg(errp, "broken server omitted NBD_INFO_EXPORT");
+                return -1;
+            }
+            trace_nbd_opt_go_success();
+            return 1;
+        }
+        if (reply.type != NBD_REP_INFO) {
+            error_setg(errp, "unexpected reply type %" PRIx32
+                       " (%s), expected %x",
+                       reply.type, nbd_rep_lookup(reply.type), NBD_REP_INFO);
+            nbd_send_opt_abort(ioc);
+            return -1;
+        }
+        if (len < sizeof(type)) {
+            error_setg(errp, "NBD_REP_INFO length %" PRIu32 " is too short",
+                       len);
+            nbd_send_opt_abort(ioc);
+            return -1;
+        }
+        if (nbd_read(ioc, &type, sizeof(type), errp) < 0) {
+            error_prepend(errp, "failed to read info type: ");
+            nbd_send_opt_abort(ioc);
+            return -1;
+        }
+        len -= sizeof(type);
+        be16_to_cpus(&type);
+        switch (type) {
+        case NBD_INFO_EXPORT:
+            if (len != sizeof(info->size) + sizeof(info->flags)) {
+                error_setg(errp, "remaining export info len %" PRIu32
+                           " is unexpected size", len);
+                nbd_send_opt_abort(ioc);
+                return -1;
+            }
+            if (nbd_read(ioc, &info->size, sizeof(info->size), errp) < 0) {
+                error_prepend(errp, "failed to read info size: ");
+                nbd_send_opt_abort(ioc);
+                return -1;
+            }
+            be64_to_cpus(&info->size);
+            if (nbd_read(ioc, &info->flags, sizeof(info->flags), errp) < 0) {
+                error_prepend(errp, "failed to read info flags: ");
+                nbd_send_opt_abort(ioc);
+                return -1;
+            }
+            be16_to_cpus(&info->flags);
+            trace_nbd_receive_negotiate_size_flags(info->size, info->flags);
+            break;
+
+        case NBD_INFO_BLOCK_SIZE:
+            if (len != sizeof(info->min_block) * 3) {
+                error_setg(errp, "remaining export info len %" PRIu32
+                           " is unexpected size", len);
+                nbd_send_opt_abort(ioc);
+                return -1;
+            }
+            if (nbd_read(ioc, &info->min_block, sizeof(info->min_block),
+                         errp) < 0) {
+                error_prepend(errp, "failed to read info minimum block size: ");
+                nbd_send_opt_abort(ioc);
+                return -1;
+            }
+            be32_to_cpus(&info->min_block);
+            if (!is_power_of_2(info->min_block)) {
+                error_setg(errp, "server minimum block size %" PRId32
+                           "is not a power of two", info->min_block);
+                nbd_send_opt_abort(ioc);
+                return -1;
+            }
+            if (nbd_read(ioc, &info->opt_block, sizeof(info->opt_block),
+                         errp) < 0) {
+                error_prepend(errp,
+                              "failed to read info preferred block size: ");
+                nbd_send_opt_abort(ioc);
+                return -1;
+            }
+            be32_to_cpus(&info->opt_block);
+            if (!is_power_of_2(info->opt_block) ||
+                info->opt_block < info->min_block) {
+                error_setg(errp, "server preferred block size %" PRId32
+                           "is not valid", info->opt_block);
+                nbd_send_opt_abort(ioc);
+                return -1;
+            }
+            if (nbd_read(ioc, &info->max_block, sizeof(info->max_block),
+                         errp) < 0) {
+                error_prepend(errp, "failed to read info maximum block size: ");
+                nbd_send_opt_abort(ioc);
+                return -1;
+            }
+            be32_to_cpus(&info->max_block);
+            trace_nbd_opt_go_info_block_size(info->min_block, info->opt_block,
+                                             info->max_block);
+            break;
+
+        default:
+            trace_nbd_opt_go_info_unknown(type, nbd_info_lookup(type));
+            if (nbd_drop(ioc, len, errp) < 0) {
+                error_prepend(errp, "Failed to read info payload: ");
+                nbd_send_opt_abort(ioc);
+                return -1;
+            }
+            break;
+        }
+    }
+}
+
+/* Return -1 on failure, 0 if wantname is an available export. */
+static int nbd_receive_query_exports(QIOChannel *ioc,
+                                     const char *wantname,
+                                     Error **errp)
+{
+    bool foundExport = false;
+
+    trace_nbd_receive_query_exports_start(wantname);
+    if (nbd_send_option_request(ioc, NBD_OPT_LIST, 0, NULL, errp) < 0) {
+        return -1;
+    }
+
+    while (1) {
+        int ret = nbd_receive_list(ioc, wantname, &foundExport, errp);
+
+        if (ret < 0) {
+            /* Server gave unexpected reply */
+            return -1;
+        } else if (ret == 0) {
+            /* Done iterating. */
+            if (!foundExport) {
+                error_setg(errp, "No export with name '%s' available",
+                           wantname);
+                nbd_send_opt_abort(ioc);
+                return -1;
+            }
+            trace_nbd_receive_query_exports_success(wantname);
+            return 0;
+        }
+    }
+}
+
+/* nbd_request_simple_option: Send an option request, and parse the reply
+ * return 1 for successful negotiation,
+ *        0 if operation is unsupported,
+ *        -1 with errp set for any other error
+ */
+static int nbd_request_simple_option(QIOChannel *ioc, int opt, Error **errp)
+{
+    nbd_opt_reply reply;
+    int error;
+
+    if (nbd_send_option_request(ioc, opt, 0, NULL, errp) < 0) {
+        return -1;
+    }
+
+    if (nbd_receive_option_reply(ioc, opt, &reply, errp) < 0) {
+        return -1;
+    }
+    error = nbd_handle_reply_err(ioc, &reply, errp);
+    if (error <= 0) {
+        return error;
+    }
+
+    if (reply.type != NBD_REP_ACK) {
+        error_setg(errp, "Server answered option %d (%s) with unexpected "
+                   "reply %" PRIx32 " (%s)", opt, nbd_opt_lookup(opt),
+                   reply.type, nbd_rep_lookup(reply.type));
+        nbd_send_opt_abort(ioc);
+        return -1;
+    }
+
+    if (reply.length != 0) {
+        error_setg(errp, "Option %d ('%s') response length is %" PRIu32
+                   " (it should be zero)", opt, nbd_opt_lookup(opt),
+                   reply.length);
+        nbd_send_opt_abort(ioc);
+        return -1;
+    }
+
+    return 1;
+}
+
 static QIOChannel *nbd_receive_starttls(QIOChannel *ioc,
                                         QCryptoTLSCreds *tlscreds,
                                         const char *hostname, Error **errp)
 {
-    uint64_t magic = cpu_to_be64(NBD_OPTS_MAGIC);
-    uint32_t opt = cpu_to_be32(NBD_OPT_STARTTLS);
-    uint32_t length = 0;
-    uint32_t type;
+    int ret;
     QIOChannelTLS *tioc;
     struct NBDTLSHandshakeData data = { 0 };
 
-    TRACE("Requesting TLS from server");
-    if (write_sync(ioc, &magic, sizeof(magic)) != sizeof(magic)) {
-        error_setg(errp, "Failed to send option magic");
+    ret = nbd_request_simple_option(ioc, NBD_OPT_STARTTLS, errp);
+    if (ret <= 0) {
+        if (ret == 0) {
+            error_setg(errp, "Server don't support STARTTLS option");
+            nbd_send_opt_abort(ioc);
+        }
         return NULL;
     }
 
-    if (write_sync(ioc, &opt, sizeof(opt)) != sizeof(opt)) {
-        error_setg(errp, "Failed to send option number");
-        return NULL;
-    }
-
-    if (write_sync(ioc, &length, sizeof(length)) != sizeof(length)) {
-        error_setg(errp, "Failed to send option length");
-        return NULL;
-    }
-
-    TRACE("Getting TLS reply from server1");
-    if (read_sync(ioc, &magic, sizeof(magic)) != sizeof(magic)) {
-        error_setg(errp, "failed to read option magic");
-        return NULL;
-    }
-    magic = be64_to_cpu(magic);
-    if (magic != NBD_REP_MAGIC) {
-        error_setg(errp, "Unexpected option magic");
-        return NULL;
-    }
-    TRACE("Getting TLS reply from server2");
-    if (read_sync(ioc, &opt, sizeof(opt)) != sizeof(opt)) {
-        error_setg(errp, "failed to read option");
-        return NULL;
-    }
-    opt = be32_to_cpu(opt);
-    if (opt != NBD_OPT_STARTTLS) {
-        error_setg(errp, "Unexpected option type %" PRIx32 " expected %x",
-                   opt, NBD_OPT_STARTTLS);
-        return NULL;
-    }
-
-    TRACE("Getting TLS reply from server");
-    if (read_sync(ioc, &type, sizeof(type)) != sizeof(type)) {
-        error_setg(errp, "failed to read option type");
-        return NULL;
-    }
-    type = be32_to_cpu(type);
-    if (type != NBD_REP_ACK) {
-        error_setg(errp, "Server rejected request to start TLS %" PRIx32,
-                   type);
-        return NULL;
-    }
-
-    TRACE("Getting TLS reply from server");
-    if (read_sync(ioc, &length, sizeof(length)) != sizeof(length)) {
-        error_setg(errp, "failed to read option length");
-        return NULL;
-    }
-    length = be32_to_cpu(length);
-    if (length != 0) {
-        error_setg(errp, "Start TLS response was not zero %" PRIu32,
-                   length);
-        return NULL;
-    }
-
-    TRACE("TLS request approved, setting up TLS");
+    trace_nbd_receive_starttls_new_client();
     tioc = qio_channel_tls_new_client(ioc, tlscreds, hostname, errp);
     if (!tioc) {
         return NULL;
     }
+    qio_channel_set_name(QIO_CHANNEL(tioc), "nbd-client-tls");
     data.loop = g_main_loop_new(g_main_context_default(), FALSE);
-    TRACE("Starting TLS handshake");
+    trace_nbd_receive_starttls_tls_handshake();
     qio_channel_tls_handshake(tioc,
                               nbd_tls_handshake,
                               &data,
@@ -408,18 +595,20 @@ static QIOChannel *nbd_receive_starttls(QIOChannel *ioc,
 }
 
 
-int nbd_receive_negotiate(QIOChannel *ioc, const char *name, uint16_t *flags,
+int nbd_receive_negotiate(QIOChannel *ioc, const char *name,
                           QCryptoTLSCreds *tlscreds, const char *hostname,
-                          QIOChannel **outioc,
-                          off_t *size, Error **errp)
+                          QIOChannel **outioc, NBDExportInfo *info,
+                          Error **errp)
 {
     char buf[256];
-    uint64_t magic, s;
+    uint64_t magic;
     int rc;
+    bool zeroes = true;
+    bool structured_reply = info->structured_reply;
 
-    TRACE("Receiving negotiation tlscreds=%p hostname=%s.",
-          tlscreds, hostname ? hostname : "<null>");
+    trace_nbd_receive_negotiate(tlscreds, hostname ? hostname : "<null>");
 
+    info->structured_reply = false;
     rc = -EINVAL;
 
     if (outioc) {
@@ -430,8 +619,8 @@ int nbd_receive_negotiate(QIOChannel *ioc, const char *name, uint16_t *flags,
         goto fail;
     }
 
-    if (read_sync(ioc, buf, 8) != 8) {
-        error_setg(errp, "Failed to read data");
+    if (nbd_read(ioc, buf, 8, errp) < 0) {
+        error_prepend(errp, "Failed to read data: ");
         goto fail;
     }
 
@@ -441,52 +630,44 @@ int nbd_receive_negotiate(QIOChannel *ioc, const char *name, uint16_t *flags,
         goto fail;
     }
 
-    TRACE("Magic is %c%c%c%c%c%c%c%c",
-          qemu_isprint(buf[0]) ? buf[0] : '.',
-          qemu_isprint(buf[1]) ? buf[1] : '.',
-          qemu_isprint(buf[2]) ? buf[2] : '.',
-          qemu_isprint(buf[3]) ? buf[3] : '.',
-          qemu_isprint(buf[4]) ? buf[4] : '.',
-          qemu_isprint(buf[5]) ? buf[5] : '.',
-          qemu_isprint(buf[6]) ? buf[6] : '.',
-          qemu_isprint(buf[7]) ? buf[7] : '.');
+    magic = ldq_be_p(buf);
+    trace_nbd_receive_negotiate_magic(magic);
 
     if (memcmp(buf, "NBDMAGIC", 8) != 0) {
         error_setg(errp, "Invalid magic received");
         goto fail;
     }
 
-    if (read_sync(ioc, &magic, sizeof(magic)) != sizeof(magic)) {
-        error_setg(errp, "Failed to read magic");
+    if (nbd_read(ioc, &magic, sizeof(magic), errp) < 0) {
+        error_prepend(errp, "Failed to read magic: ");
         goto fail;
     }
     magic = be64_to_cpu(magic);
-    TRACE("Magic is 0x%" PRIx64, magic);
+    trace_nbd_receive_negotiate_magic(magic);
 
     if (magic == NBD_OPTS_MAGIC) {
         uint32_t clientflags = 0;
-        uint32_t opt;
-        uint32_t namesize;
         uint16_t globalflags;
         bool fixedNewStyle = false;
 
-        if (read_sync(ioc, &globalflags, sizeof(globalflags)) !=
-            sizeof(globalflags)) {
-            error_setg(errp, "Failed to read server flags");
+        if (nbd_read(ioc, &globalflags, sizeof(globalflags), errp) < 0) {
+            error_prepend(errp, "Failed to read server flags: ");
             goto fail;
         }
         globalflags = be16_to_cpu(globalflags);
-        TRACE("Global flags are %" PRIx32, globalflags);
+        trace_nbd_receive_negotiate_server_flags(globalflags);
         if (globalflags & NBD_FLAG_FIXED_NEWSTYLE) {
             fixedNewStyle = true;
-            TRACE("Server supports fixed new style");
             clientflags |= NBD_FLAG_C_FIXED_NEWSTYLE;
+        }
+        if (globalflags & NBD_FLAG_NO_ZEROES) {
+            zeroes = false;
+            clientflags |= NBD_FLAG_C_NO_ZEROES;
         }
         /* client requested flags */
         clientflags = cpu_to_be32(clientflags);
-        if (write_sync(ioc, &clientflags, sizeof(clientflags)) !=
-            sizeof(clientflags)) {
-            error_setg(errp, "Failed to send clientflags field");
+        if (nbd_write(ioc, &clientflags, sizeof(clientflags), errp) < 0) {
+            error_prepend(errp, "Failed to send clientflags field: ");
             goto fail;
         }
         if (tlscreds) {
@@ -502,53 +683,62 @@ int nbd_receive_negotiate(QIOChannel *ioc, const char *name, uint16_t *flags,
             }
         }
         if (!name) {
-            TRACE("Using default NBD export name \"\"");
+            trace_nbd_receive_negotiate_default_name();
             name = "";
         }
         if (fixedNewStyle) {
+            int result;
+
+            if (structured_reply) {
+                result = nbd_request_simple_option(ioc,
+                                                   NBD_OPT_STRUCTURED_REPLY,
+                                                   errp);
+                if (result < 0) {
+                    goto fail;
+                }
+                info->structured_reply = result == 1;
+            }
+
+            /* Try NBD_OPT_GO first - if it works, we are done (it
+             * also gives us a good message if the server requires
+             * TLS).  If it is not available, fall back to
+             * NBD_OPT_LIST for nicer error messages about a missing
+             * export, then use NBD_OPT_EXPORT_NAME.  */
+            result = nbd_opt_go(ioc, name, info, errp);
+            if (result < 0) {
+                goto fail;
+            }
+            if (result > 0) {
+                return 0;
+            }
             /* Check our desired export is present in the
              * server export list. Since NBD_OPT_EXPORT_NAME
              * cannot return an error message, running this
-             * query gives us good error reporting if the
-             * server required TLS
+             * query gives us better error reporting if the
+             * export name is not available.
              */
             if (nbd_receive_query_exports(ioc, name, errp) < 0) {
                 goto fail;
             }
         }
-        /* write the export name */
-        magic = cpu_to_be64(magic);
-        if (write_sync(ioc, &magic, sizeof(magic)) != sizeof(magic)) {
-            error_setg(errp, "Failed to send export name magic");
-            goto fail;
-        }
-        opt = cpu_to_be32(NBD_OPT_EXPORT_NAME);
-        if (write_sync(ioc, &opt, sizeof(opt)) != sizeof(opt)) {
-            error_setg(errp, "Failed to send export name option number");
-            goto fail;
-        }
-        namesize = cpu_to_be32(strlen(name));
-        if (write_sync(ioc, &namesize, sizeof(namesize)) !=
-            sizeof(namesize)) {
-            error_setg(errp, "Failed to send export name length");
-            goto fail;
-        }
-        if (write_sync(ioc, (char *)name, strlen(name)) != strlen(name)) {
-            error_setg(errp, "Failed to send export name");
+        /* write the export name request */
+        if (nbd_send_option_request(ioc, NBD_OPT_EXPORT_NAME, -1, name,
+                                    errp) < 0) {
             goto fail;
         }
 
-        if (read_sync(ioc, &s, sizeof(s)) != sizeof(s)) {
-            error_setg(errp, "Failed to read export length");
+        /* Read the response */
+        if (nbd_read(ioc, &info->size, sizeof(info->size), errp) < 0) {
+            error_prepend(errp, "Failed to read export length: ");
             goto fail;
         }
-        *size = be64_to_cpu(s);
+        be64_to_cpus(&info->size);
 
-        if (read_sync(ioc, flags, sizeof(*flags)) != sizeof(*flags)) {
-            error_setg(errp, "Failed to read export flags");
+        if (nbd_read(ioc, &info->flags, sizeof(info->flags), errp) < 0) {
+            error_prepend(errp, "Failed to read export flags: ");
             goto fail;
         }
-        be16_to_cpus(flags);
+        be16_to_cpus(&info->flags);
     } else if (magic == NBD_CLIENT_MAGIC) {
         uint32_t oldflags;
 
@@ -561,15 +751,14 @@ int nbd_receive_negotiate(QIOChannel *ioc, const char *name, uint16_t *flags,
             goto fail;
         }
 
-        if (read_sync(ioc, &s, sizeof(s)) != sizeof(s)) {
-            error_setg(errp, "Failed to read export length");
+        if (nbd_read(ioc, &info->size, sizeof(info->size), errp) < 0) {
+            error_prepend(errp, "Failed to read export length: ");
             goto fail;
         }
-        *size = be64_to_cpu(s);
-        TRACE("Size is %" PRIu64, *size);
+        be64_to_cpus(&info->size);
 
-        if (read_sync(ioc, &oldflags, sizeof(oldflags)) != sizeof(oldflags)) {
-            error_setg(errp, "Failed to read export flags");
+        if (nbd_read(ioc, &oldflags, sizeof(oldflags), errp) < 0) {
+            error_prepend(errp, "Failed to read export flags: ");
             goto fail;
         }
         be32_to_cpus(&oldflags);
@@ -577,15 +766,15 @@ int nbd_receive_negotiate(QIOChannel *ioc, const char *name, uint16_t *flags,
             error_setg(errp, "Unexpected export flags %0x" PRIx32, oldflags);
             goto fail;
         }
-        *flags = oldflags;
+        info->flags = oldflags;
     } else {
         error_setg(errp, "Bad magic received");
         goto fail;
     }
 
-    TRACE("Size is %" PRIu64 ", export flags %" PRIx16, *size, *flags);
-    if (read_sync(ioc, &buf, 124) != 124) {
-        error_setg(errp, "Failed to read reserved block");
+    trace_nbd_receive_negotiate_size_flags(info->size, info->flags);
+    if (zeroes && nbd_drop(ioc, 124, errp) < 0) {
+        error_prepend(errp, "Failed to read reserved block: ");
         goto fail;
     }
     rc = 0;
@@ -595,60 +784,67 @@ fail:
 }
 
 #ifdef __linux__
-int nbd_init(int fd, QIOChannelSocket *sioc, uint16_t flags, off_t size)
+int nbd_init(int fd, QIOChannelSocket *sioc, NBDExportInfo *info,
+             Error **errp)
 {
-    unsigned long sectors = size / BDRV_SECTOR_SIZE;
-    if (size / BDRV_SECTOR_SIZE != sectors) {
-        LOG("Export size %lld too large for 32-bit kernel", (long long) size);
+    unsigned long sector_size = MAX(BDRV_SECTOR_SIZE, info->min_block);
+    unsigned long sectors = info->size / sector_size;
+
+    /* FIXME: Once the kernel module is patched to honor block sizes,
+     * and to advertise that fact to user space, we should update the
+     * hand-off to the kernel to use any block sizes we learned. */
+    assert(!info->request_sizes);
+    if (info->size / sector_size != sectors) {
+        error_setg(errp, "Export size %" PRIu64 " too large for 32-bit kernel",
+                   info->size);
         return -E2BIG;
     }
 
-    TRACE("Setting NBD socket");
+    trace_nbd_init_set_socket();
 
     if (ioctl(fd, NBD_SET_SOCK, (unsigned long) sioc->fd) < 0) {
         int serrno = errno;
-        LOG("Failed to set NBD socket");
+        error_setg(errp, "Failed to set NBD socket");
         return -serrno;
     }
 
-    TRACE("Setting block size to %lu", (unsigned long)BDRV_SECTOR_SIZE);
+    trace_nbd_init_set_block_size(sector_size);
 
-    if (ioctl(fd, NBD_SET_BLKSIZE, (unsigned long)BDRV_SECTOR_SIZE) < 0) {
+    if (ioctl(fd, NBD_SET_BLKSIZE, sector_size) < 0) {
         int serrno = errno;
-        LOG("Failed setting NBD block size");
+        error_setg(errp, "Failed setting NBD block size");
         return -serrno;
     }
 
-    TRACE("Setting size to %lu block(s)", sectors);
-    if (size % BDRV_SECTOR_SIZE) {
-        TRACE("Ignoring trailing %d bytes of export",
-              (int) (size % BDRV_SECTOR_SIZE));
+    trace_nbd_init_set_size(sectors);
+    if (info->size % sector_size) {
+        trace_nbd_init_trailing_bytes(info->size % sector_size);
     }
 
     if (ioctl(fd, NBD_SET_SIZE_BLOCKS, sectors) < 0) {
         int serrno = errno;
-        LOG("Failed setting size (in blocks)");
+        error_setg(errp, "Failed setting size (in blocks)");
         return -serrno;
     }
 
-    if (ioctl(fd, NBD_SET_FLAGS, (unsigned long) flags) < 0) {
+    if (ioctl(fd, NBD_SET_FLAGS, (unsigned long) info->flags) < 0) {
         if (errno == ENOTTY) {
-            int read_only = (flags & NBD_FLAG_READ_ONLY) != 0;
-            TRACE("Setting readonly attribute");
+            int read_only = (info->flags & NBD_FLAG_READ_ONLY) != 0;
+            trace_nbd_init_set_readonly();
 
             if (ioctl(fd, BLKROSET, (unsigned long) &read_only) < 0) {
                 int serrno = errno;
-                LOG("Failed setting read-only attribute");
+                error_setg(errp, "Failed setting read-only attribute");
                 return -serrno;
             }
         } else {
             int serrno = errno;
-            LOG("Failed setting flags");
+            error_setg(errp, "Failed setting flags");
             return -serrno;
         }
     }
 
-    TRACE("Negotiation ended");
+    trace_nbd_init_finish();
 
     return 0;
 }
@@ -658,7 +854,7 @@ int nbd_client(int fd)
     int ret;
     int serrno;
 
-    TRACE("Doing NBD loop");
+    trace_nbd_client_loop();
 
     ret = ioctl(fd, NBD_DO_IT);
     if (ret < 0 && errno == EPIPE) {
@@ -670,12 +866,12 @@ int nbd_client(int fd)
     }
     serrno = errno;
 
-    TRACE("NBD loop returned %d: %s", ret, strerror(serrno));
+    trace_nbd_client_loop_ret(ret, strerror(serrno));
 
-    TRACE("Clearing NBD queue");
+    trace_nbd_client_clear_queue();
     ioctl(fd, NBD_CLEAR_QUE);
 
-    TRACE("Clearing NBD socket");
+    trace_nbd_client_clear_socket();
     ioctl(fd, NBD_CLEAR_SOCK);
 
     errno = serrno;
@@ -691,8 +887,10 @@ int nbd_disconnect(int fd)
 }
 
 #else
-int nbd_init(int fd, QIOChannelSocket *ioc, uint16_t flags, off_t size)
+int nbd_init(int fd, QIOChannelSocket *ioc, NBDExportInfo *info,
+	     Error **errp)
 {
+    error_setg(errp, "nbd_init is only supported on Linux");
     return -ENOTSUP;
 }
 
@@ -706,70 +904,121 @@ int nbd_disconnect(int fd)
 }
 #endif
 
-ssize_t nbd_send_request(QIOChannel *ioc, struct nbd_request *request)
+int nbd_send_request(QIOChannel *ioc, NBDRequest *request)
 {
     uint8_t buf[NBD_REQUEST_SIZE];
-    ssize_t ret;
 
-    TRACE("Sending request to server: "
-          "{ .from = %" PRIu64", .len = %" PRIu32 ", .handle = %" PRIu64
-          ", .type=%" PRIu32 " }",
-          request->from, request->len, request->handle, request->type);
+    trace_nbd_send_request(request->from, request->len, request->handle,
+                           request->flags, request->type,
+                           nbd_cmd_lookup(request->type));
 
     stl_be_p(buf, NBD_REQUEST_MAGIC);
-    stl_be_p(buf + 4, request->type);
+    stw_be_p(buf + 4, request->flags);
+    stw_be_p(buf + 6, request->type);
     stq_be_p(buf + 8, request->handle);
     stq_be_p(buf + 16, request->from);
     stl_be_p(buf + 24, request->len);
 
-    ret = write_sync(ioc, buf, sizeof(buf));
+    return nbd_write(ioc, buf, sizeof(buf), NULL);
+}
+
+/* nbd_receive_simple_reply
+ * Read simple reply except magic field (which should be already read).
+ * Payload is not read (payload is possible for CMD_READ, but here we even
+ * don't know whether it take place or not).
+ */
+static int nbd_receive_simple_reply(QIOChannel *ioc, NBDSimpleReply *reply,
+                                    Error **errp)
+{
+    int ret;
+
+    assert(reply->magic == NBD_SIMPLE_REPLY_MAGIC);
+
+    ret = nbd_read(ioc, (uint8_t *)reply + sizeof(reply->magic),
+                   sizeof(*reply) - sizeof(reply->magic), errp);
     if (ret < 0) {
         return ret;
     }
 
-    if (ret != sizeof(buf)) {
-        LOG("writing to socket failed");
-        return -EINVAL;
-    }
+    be32_to_cpus(&reply->error);
+    be64_to_cpus(&reply->handle);
+
     return 0;
 }
 
-ssize_t nbd_receive_reply(QIOChannel *ioc, struct nbd_reply *reply)
+/* nbd_receive_structured_reply_chunk
+ * Read structured reply chunk except magic field (which should be already
+ * read).
+ * Payload is not read.
+ */
+static int nbd_receive_structured_reply_chunk(QIOChannel *ioc,
+                                              NBDStructuredReplyChunk *chunk,
+                                              Error **errp)
 {
-    uint8_t buf[NBD_REPLY_SIZE];
-    uint32_t magic;
-    ssize_t ret;
+    int ret;
 
-    ret = read_sync(ioc, buf, sizeof(buf));
+    assert(chunk->magic == NBD_STRUCTURED_REPLY_MAGIC);
+
+    ret = nbd_read(ioc, (uint8_t *)chunk + sizeof(chunk->magic),
+                   sizeof(*chunk) - sizeof(chunk->magic), errp);
     if (ret < 0) {
         return ret;
     }
 
-    if (ret != sizeof(buf)) {
-        LOG("read failed");
-        return -EINVAL;
-    }
+    be16_to_cpus(&chunk->flags);
+    be16_to_cpus(&chunk->type);
+    be64_to_cpus(&chunk->handle);
+    be32_to_cpus(&chunk->length);
 
-    /* Reply
-       [ 0 ..  3]    magic   (NBD_REPLY_MAGIC)
-       [ 4 ..  7]    error   (0 == no error)
-       [ 7 .. 15]    handle
-     */
-
-    magic = ldl_be_p(buf);
-    reply->error  = ldl_be_p(buf + 4);
-    reply->handle = ldq_be_p(buf + 8);
-
-    reply->error = nbd_errno_to_system_errno(reply->error);
-
-    TRACE("Got reply: { magic = 0x%" PRIx32 ", .error = % " PRId32
-          ", handle = %" PRIu64" }",
-          magic, reply->error, reply->handle);
-
-    if (magic != NBD_REPLY_MAGIC) {
-        LOG("invalid magic (got 0x%" PRIx32 ")", magic);
-        return -EINVAL;
-    }
     return 0;
+}
+
+/* nbd_receive_reply
+ * Returns 1 on success
+ *         0 on eof, when no data was read (errp is not set)
+ *         negative errno on failure (errp is set)
+ */
+int nbd_receive_reply(QIOChannel *ioc, NBDReply *reply, Error **errp)
+{
+    int ret;
+    const char *type;
+
+    ret = nbd_read_eof(ioc, &reply->magic, sizeof(reply->magic), errp);
+    if (ret <= 0) {
+        return ret;
+    }
+
+    be32_to_cpus(&reply->magic);
+
+    switch (reply->magic) {
+    case NBD_SIMPLE_REPLY_MAGIC:
+        ret = nbd_receive_simple_reply(ioc, &reply->simple, errp);
+        if (ret < 0) {
+            break;
+        }
+        trace_nbd_receive_simple_reply(reply->simple.error,
+                                       nbd_err_lookup(reply->simple.error),
+                                       reply->handle);
+        break;
+    case NBD_STRUCTURED_REPLY_MAGIC:
+        ret = nbd_receive_structured_reply_chunk(ioc, &reply->structured, errp);
+        if (ret < 0) {
+            break;
+        }
+        type = nbd_reply_type_lookup(reply->structured.type);
+        trace_nbd_receive_structured_reply_chunk(reply->structured.flags,
+                                                 reply->structured.type, type,
+                                                 reply->structured.handle,
+                                                 reply->structured.length);
+        break;
+    default:
+        error_setg(errp, "invalid magic (got 0x%" PRIx32 ")", reply->magic);
+        return -EINVAL;
+    }
+    if (ret < 0) {
+        return ret;
+    }
+
+    return 1;
 }
 

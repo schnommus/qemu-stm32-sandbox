@@ -90,10 +90,8 @@ if( cmd == val ) { \
     output_cmd( IPC_STAT );
     output_cmd( IPC_INFO );
     /* msgctl() commands */
-    #ifdef __USER_MISC
     output_cmd( MSG_STAT );
     output_cmd( MSG_INFO );
-    #endif
     /* shmctl() commands */
     output_cmd( SHM_LOCK );
     output_cmd( SHM_UNLOCK );
@@ -152,6 +150,187 @@ print_signal(abi_ulong arg, int last)
         return;
     }
     gemu_log("%s%s", signal_name, get_comma(last));
+}
+
+static void print_si_code(int arg)
+{
+    const char *codename = NULL;
+
+    switch (arg) {
+    case SI_USER:
+        codename = "SI_USER";
+        break;
+    case SI_KERNEL:
+        codename = "SI_KERNEL";
+        break;
+    case SI_QUEUE:
+        codename = "SI_QUEUE";
+        break;
+    case SI_TIMER:
+        codename = "SI_TIMER";
+        break;
+    case SI_MESGQ:
+        codename = "SI_MESGQ";
+        break;
+    case SI_ASYNCIO:
+        codename = "SI_ASYNCIO";
+        break;
+    case SI_SIGIO:
+        codename = "SI_SIGIO";
+        break;
+    case SI_TKILL:
+        codename = "SI_TKILL";
+        break;
+    default:
+        gemu_log("%d", arg);
+        return;
+    }
+    gemu_log("%s", codename);
+}
+
+static void get_target_siginfo(target_siginfo_t *tinfo,
+                                const target_siginfo_t *info)
+{
+    abi_ulong sival_ptr;
+
+    int sig;
+    int si_errno;
+    int si_code;
+    int si_type;
+
+    __get_user(sig, &info->si_signo);
+    __get_user(si_errno, &tinfo->si_errno);
+    __get_user(si_code, &info->si_code);
+
+    tinfo->si_signo = sig;
+    tinfo->si_errno = si_errno;
+    tinfo->si_code = si_code;
+
+    /* Ensure we don't leak random junk to the guest later */
+    memset(tinfo->_sifields._pad, 0, sizeof(tinfo->_sifields._pad));
+
+    /* This is awkward, because we have to use a combination of
+     * the si_code and si_signo to figure out which of the union's
+     * members are valid. (Within the host kernel it is always possible
+     * to tell, but the kernel carefully avoids giving userspace the
+     * high 16 bits of si_code, so we don't have the information to
+     * do this the easy way...) We therefore make our best guess,
+     * bearing in mind that a guest can spoof most of the si_codes
+     * via rt_sigqueueinfo() if it likes.
+     *
+     * Once we have made our guess, we record it in the top 16 bits of
+     * the si_code, so that print_siginfo() later can use it.
+     * print_siginfo() will strip these top bits out before printing
+     * the si_code.
+     */
+
+    switch (si_code) {
+    case SI_USER:
+    case SI_TKILL:
+    case SI_KERNEL:
+        /* Sent via kill(), tkill() or tgkill(), or direct from the kernel.
+         * These are the only unspoofable si_code values.
+         */
+        __get_user(tinfo->_sifields._kill._pid, &info->_sifields._kill._pid);
+        __get_user(tinfo->_sifields._kill._uid, &info->_sifields._kill._uid);
+        si_type = QEMU_SI_KILL;
+        break;
+    default:
+        /* Everything else is spoofable. Make best guess based on signal */
+        switch (sig) {
+        case TARGET_SIGCHLD:
+            __get_user(tinfo->_sifields._sigchld._pid,
+                       &info->_sifields._sigchld._pid);
+            __get_user(tinfo->_sifields._sigchld._uid,
+                       &info->_sifields._sigchld._uid);
+            __get_user(tinfo->_sifields._sigchld._status,
+                       &info->_sifields._sigchld._status);
+            __get_user(tinfo->_sifields._sigchld._utime,
+                       &info->_sifields._sigchld._utime);
+            __get_user(tinfo->_sifields._sigchld._stime,
+                       &info->_sifields._sigchld._stime);
+            si_type = QEMU_SI_CHLD;
+            break;
+        case TARGET_SIGIO:
+            __get_user(tinfo->_sifields._sigpoll._band,
+                       &info->_sifields._sigpoll._band);
+            __get_user(tinfo->_sifields._sigpoll._fd,
+                       &info->_sifields._sigpoll._fd);
+            si_type = QEMU_SI_POLL;
+            break;
+        default:
+            /* Assume a sigqueue()/mq_notify()/rt_sigqueueinfo() source. */
+            __get_user(tinfo->_sifields._rt._pid, &info->_sifields._rt._pid);
+            __get_user(tinfo->_sifields._rt._uid, &info->_sifields._rt._uid);
+            /* XXX: potential problem if 64 bit */
+            __get_user(sival_ptr, &info->_sifields._rt._sigval.sival_ptr);
+            tinfo->_sifields._rt._sigval.sival_ptr = sival_ptr;
+
+            si_type = QEMU_SI_RT;
+            break;
+        }
+        break;
+    }
+
+    tinfo->si_code = deposit32(si_code, 16, 16, si_type);
+}
+
+static void print_siginfo(const target_siginfo_t *tinfo)
+{
+    /* Print a target_siginfo_t in the format desired for printing
+     * signals being taken. We assume the target_siginfo_t is in the
+     * internal form where the top 16 bits of si_code indicate which
+     * part of the union is valid, rather than in the guest-visible
+     * form where the bottom 16 bits are sign-extended into the top 16.
+     */
+    int si_type = extract32(tinfo->si_code, 16, 16);
+    int si_code = sextract32(tinfo->si_code, 0, 16);
+
+    gemu_log("{si_signo=");
+    print_signal(tinfo->si_signo, 1);
+    gemu_log(", si_code=");
+    print_si_code(si_code);
+
+    switch (si_type) {
+    case QEMU_SI_KILL:
+        gemu_log(", si_pid=%u, si_uid=%u",
+                 (unsigned int)tinfo->_sifields._kill._pid,
+                 (unsigned int)tinfo->_sifields._kill._uid);
+        break;
+    case QEMU_SI_TIMER:
+        gemu_log(", si_timer1=%u, si_timer2=%u",
+                 tinfo->_sifields._timer._timer1,
+                 tinfo->_sifields._timer._timer2);
+        break;
+    case QEMU_SI_POLL:
+        gemu_log(", si_band=%d, si_fd=%d",
+                 tinfo->_sifields._sigpoll._band,
+                 tinfo->_sifields._sigpoll._fd);
+        break;
+    case QEMU_SI_FAULT:
+        gemu_log(", si_addr=");
+        print_pointer(tinfo->_sifields._sigfault._addr, 1);
+        break;
+    case QEMU_SI_CHLD:
+        gemu_log(", si_pid=%u, si_uid=%u, si_status=%d"
+                 ", si_utime=" TARGET_ABI_FMT_ld
+                 ", si_stime=" TARGET_ABI_FMT_ld,
+                 (unsigned int)(tinfo->_sifields._sigchld._pid),
+                 (unsigned int)(tinfo->_sifields._sigchld._uid),
+                 tinfo->_sifields._sigchld._status,
+                 tinfo->_sifields._sigchld._utime,
+                 tinfo->_sifields._sigchld._stime);
+        break;
+    case QEMU_SI_RT:
+        gemu_log(", si_pid=%u, si_uid=%u, si_sigval=" TARGET_ABI_FMT_ld,
+                 (unsigned int)tinfo->_sifields._rt._pid,
+                 (unsigned int)tinfo->_sifields._rt._uid,
+                 tinfo->_sifields._rt._sigval.sival_ptr);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    gemu_log("}");
 }
 
 static void
@@ -341,6 +520,69 @@ print_fdset(int n, abi_ulong target_fds_addr)
 }
 #endif
 
+#ifdef TARGET_NR_clock_adjtime
+/* IDs of the various system clocks */
+#define TARGET_CLOCK_REALTIME              0
+#define TARGET_CLOCK_MONOTONIC             1
+#define TARGET_CLOCK_PROCESS_CPUTIME_ID    2
+#define TARGET_CLOCK_THREAD_CPUTIME_ID     3
+#define TARGET_CLOCK_MONOTONIC_RAW         4
+#define TARGET_CLOCK_REALTIME_COARSE       5
+#define TARGET_CLOCK_MONOTONIC_COARSE      6
+#define TARGET_CLOCK_BOOTTIME              7
+#define TARGET_CLOCK_REALTIME_ALARM        8
+#define TARGET_CLOCK_BOOTTIME_ALARM        9
+#define TARGET_CLOCK_SGI_CYCLE             10
+#define TARGET_CLOCK_TAI                   11
+
+static void
+print_clockid(int clockid, int last)
+{
+    switch (clockid) {
+    case TARGET_CLOCK_REALTIME:
+        gemu_log("CLOCK_REALTIME");
+        break;
+    case TARGET_CLOCK_MONOTONIC:
+        gemu_log("CLOCK_MONOTONIC");
+        break;
+    case TARGET_CLOCK_PROCESS_CPUTIME_ID:
+        gemu_log("CLOCK_PROCESS_CPUTIME_ID");
+        break;
+    case TARGET_CLOCK_THREAD_CPUTIME_ID:
+        gemu_log("CLOCK_THREAD_CPUTIME_ID");
+        break;
+    case TARGET_CLOCK_MONOTONIC_RAW:
+        gemu_log("CLOCK_MONOTONIC_RAW");
+        break;
+    case TARGET_CLOCK_REALTIME_COARSE:
+        gemu_log("CLOCK_REALTIME_COARSE");
+        break;
+    case TARGET_CLOCK_MONOTONIC_COARSE:
+        gemu_log("CLOCK_MONOTONIC_COARSE");
+        break;
+    case TARGET_CLOCK_BOOTTIME:
+        gemu_log("CLOCK_BOOTTIME");
+        break;
+    case TARGET_CLOCK_REALTIME_ALARM:
+        gemu_log("CLOCK_REALTIME_ALARM");
+        break;
+    case TARGET_CLOCK_BOOTTIME_ALARM:
+        gemu_log("CLOCK_BOOTTIME_ALARM");
+        break;
+    case TARGET_CLOCK_SGI_CYCLE:
+        gemu_log("CLOCK_SGI_CYCLE");
+        break;
+    case TARGET_CLOCK_TAI:
+        gemu_log("CLOCK_TAI");
+        break;
+    default:
+        gemu_log("%d", clockid);
+        break;
+    }
+    gemu_log("%s", get_comma(last));
+}
+#endif
+
 /*
  * Sysycall specific output functions
  */
@@ -483,6 +725,52 @@ print_syscall_ret_newselect(const struct syscallname *name, abi_long ret)
 }
 #endif
 
+/* special meanings of adjtimex()' non-negative return values */
+#define TARGET_TIME_OK       0   /* clock synchronized, no leap second */
+#define TARGET_TIME_INS      1   /* insert leap second */
+#define TARGET_TIME_DEL      2   /* delete leap second */
+#define TARGET_TIME_OOP      3   /* leap second in progress */
+#define TARGET_TIME_WAIT     4   /* leap second has occurred */
+#define TARGET_TIME_ERROR    5   /* clock not synchronized */
+static void
+print_syscall_ret_adjtimex(const struct syscallname *name, abi_long ret)
+{
+    const char *errstr = NULL;
+
+    gemu_log(" = ");
+    if (ret < 0) {
+        gemu_log("-1 errno=%d", errno);
+        errstr = target_strerror(-ret);
+        if (errstr) {
+            gemu_log(" (%s)", errstr);
+        }
+    } else {
+        gemu_log(TARGET_ABI_FMT_ld, ret);
+        switch (ret) {
+        case TARGET_TIME_OK:
+            gemu_log(" TIME_OK (clock synchronized, no leap second)");
+            break;
+        case TARGET_TIME_INS:
+            gemu_log(" TIME_INS (insert leap second)");
+            break;
+        case TARGET_TIME_DEL:
+            gemu_log(" TIME_DEL (delete leap second)");
+            break;
+        case TARGET_TIME_OOP:
+            gemu_log(" TIME_OOP (leap second in progress)");
+            break;
+        case TARGET_TIME_WAIT:
+            gemu_log(" TIME_WAIT (leap second has occurred)");
+            break;
+        case TARGET_TIME_ERROR:
+            gemu_log(" TIME_ERROR (clock not synchronized)");
+            break;
+        }
+    }
+
+    gemu_log("\n");
+}
+
 UNUSED static struct flags access_flags[] = {
     FLAG_GENERIC(F_OK),
     FLAG_GENERIC(R_OK),
@@ -549,6 +837,10 @@ UNUSED static struct flags open_flags[] = {
 #endif
 #ifdef O_PATH
     FLAG_TARGET(O_PATH),
+#endif
+#ifdef O_TMPFILE
+    FLAG_TARGET(O_TMPFILE),
+    FLAG_TARGET(__O_TMPFILE),
 #endif
     FLAG_END,
 };
@@ -952,6 +1244,19 @@ print_chmod(const struct syscallname *name,
     print_syscall_prologue(name);
     print_string(arg0, 0);
     print_file_mode(arg1, 1);
+    print_syscall_epilogue(name);
+}
+#endif
+
+#ifdef TARGET_NR_clock_adjtime
+static void
+print_clock_adjtime(const struct syscallname *name,
+    abi_long arg0, abi_long arg1, abi_long arg2,
+    abi_long arg3, abi_long arg4, abi_long arg5)
+{
+    print_syscall_prologue(name);
+    print_clockid(arg0, 0);
+    print_pointer(arg1, 1);
     print_syscall_epilogue(name);
 }
 #endif
@@ -1535,29 +1840,32 @@ print_optint:
 }
 
 #define PRINT_SOCKOP(name, func) \
-    [SOCKOP_##name] = { #name, func }
+    [TARGET_SYS_##name] = { #name, func }
 
 static struct {
     const char *name;
     void (*print)(const char *, abi_long);
 } scall[] = {
-    PRINT_SOCKOP(socket, do_print_socket),
-    PRINT_SOCKOP(bind, do_print_sockaddr),
-    PRINT_SOCKOP(connect, do_print_sockaddr),
-    PRINT_SOCKOP(listen, do_print_listen),
-    PRINT_SOCKOP(accept, do_print_sockaddr),
-    PRINT_SOCKOP(getsockname, do_print_sockaddr),
-    PRINT_SOCKOP(getpeername, do_print_sockaddr),
-    PRINT_SOCKOP(socketpair, do_print_socketpair),
-    PRINT_SOCKOP(send, do_print_sendrecv),
-    PRINT_SOCKOP(recv, do_print_sendrecv),
-    PRINT_SOCKOP(sendto, do_print_msgaddr),
-    PRINT_SOCKOP(recvfrom, do_print_msgaddr),
-    PRINT_SOCKOP(shutdown, do_print_shutdown),
-    PRINT_SOCKOP(sendmsg, do_print_msg),
-    PRINT_SOCKOP(recvmsg, do_print_msg),
-    PRINT_SOCKOP(setsockopt, do_print_sockopt),
-    PRINT_SOCKOP(getsockopt, do_print_sockopt),
+    PRINT_SOCKOP(SOCKET, do_print_socket),
+    PRINT_SOCKOP(BIND, do_print_sockaddr),
+    PRINT_SOCKOP(CONNECT, do_print_sockaddr),
+    PRINT_SOCKOP(LISTEN, do_print_listen),
+    PRINT_SOCKOP(ACCEPT, do_print_sockaddr),
+    PRINT_SOCKOP(GETSOCKNAME, do_print_sockaddr),
+    PRINT_SOCKOP(GETPEERNAME, do_print_sockaddr),
+    PRINT_SOCKOP(SOCKETPAIR, do_print_socketpair),
+    PRINT_SOCKOP(SEND, do_print_sendrecv),
+    PRINT_SOCKOP(RECV, do_print_sendrecv),
+    PRINT_SOCKOP(SENDTO, do_print_msgaddr),
+    PRINT_SOCKOP(RECVFROM, do_print_msgaddr),
+    PRINT_SOCKOP(SHUTDOWN, do_print_shutdown),
+    PRINT_SOCKOP(SETSOCKOPT, do_print_sockopt),
+    PRINT_SOCKOP(GETSOCKOPT, do_print_sockopt),
+    PRINT_SOCKOP(SENDMSG, do_print_msg),
+    PRINT_SOCKOP(RECVMSG, do_print_msg),
+    PRINT_SOCKOP(ACCEPT4, NULL),
+    PRINT_SOCKOP(RECVMMSG, NULL),
+    PRINT_SOCKOP(SENDMMSG, NULL),
 };
 
 static void
@@ -1680,6 +1988,129 @@ print_rt_sigprocmask(const struct syscallname *name,
     gemu_log("%s,",how);
     print_pointer(arg1, 0);
     print_pointer(arg2, 1);
+    print_syscall_epilogue(name);
+}
+#endif
+
+#ifdef TARGET_NR_rt_sigqueueinfo
+static void
+print_rt_sigqueueinfo(const struct syscallname *name,
+    abi_long arg0, abi_long arg1, abi_long arg2,
+    abi_long arg3, abi_long arg4, abi_long arg5)
+{
+    void *p;
+    target_siginfo_t uinfo;
+
+    print_syscall_prologue(name);
+    print_raw_param("%d", arg0, 0);
+    print_signal(arg1, 0);
+    p = lock_user(VERIFY_READ, arg2, sizeof(target_siginfo_t), 1);
+    if (p) {
+        get_target_siginfo(&uinfo, p);
+        print_siginfo(&uinfo);
+
+        unlock_user(p, arg2, 0);
+    } else {
+        print_pointer(arg2, 1);
+    }
+    print_syscall_epilogue(name);
+}
+#endif
+
+#ifdef TARGET_NR_rt_tgsigqueueinfo
+static void
+print_rt_tgsigqueueinfo(const struct syscallname *name,
+    abi_long arg0, abi_long arg1, abi_long arg2,
+    abi_long arg3, abi_long arg4, abi_long arg5)
+{
+    void *p;
+    target_siginfo_t uinfo;
+
+    print_syscall_prologue(name);
+    print_raw_param("%d", arg0, 0);
+    print_raw_param("%d", arg1, 0);
+    print_signal(arg2, 0);
+    p = lock_user(VERIFY_READ, arg3, sizeof(target_siginfo_t), 1);
+    if (p) {
+        get_target_siginfo(&uinfo, p);
+        print_siginfo(&uinfo);
+
+        unlock_user(p, arg3, 0);
+    } else {
+        print_pointer(arg3, 1);
+    }
+    print_syscall_epilogue(name);
+}
+#endif
+
+#ifdef TARGET_NR_syslog
+static void
+print_syslog_action(abi_ulong arg, int last)
+{
+    const char *type;
+
+    switch (arg) {
+        case TARGET_SYSLOG_ACTION_CLOSE: {
+            type = "SYSLOG_ACTION_CLOSE";
+            break;
+        }
+        case TARGET_SYSLOG_ACTION_OPEN: {
+            type = "SYSLOG_ACTION_OPEN";
+            break;
+        }
+        case TARGET_SYSLOG_ACTION_READ: {
+            type = "SYSLOG_ACTION_READ";
+            break;
+        }
+        case TARGET_SYSLOG_ACTION_READ_ALL: {
+            type = "SYSLOG_ACTION_READ_ALL";
+            break;
+        }
+        case TARGET_SYSLOG_ACTION_READ_CLEAR: {
+            type = "SYSLOG_ACTION_READ_CLEAR";
+            break;
+        }
+        case TARGET_SYSLOG_ACTION_CLEAR: {
+            type = "SYSLOG_ACTION_CLEAR";
+            break;
+        }
+        case TARGET_SYSLOG_ACTION_CONSOLE_OFF: {
+            type = "SYSLOG_ACTION_CONSOLE_OFF";
+            break;
+        }
+        case TARGET_SYSLOG_ACTION_CONSOLE_ON: {
+            type = "SYSLOG_ACTION_CONSOLE_ON";
+            break;
+        }
+        case TARGET_SYSLOG_ACTION_CONSOLE_LEVEL: {
+            type = "SYSLOG_ACTION_CONSOLE_LEVEL";
+            break;
+        }
+        case TARGET_SYSLOG_ACTION_SIZE_UNREAD: {
+            type = "SYSLOG_ACTION_SIZE_UNREAD";
+            break;
+        }
+        case TARGET_SYSLOG_ACTION_SIZE_BUFFER: {
+            type = "SYSLOG_ACTION_SIZE_BUFFER";
+            break;
+        }
+        default: {
+            print_raw_param("%ld", arg, last);
+            return;
+        }
+    }
+    gemu_log("%s%s", type, get_comma(last));
+}
+
+static void
+print_syslog(const struct syscallname *name,
+    abi_long arg0, abi_long arg1, abi_long arg2,
+    abi_long arg3, abi_long arg4, abi_long arg5)
+{
+    print_syscall_prologue(name);
+    print_syslog_action(arg0, 0);
+    print_pointer(arg1, 0);
+    print_raw_param("%d", arg2, 1);
     print_syscall_epilogue(name);
 }
 #endif
@@ -2126,6 +2557,33 @@ print_kill(const struct syscallname *name,
 }
 #endif
 
+#ifdef TARGET_NR_tkill
+static void
+print_tkill(const struct syscallname *name,
+    abi_long arg0, abi_long arg1, abi_long arg2,
+    abi_long arg3, abi_long arg4, abi_long arg5)
+{
+    print_syscall_prologue(name);
+    print_raw_param("%d", arg0, 0);
+    print_signal(arg1, 1);
+    print_syscall_epilogue(name);
+}
+#endif
+
+#ifdef TARGET_NR_tgkill
+static void
+print_tgkill(const struct syscallname *name,
+    abi_long arg0, abi_long arg1, abi_long arg2,
+    abi_long arg3, abi_long arg4, abi_long arg5)
+{
+    print_syscall_prologue(name);
+    print_raw_param("%d", arg0, 0);
+    print_raw_param("%d", arg1, 0);
+    print_signal(arg2, 1);
+    print_syscall_epilogue(name);
+}
+#endif
+
 /*
  * An array of all of the syscalls we know about
  */
@@ -2189,4 +2647,16 @@ print_syscall_ret(int num, abi_long ret)
             }
             break;
         }
+}
+
+void print_taken_signal(int target_signum, const target_siginfo_t *tinfo)
+{
+    /* Print the strace output for a signal being taken:
+     * --- SIGSEGV {si_signo=SIGSEGV, si_code=SI_KERNEL, si_addr=0} ---
+     */
+    gemu_log("--- ");
+    print_signal(target_signum, 1);
+    gemu_log(" ");
+    print_siginfo(tinfo);
+    gemu_log(" ---\n");
 }

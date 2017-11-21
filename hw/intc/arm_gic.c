@@ -25,15 +25,21 @@
 #include "qom/cpu.h"
 #include "qemu/log.h"
 #include "trace.h"
+#include "sysemu/kvm.h"
 
-//#define DEBUG_GIC
+/* #define DEBUG_GIC */
 
 #ifdef DEBUG_GIC
-#define DPRINTF(fmt, ...) \
-do { fprintf(stderr, "arm_gic: " fmt , ## __VA_ARGS__); } while (0)
+#define DEBUG_GIC_GATE 1
 #else
-#define DPRINTF(fmt, ...) do {} while(0)
+#define DEBUG_GIC_GATE 0
 #endif
+
+#define DPRINTF(fmt, ...) do {                                          \
+        if (DEBUG_GIC_GATE) {                                           \
+            fprintf(stderr, "%s: " fmt, __func__, ## __VA_ARGS__);      \
+        }                                                               \
+    } while (0)
 
 static const uint8_t gic_id_11mpcore[] = {
     0x00, 0x00, 0x00, 0x00, 0x90, 0x13, 0x04, 0x00, 0x0d, 0xf0, 0x05, 0xb1
@@ -201,7 +207,7 @@ static void gic_set_irq(void *opaque, int irq, int level)
         return;
     }
 
-    if (s->revision == REV_11MPCORE || s->revision == REV_NVIC) {
+    if (s->revision == REV_11MPCORE) {
         gic_set_irq_11mpcore(s, irq, level, cm, target);
     } else {
         gic_set_irq_generic(s, irq, level, cm, target);
@@ -354,7 +360,7 @@ uint32_t gic_acknowledge_irq(GICState *s, int cpu, MemTxAttrs attrs)
         return 1023;
     }
 
-    if (s->revision == REV_11MPCORE || s->revision == REV_NVIC) {
+    if (s->revision == REV_11MPCORE) {
         /* Clear pending flags for both level and edge triggered interrupts.
          * Level triggered IRQs will be reasserted once they become inactive.
          */
@@ -568,7 +574,7 @@ void gic_complete_irq(GICState *s, int cpu, int irq, MemTxAttrs attrs)
         return; /* No active IRQ.  */
     }
 
-    if (s->revision == REV_11MPCORE || s->revision == REV_NVIC) {
+    if (s->revision == REV_11MPCORE) {
         /* Mark level triggered interrupts as pending if they are still
            raised.  */
         if (!GIC_TEST_EDGE_TRIGGER(irq) && GIC_TEST_ENABLED(irq, cm)
@@ -750,7 +756,7 @@ static uint32_t gic_dist_readb(void *opaque, hwaddr offset, MemTxAttrs attrs)
     } else if (offset < 0xf10) {
         goto bad_reg;
     } else if (offset < 0xf30) {
-        if (s->revision == REV_11MPCORE || s->revision == REV_NVIC) {
+        if (s->revision == REV_11MPCORE) {
             goto bad_reg;
         }
 
@@ -784,9 +790,6 @@ static uint32_t gic_dist_readb(void *opaque, hwaddr offset, MemTxAttrs attrs)
             case 2:
                 res = gic_id_gicv2[(offset - 0xfd0) >> 2];
                 break;
-            case REV_NVIC:
-                /* Shouldn't be able to get here */
-                abort();
             default:
                 res = 0;
             }
@@ -1010,7 +1013,7 @@ static void gic_dist_writeb(void *opaque, hwaddr offset,
                 continue; /* Ignore Non-secure access of Group0 IRQ */
             }
 
-            if (s->revision == REV_11MPCORE || s->revision == REV_NVIC) {
+            if (s->revision == REV_11MPCORE) {
                 if (value & (1 << (i * 2))) {
                     GIC_SET_MODEL(irq + i);
                 } else {
@@ -1028,7 +1031,7 @@ static void gic_dist_writeb(void *opaque, hwaddr offset,
         goto bad_reg;
     } else if (offset < 0xf20) {
         /* GICD_CPENDSGIRn */
-        if (s->revision == REV_11MPCORE || s->revision == REV_NVIC) {
+        if (s->revision == REV_11MPCORE) {
             goto bad_reg;
         }
         irq = (offset - 0xf10);
@@ -1042,7 +1045,7 @@ static void gic_dist_writeb(void *opaque, hwaddr offset,
         }
     } else if (offset < 0xf30) {
         /* GICD_SPENDSGIRn */
-        if (s->revision == REV_11MPCORE || s->revision == REV_NVIC) {
+        if (s->revision == REV_11MPCORE) {
             goto bad_reg;
         }
         irq = (offset - 0xf20);
@@ -1407,6 +1410,12 @@ static void arm_gic_realize(DeviceState *dev, Error **errp)
     agc->parent_realize(dev, &local_err);
     if (local_err) {
         error_propagate(errp, local_err);
+        return;
+    }
+
+    if (kvm_enabled() && !kvm_arm_supports_user_irq()) {
+        error_setg(errp, "KVM with user space irqchip only works when the "
+                         "host kernel supports KVM_CAP_ARM_USER_IRQ");
         return;
     }
 

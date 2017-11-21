@@ -52,7 +52,7 @@
                                      second according to spec 10.2.4.2 */
 #define E1000E_MAX_TX_FRAGS (64)
 
-static void
+static inline void
 e1000e_set_interrupt_cause(E1000ECore *core, uint32_t val);
 
 static inline void
@@ -806,7 +806,8 @@ typedef struct E1000E_RingInfo_st {
 static inline bool
 e1000e_ring_empty(E1000ECore *core, const E1000E_RingInfo *r)
 {
-    return core->mac[r->dh] == core->mac[r->dt];
+    return core->mac[r->dh] == core->mac[r->dt] ||
+                core->mac[r->dt] >= core->mac[r->dlen] / E1000_RING_DESC_LEN;
 }
 
 static inline uint64_t
@@ -953,7 +954,7 @@ e1000e_has_rxbufs(E1000ECore *core, const E1000E_RingInfo *r,
                          core->rx_desc_buf_size;
 }
 
-static inline void
+void
 e1000e_start_recv(E1000ECore *core)
 {
     int i;
@@ -1278,11 +1279,10 @@ e1000e_write_lgcy_rx_descr(E1000ECore *core, uint8_t *desc,
 
     struct e1000_rx_desc *d = (struct e1000_rx_desc *) desc;
 
-    memset(d, 0, sizeof(*d));
-
     assert(!rss_info->enabled);
 
     d->length = cpu_to_le16(length);
+    d->csum = 0;
 
     e1000e_build_rx_metadata(core, pkt, pkt != NULL,
                              rss_info,
@@ -1291,6 +1291,7 @@ e1000e_write_lgcy_rx_descr(E1000ECore *core, uint8_t *desc,
                              &d->special);
     d->errors = (uint8_t) (le32_to_cpu(status_flags) >> 24);
     d->status = (uint8_t) le32_to_cpu(status_flags);
+    d->special = 0;
 }
 
 static inline void
@@ -1301,7 +1302,7 @@ e1000e_write_ext_rx_descr(E1000ECore *core, uint8_t *desc,
 {
     union e1000_rx_desc_extended *d = (union e1000_rx_desc_extended *) desc;
 
-    memset(d, 0, sizeof(*d));
+    memset(&d->wb, 0, sizeof(d->wb));
 
     d->wb.upper.length = cpu_to_le16(length);
 
@@ -1325,7 +1326,7 @@ e1000e_write_ps_rx_descr(E1000ECore *core, uint8_t *desc,
     union e1000_rx_desc_packet_split *d =
         (union e1000_rx_desc_packet_split *) desc;
 
-    memset(d, 0, sizeof(*d));
+    memset(&d->wb, 0, sizeof(d->wb));
 
     d->wb.middle.length0 = cpu_to_le16((*written)[0]);
 
@@ -1507,6 +1508,7 @@ e1000e_write_packet_to_guest(E1000ECore *core, struct NetRxPkt *pkt,
     const E1000E_RingInfo *rxi;
     size_t ps_hdr_len = 0;
     bool do_ps = e1000e_do_ps(core, pkt, &ps_hdr_len);
+    bool is_first = true;
 
     rxi = rxr->i;
 
@@ -1514,12 +1516,15 @@ e1000e_write_packet_to_guest(E1000ECore *core, struct NetRxPkt *pkt,
         hwaddr ba[MAX_PS_BUFFERS];
         e1000e_ba_state bastate = { { 0 } };
         bool is_last = false;
-        bool is_first = true;
 
         desc_size = total_size - desc_offset;
 
         if (desc_size > core->rx_desc_buf_size) {
             desc_size = core->rx_desc_buf_size;
+        }
+
+        if (e1000e_ring_empty(core, rxi)) {
+            return;
         }
 
         base = e1000e_ring_head_descr(core, rxi);
@@ -1710,7 +1715,8 @@ e1000e_receive_iov(E1000ECore *core, const struct iovec *iov, int iovcnt)
         }
 
         /* Perform ACK receive detection */
-        if (e1000e_is_tcp_ack(core, core->rx_pkt)) {
+        if  (!(core->mac[RFCTL] & E1000_RFCTL_ACK_DIS) &&
+             (e1000e_is_tcp_ack(core, core->rx_pkt))) {
             n |= E1000_ICS_ACK;
         }
 
@@ -1807,6 +1813,7 @@ e1000e_core_set_link_status(E1000ECore *core)
                                    core->autoneg_timer);
         } else {
             e1000x_update_regs_on_link_up(core->mac, core->phy[0]);
+            e1000e_start_recv(core);
         }
     }
 
@@ -2007,19 +2014,23 @@ e1000e_msix_notify_one(E1000ECore *core, uint32_t cause, uint32_t int_cfg)
     }
 
     if (core->mac[CTRL_EXT] & E1000_CTRL_EXT_EIAME) {
-        trace_e1000e_irq_ims_clear_eiame(core->mac[IAM], cause);
-        e1000e_clear_ims_bits(core, core->mac[IAM] & cause);
+        trace_e1000e_irq_iam_clear_eiame(core->mac[IAM], cause);
+        core->mac[IAM] &= ~cause;
     }
 
     trace_e1000e_irq_icr_clear_eiac(core->mac[ICR], core->mac[EIAC]);
 
-    if (core->mac[EIAC] & E1000_ICR_OTHER) {
-        effective_eiac = (core->mac[EIAC] & E1000_EIAC_MASK) |
-                         E1000_ICR_OTHER_CAUSES;
-    } else {
-        effective_eiac = core->mac[EIAC] & E1000_EIAC_MASK;
+    effective_eiac = core->mac[EIAC] & cause;
+
+    if (effective_eiac == E1000_ICR_OTHER) {
+        effective_eiac |= E1000_ICR_OTHER_CAUSES;
     }
+
     core->mac[ICR] &= ~effective_eiac;
+
+    if (!(core->mac[CTRL_EXT] & E1000_CTRL_EXT_IAME)) {
+        core->mac[IMS] &= ~effective_eiac;
+    }
 }
 
 static void
@@ -2130,7 +2141,7 @@ e1000e_update_interrupt_state(E1000ECore *core)
 
     /* Set ICR[OTHER] for MSI-X */
     if (is_msix) {
-        if (core->mac[ICR] & core->mac[IMS] & E1000_ICR_OTHER_CAUSES) {
+        if (core->mac[ICR] & E1000_ICR_OTHER_CAUSES) {
             core->mac[ICR] |= E1000_ICR_OTHER;
             trace_e1000e_irq_add_msi_other(core->mac[ICR]);
         }
@@ -2168,7 +2179,7 @@ e1000e_update_interrupt_state(E1000ECore *core)
     }
 }
 
-static inline void
+static void
 e1000e_set_interrupt_cause(E1000ECore *core, uint32_t val)
 {
     trace_e1000e_irq_set_cause_entry(val, core->mac[ICR]);
@@ -2187,6 +2198,8 @@ e1000e_autoneg_timer(void *opaque)
     E1000ECore *core = opaque;
     if (!qemu_get_queue(core->owner_nic)->link_down) {
         e1000x_update_regs_on_autoneg_done(core->mac, core->phy[0]);
+        e1000e_start_recv(core);
+
         e1000e_update_flowctl_status(core);
         /* signal link status change to the guest */
         e1000e_set_interrupt_cause(core, E1000_ICR_LSC);
@@ -2344,7 +2357,7 @@ e1000e_set_pbaclr(E1000ECore *core, int index, uint32_t val)
 
     core->mac[PBACLR] = val & E1000_PBACLR_VALID_MASK;
 
-    if (msix_enabled(core->owner)) {
+    if (!msix_enabled(core->owner)) {
         return;
     }
 
@@ -2441,14 +2454,20 @@ e1000e_set_ics(E1000ECore *core, int index, uint32_t val)
 static void
 e1000e_set_icr(E1000ECore *core, int index, uint32_t val)
 {
+    uint32_t icr = 0;
     if ((core->mac[ICR] & E1000_ICR_ASSERTED) &&
         (core->mac[CTRL_EXT] & E1000_CTRL_EXT_IAME)) {
         trace_e1000e_irq_icr_process_iame();
         e1000e_clear_ims_bits(core, core->mac[IAM]);
     }
 
-    trace_e1000e_irq_icr_write(val, core->mac[ICR], core->mac[ICR] & ~val);
-    core->mac[ICR] &= ~val;
+    icr = core->mac[ICR] & ~val;
+    /* Windows driver expects that the "receive overrun" bit and other
+     * ones to be cleared when the "Other" bit (#24) is cleared.
+     */
+    icr = (val & E1000_ICR_OTHER) ? (icr & ~E1000_ICR_OTHER_CAUSES) : icr;
+    trace_e1000e_irq_icr_write(val, core->mac[ICR], icr);
+    core->mac[ICR] = icr;
     e1000e_update_interrupt_state(core);
 }
 
@@ -2836,7 +2855,7 @@ static uint32_t (*e1000e_macreg_readops[])(E1000ECore *, int) = {
     e1000e_getreg(RDLEN0),
     e1000e_getreg(RDH1),
     e1000e_getreg(LATECOL),
-    e1000e_getreg(SEC),
+    e1000e_getreg(SEQEC),
     e1000e_getreg(XONTXC),
     e1000e_getreg(WUS),
     e1000e_getreg(GORCL),

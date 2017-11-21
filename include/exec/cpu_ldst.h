@@ -76,6 +76,8 @@
 
 #if defined(CONFIG_USER_ONLY)
 
+extern __thread uintptr_t helper_retaddr;
+
 /* In user-only mode we provide only the _code and _data accessors. */
 
 #define MEMSUFFIX _data
@@ -401,7 +403,7 @@ static inline void *tlb_vaddr_to_host(CPUArchState *env, target_ulong addr,
                                       int access_type, int mmu_idx)
 {
 #if defined(CONFIG_USER_ONLY)
-    return g2h(vaddr);
+    return g2h(addr);
 #else
     int index = (addr >> TARGET_PAGE_BITS) & (CPU_TLB_SIZE - 1);
     CPUTLBEntry *tlbentry = &env->tlb_table[mmu_idx][index];

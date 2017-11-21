@@ -42,11 +42,14 @@ typedef struct AspeedSMCController {
     uint8_t conf_enable_w0;
     uint8_t max_slaves;
     const AspeedSegments *segments;
-    uint32_t mapping_window_size;
+    hwaddr flash_window_base;
+    uint32_t flash_window_size;
+    bool has_dma;
+    uint32_t nregs;
 } AspeedSMCController;
 
 typedef struct AspeedSMCFlash {
-    const struct AspeedSMCState *controller;
+    struct AspeedSMCState *controller;
 
     uint8_t id;
     uint32_t size;

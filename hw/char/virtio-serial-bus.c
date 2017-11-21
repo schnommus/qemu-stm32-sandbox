@@ -75,6 +75,19 @@ static VirtIOSerialPort *find_port_by_name(char *name)
     return NULL;
 }
 
+static VirtIOSerialPort *find_first_connected_console(VirtIOSerial *vser)
+{
+    VirtIOSerialPort *port;
+
+    QTAILQ_FOREACH(port, &vser->ports, next) {
+        VirtIOSerialPortClass const *vsc = VIRTIO_SERIAL_PORT_GET_CLASS(port);
+        if (vsc->is_console && port->host_connected) {
+            return port;
+        }
+    }
+    return NULL;
+}
+
 static bool use_multiport(VirtIOSerial *vser)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(vser);
@@ -132,6 +145,15 @@ static void discard_vq_data(VirtQueue *vq, VirtIODevice *vdev)
     virtio_notify(vdev, vq);
 }
 
+static void discard_throttle_data(VirtIOSerialPort *port)
+{
+    if (port->elem) {
+        virtqueue_detach_element(port->ovq, port->elem, 0);
+        g_free(port->elem);
+        port->elem = NULL;
+    }
+}
+
 static void do_flush_queued_data(VirtIOSerialPort *port, VirtQueue *vq,
                                  VirtIODevice *vdev)
 {
@@ -164,6 +186,9 @@ static void do_flush_queued_data(VirtIOSerialPort *port, VirtQueue *vq,
                                   port->elem->out_sg[i].iov_base
                                   + port->iov_offset,
                                   buf_size);
+            if (!port->elem) { /* bail if we got disconnected */
+                return;
+            }
             if (port->throttled) {
                 port->iov_idx = i;
                 if (ret > 0) {
@@ -254,6 +279,7 @@ int virtio_serial_close(VirtIOSerialPort *port)
      * consume, reset the throttling flag and discard the data.
      */
     port->throttled = false;
+    discard_throttle_data(port);
     discard_vq_data(port->ovq, VIRTIO_DEVICE(port->vser));
 
     send_control_event(port->vser, port->id, VIRTIO_CONSOLE_PORT_OPEN, 0);
@@ -528,6 +554,7 @@ static uint64_t get_features(VirtIODevice *vdev, uint64_t features,
 
     vser = VIRTIO_SERIAL(vdev);
 
+    features |= vser->host_features;
     if (vser->bus.max_nr_ports > 1) {
         virtio_add_feature(&features, VIRTIO_CONSOLE_F_MULTIPORT);
     }
@@ -547,6 +574,29 @@ static void get_config(VirtIODevice *vdev, uint8_t *config_data)
                                           vser->serial.max_virtserial_ports);
 }
 
+/* Guest sent new config info */
+static void set_config(VirtIODevice *vdev, const uint8_t *config_data)
+{
+    VirtIOSerial *vser = VIRTIO_SERIAL(vdev);
+    struct virtio_console_config *config =
+        (struct virtio_console_config *)config_data;
+    uint8_t emerg_wr_lo = le32_to_cpu(config->emerg_wr);
+    VirtIOSerialPort *port = find_first_connected_console(vser);
+    VirtIOSerialPortClass *vsc;
+
+    if (!config->emerg_wr) {
+        return;
+    }
+    /* Make sure we don't misdetect an emergency write when the guest
+     * does a short config write after an emergency write. */
+    config->emerg_wr = 0;
+    if (!port) {
+        return;
+    }
+    vsc = VIRTIO_SERIAL_PORT_GET_CLASS(port);
+    (void)vsc->have_data(port, &emerg_wr_lo, 1);
+}
+
 static void guest_reset(VirtIOSerial *vser)
 {
     VirtIOSerialPort *port;
@@ -554,6 +604,9 @@ static void guest_reset(VirtIOSerial *vser)
 
     QTAILQ_FOREACH(port, &vser->ports, next) {
         vsc = VIRTIO_SERIAL_PORT_GET_CLASS(port);
+
+        discard_throttle_data(port);
+
         if (port->guest_connected) {
             port->guest_connected = false;
             if (vsc->set_guest_connected) {
@@ -584,6 +637,13 @@ static void set_status(VirtIODevice *vdev, uint8_t status)
     if (!(status & VIRTIO_CONFIG_S_DRIVER_OK)) {
         guest_reset(vser);
     }
+
+    QTAILQ_FOREACH(port, &vser->ports, next) {
+        VirtIOSerialPortClass *vsc = VIRTIO_SERIAL_PORT_GET_CLASS(port);
+        if (vsc->enable_backend) {
+            vsc->enable_backend(port, vdev->vm_running);
+        }
+    }
 }
 
 static void vser_reset(VirtIODevice *vdev)
@@ -610,7 +670,7 @@ static void virtio_serial_save_device(VirtIODevice *vdev, QEMUFile *f)
 
     /* The ports map */
     max_nr_ports = s->serial.max_virtserial_ports;
-    for (i = 0; i < (max_nr_ports + 31) / 32; i++) {
+    for (i = 0; i < DIV_ROUND_UP(max_nr_ports, 32); i++) {
         qemu_put_be32s(f, &s->ports_map[i]);
     }
 
@@ -674,6 +734,7 @@ static void virtio_serial_post_load_timer_cb(void *opaque)
         }
     }
     g_free(s->post_load->connected);
+    timer_del(s->post_load->timer);
     timer_free(s->post_load->timer);
     g_free(s->post_load);
     s->post_load = NULL;
@@ -682,6 +743,7 @@ static void virtio_serial_post_load_timer_cb(void *opaque)
 static int fetch_active_ports_list(QEMUFile *f,
                                    VirtIOSerial *s, uint32_t nr_active_ports)
 {
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
     uint32_t i;
 
     s->post_load = g_malloc0(sizeof(*s->post_load));
@@ -715,7 +777,7 @@ static int fetch_active_ports_list(QEMUFile *f,
             qemu_get_be64s(f, &port->iov_offset);
 
             port->elem =
-                qemu_get_virtqueue_element(f, sizeof(VirtQueueElement));
+                qemu_get_virtqueue_element(vdev, f, sizeof(VirtQueueElement));
 
             /*
              *  Port was throttled on source machine.  Let's
@@ -726,12 +788,6 @@ static int fetch_active_ports_list(QEMUFile *f,
     }
     timer_mod(s->post_load->timer, 1);
     return 0;
-}
-
-static int virtio_serial_load(QEMUFile *f, void *opaque, size_t size)
-{
-    /* The virtio device */
-    return virtio_load(VIRTIO_DEVICE(opaque), f, 3);
 }
 
 static int virtio_serial_load_device(VirtIODevice *vdev, QEMUFile *f,
@@ -749,7 +805,7 @@ static int virtio_serial_load_device(VirtIODevice *vdev, QEMUFile *f,
     qemu_get_be32s(f, &tmp);
 
     max_nr_ports = s->serial.max_virtserial_ports;
-    for (i = 0; i < (max_nr_ports + 31) / 32; i++) {
+    for (i = 0; i < DIV_ROUND_UP(max_nr_ports, 32); i++) {
         qemu_get_be32s(f, &ports_map);
 
         if (ports_map != s->ports_map[i]) {
@@ -814,7 +870,7 @@ static uint32_t find_free_port_id(VirtIOSerial *vser)
     unsigned int i, max_nr_ports;
 
     max_nr_ports = vser->serial.max_virtserial_ports;
-    for (i = 0; i < (max_nr_ports + 31) / 32; i++) {
+    for (i = 0; i < DIV_ROUND_UP(max_nr_ports, 32); i++) {
         uint32_t map, zeroes;
 
         map = vser->ports_map[i];
@@ -864,6 +920,7 @@ static void remove_port(VirtIOSerial *vser, uint32_t port_id)
     assert(port);
 
     /* Flush out any unconsumed buffers first */
+    discard_throttle_data(port);
     discard_vq_data(port->ovq, VIRTIO_DEVICE(port->vser));
 
     send_control_event(vser, port->id, VIRTIO_CONSOLE_PORT_REMOVE, 1);
@@ -967,6 +1024,7 @@ static void virtio_serial_device_realize(DeviceState *dev, Error **errp)
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
     VirtIOSerial *vser = VIRTIO_SERIAL(dev);
     uint32_t i, max_supported_ports;
+    size_t config_size = sizeof(struct virtio_console_config);
 
     if (!vser->serial.max_virtserial_ports) {
         error_setg(errp, "Maximum number of serial ports not specified");
@@ -981,10 +1039,12 @@ static void virtio_serial_device_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    /* We don't support emergency write, skip it for now. */
-    /* TODO: cleaner fix, depending on host features. */
+    if (!virtio_has_feature(vser->host_features,
+                            VIRTIO_CONSOLE_F_EMERG_WRITE)) {
+        config_size = offsetof(struct virtio_console_config, emerg_wr);
+    }
     virtio_init(vdev, "virtio-serial", VIRTIO_ID_CONSOLE,
-                offsetof(struct virtio_console_config, emerg_wr));
+                config_size);
 
     /* Spawn a new virtio-serial bus on which the ports will ride as devices */
     qbus_create_inplace(&vser->bus, sizeof(vser->bus), TYPE_VIRTIO_SERIAL_BUS,
@@ -1022,7 +1082,7 @@ static void virtio_serial_device_realize(DeviceState *dev, Error **errp)
         vser->ovqs[i] = virtio_add_queue(vdev, 128, handle_output);
     }
 
-    vser->ports_map = g_malloc0(((vser->serial.max_virtserial_ports + 31) / 32)
+    vser->ports_map = g_malloc0((DIV_ROUND_UP(vser->serial.max_virtserial_ports, 32))
         * sizeof(vser->ports_map[0]));
     /*
      * Reserve location 0 for a console port for backward compat
@@ -1071,15 +1131,28 @@ static void virtio_serial_device_unrealize(DeviceState *dev, Error **errp)
         timer_free(vser->post_load->timer);
         g_free(vser->post_load);
     }
+
+    qbus_set_hotplug_handler(BUS(&vser->bus), NULL, errp);
+
     virtio_cleanup(vdev);
 }
 
 /* Note: 'console' is used for backwards compatibility */
-VMSTATE_VIRTIO_DEVICE(console, 3, virtio_serial_load, virtio_vmstate_save);
+static const VMStateDescription vmstate_virtio_console = {
+    .name = "virtio-console",
+    .minimum_version_id = 3,
+    .version_id = 3,
+    .fields = (VMStateField[]) {
+        VMSTATE_VIRTIO_DEVICE,
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static Property virtio_serial_properties[] = {
     DEFINE_PROP_UINT32("max_ports", VirtIOSerial, serial.max_virtserial_ports,
                                                   31),
+    DEFINE_PROP_BIT64("emergency-write", VirtIOSerial, host_features,
+                      VIRTIO_CONSOLE_F_EMERG_WRITE, true),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -1098,6 +1171,7 @@ static void virtio_serial_class_init(ObjectClass *klass, void *data)
     vdc->unrealize = virtio_serial_device_unrealize;
     vdc->get_features = get_features;
     vdc->get_config = get_config;
+    vdc->set_config = set_config;
     vdc->set_status = set_status;
     vdc->reset = vser_reset;
     vdc->save = virtio_serial_save_device;

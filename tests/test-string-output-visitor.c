@@ -4,7 +4,7 @@
  * Copyright (C) 2012 Red Hat Inc.
  *
  * Authors:
- *  Paolo Bonzini <pbonzini@redhat.com> (based on test-qmp-output-visitor)
+ *  Paolo Bonzini <pbonzini@redhat.com> (based on test-qobject-output-visitor)
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -194,12 +194,12 @@ static void test_visitor_out_enum(TestOutputVisitorData *data,
 
         str = visitor_get(data);
         if (data->human) {
-            char *str_human = g_strdup_printf("\"%s\"", EnumOne_lookup[i]);
+            char *str_human = g_strdup_printf("\"%s\"", EnumOne_str(i));
 
             g_assert_cmpstr(str, ==, str_human);
             g_free(str_human);
         } else {
-            g_assert_cmpstr(str, ==, EnumOne_lookup[i]);
+            g_assert_cmpstr(str, ==, EnumOne_str(i));
         }
         visitor_reset(data);
     }

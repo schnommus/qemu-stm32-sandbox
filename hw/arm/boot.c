@@ -9,6 +9,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include <libfdt.h>
 #include "hw/hw.h"
 #include "hw/arm/arm.h"
 #include "hw/arm/linux-boot-if.h"
@@ -29,6 +30,9 @@
 #define KERNEL_ARGS_ADDR 0x100
 #define KERNEL_LOAD_ADDR 0x00010000
 #define KERNEL64_LOAD_ADDR 0x00080000
+
+#define ARM64_TEXT_OFFSET_OFFSET    8
+#define ARM64_MAGIC_OFFSET          56
 
 typedef enum {
     FIXUP_NONE = 0,     /* do nothing */
@@ -486,6 +490,17 @@ static int load_dtb(hwaddr addr, const struct arm_boot_info *binfo,
             g_free(nodename);
         }
     } else {
+        Error *err = NULL;
+
+        rc = fdt_path_offset(fdt, "/memory");
+        if (rc < 0) {
+            qemu_fdt_add_subnode(fdt, "/memory");
+        }
+
+        if (!qemu_fdt_getprop(fdt, "/memory", "device_type", NULL, &err)) {
+            qemu_fdt_setprop_string(fdt, "/memory", "device_type", "memory");
+        }
+
         rc = qemu_fdt_setprop_sized_cells(fdt, "/memory", "reg",
                                           acells, binfo->loader_start,
                                           scells, binfo->ram_size);
@@ -493,6 +508,11 @@ static int load_dtb(hwaddr addr, const struct arm_boot_info *binfo,
             fprintf(stderr, "couldn't set /memory/reg\n");
             goto fail;
         }
+    }
+
+    rc = fdt_path_offset(fdt, "/chosen");
+    if (rc < 0) {
+        qemu_fdt_add_subnode(fdt, "/chosen");
     }
 
     if (binfo->kernel_cmdline && *binfo->kernel_cmdline) {
@@ -751,6 +771,49 @@ static uint64_t arm_load_elf(struct arm_boot_info *info, uint64_t *pentry,
     return ret;
 }
 
+static uint64_t load_aarch64_image(const char *filename, hwaddr mem_base,
+                                   hwaddr *entry)
+{
+    hwaddr kernel_load_offset = KERNEL64_LOAD_ADDR;
+    uint8_t *buffer;
+    int size;
+
+    /* On aarch64, it's the bootloader's job to uncompress the kernel. */
+    size = load_image_gzipped_buffer(filename, LOAD_IMAGE_MAX_GUNZIP_BYTES,
+                                     &buffer);
+
+    if (size < 0) {
+        gsize len;
+
+        /* Load as raw file otherwise */
+        if (!g_file_get_contents(filename, (char **)&buffer, &len, NULL)) {
+            return -1;
+        }
+        size = len;
+    }
+
+    /* check the arm64 magic header value -- very old kernels may not have it */
+    if (memcmp(buffer + ARM64_MAGIC_OFFSET, "ARM\x64", 4) == 0) {
+        uint64_t hdrvals[2];
+
+        /* The arm64 Image header has text_offset and image_size fields at 8 and
+         * 16 bytes into the Image header, respectively. The text_offset field
+         * is only valid if the image_size is non-zero.
+         */
+        memcpy(&hdrvals, buffer + ARM64_TEXT_OFFSET_OFFSET, sizeof(hdrvals));
+        if (hdrvals[1] != 0) {
+            kernel_load_offset = le64_to_cpu(hdrvals[0]);
+        }
+    }
+
+    *entry = mem_base + kernel_load_offset;
+    rom_add_blob_fixed(filename, buffer, size, *entry);
+
+    g_free(buffer);
+
+    return size;
+}
+
 static void arm_load_kernel_notify(Notifier *notifier, void *data)
 {
     CPUState *cs;
@@ -759,7 +822,7 @@ static void arm_load_kernel_notify(Notifier *notifier, void *data)
     int is_linux = 0;
     uint64_t elf_entry, elf_low_addr, elf_high_addr;
     int elf_machine;
-    hwaddr entry, kernel_load_offset;
+    hwaddr entry;
     static const ARMInsnFixup *primary_loader;
     ArmLoadKernelNotifier *n = DO_UPCAST(ArmLoadKernelNotifier,
                                          notifier, notifier);
@@ -772,6 +835,8 @@ static void arm_load_kernel_notify(Notifier *notifier, void *data)
      * doesn't support secure.
      */
     assert(!(info->secure_board_setup && kvm_enabled()));
+
+    info->dtb_filename = qemu_opt_get(qemu_get_machine_opts(), "dtb");
 
     /* Load the kernel.  */
     if (!info->kernel_filename || info->firmware_loaded) {
@@ -822,18 +887,14 @@ static void arm_load_kernel_notify(Notifier *notifier, void *data)
 
     if (arm_feature(&cpu->env, ARM_FEATURE_AARCH64)) {
         primary_loader = bootloader_aarch64;
-        kernel_load_offset = KERNEL64_LOAD_ADDR;
         elf_machine = EM_AARCH64;
     } else {
         primary_loader = bootloader;
         if (!info->write_board_setup) {
             primary_loader += BOOTLOADER_NO_BOARD_SETUP_OFFSET;
         }
-        kernel_load_offset = KERNEL_LOAD_ADDR;
         elf_machine = EM_ARM;
     }
-
-    info->dtb_filename = qemu_opt_get(qemu_get_machine_opts(), "dtb");
 
     if (!info->secondary_cpu_reset_hook) {
         info->secondary_cpu_reset_hook = default_reset_secondary;
@@ -883,17 +944,15 @@ static void arm_load_kernel_notify(Notifier *notifier, void *data)
         kernel_size = load_uimage(info->kernel_filename, &entry, NULL,
                                   &is_linux, NULL, NULL);
     }
-    /* On aarch64, it's the bootloader's job to uncompress the kernel. */
     if (arm_feature(&cpu->env, ARM_FEATURE_AARCH64) && kernel_size < 0) {
-        entry = info->loader_start + kernel_load_offset;
-        kernel_size = load_image_gzipped(info->kernel_filename, entry,
-                                         info->ram_size - kernel_load_offset);
+        kernel_size = load_aarch64_image(info->kernel_filename,
+                                         info->loader_start, &entry);
         is_linux = 1;
-    }
-    if (kernel_size < 0) {
-        entry = info->loader_start + kernel_load_offset;
+    } else if (kernel_size < 0) {
+        /* 32-bit ARM */
+        entry = info->loader_start + KERNEL_LOAD_ADDR;
         kernel_size = load_image_targphys(info->kernel_filename, entry,
-                                          info->ram_size - kernel_load_offset);
+                                          info->ram_size - KERNEL_LOAD_ADDR);
         is_linux = 1;
     }
     if (kernel_size < 0) {

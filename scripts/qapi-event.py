@@ -14,10 +14,10 @@
 from qapi import *
 
 
-def gen_event_send_proto(name, arg_type, boxed):
+def build_event_send_proto(name, arg_type, boxed):
     return 'void qapi_event_send_%(c_name)s(%(param)s)' % {
         'c_name': c_name(name.lower()),
-        'param': gen_params(arg_type, boxed, 'Error **errp')}
+        'param': build_params(arg_type, boxed, 'Error **errp')}
 
 
 def gen_event_send_decl(name, arg_type, boxed):
@@ -25,10 +25,10 @@ def gen_event_send_decl(name, arg_type, boxed):
 
 %(proto)s;
 ''',
-                 proto=gen_event_send_proto(name, arg_type, boxed))
+                 proto=build_event_send_proto(name, arg_type, boxed))
 
 
-# Declare and initialize an object 'qapi' using parameters from gen_params()
+# Declare and initialize an object 'qapi' using parameters from build_params()
 def gen_param_var(typ):
     assert not typ.variants
     ret = mcgen('''
@@ -42,7 +42,7 @@ def gen_param_var(typ):
         if memb.optional:
             ret += 'has_' + c_name(memb.name) + sep
         if memb.type.name == 'str':
-            # Cast away const added in gen_params()
+            # Cast away const added in build_params()
             ret += '(char *)'
         ret += c_name(memb.name)
     ret += mcgen('''
@@ -72,7 +72,7 @@ def gen_event_send(name, arg_type, boxed):
     Error *err = NULL;
     QMPEventFuncEmit emit;
 ''',
-                proto=gen_event_send_proto(name, arg_type, boxed))
+                proto=build_event_send_proto(name, arg_type, boxed))
 
     if arg_type and not arg_type.is_empty():
         ret += mcgen('''
@@ -98,7 +98,7 @@ def gen_event_send(name, arg_type, boxed):
 
     if arg_type and not arg_type.is_empty():
         ret += mcgen('''
-    v = qmp_output_visitor_new(&obj);
+    v = qobject_output_visitor_new(&obj);
 ''')
         if not arg_type.is_implicit():
             ret += mcgen('''
@@ -209,7 +209,7 @@ fdef.write(mcgen('''
 #include "qemu-common.h"
 #include "%(prefix)sqapi-event.h"
 #include "%(prefix)sqapi-visit.h"
-#include "qapi/qmp-output-visitor.h"
+#include "qapi/qobject-output-visitor.h"
 #include "qapi/qmp-event.h"
 
 ''',
@@ -217,13 +217,14 @@ fdef.write(mcgen('''
 
 fdecl.write(mcgen('''
 #include "qapi/error.h"
+#include "qapi/util.h"
 #include "qapi/qmp/qdict.h"
 #include "%(prefix)sqapi-types.h"
 
 ''',
                   prefix=prefix))
 
-event_enum_name = c_name(prefix + "QAPIEvent", protect=False)
+event_enum_name = c_name(prefix + 'QAPIEvent', protect=False)
 
 schema = QAPISchema(input_file)
 gen = QAPISchemaGenEventVisitor()

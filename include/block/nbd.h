@@ -1,4 +1,5 @@
 /*
+ *  Copyright (C) 2016-2017 Red Hat, Inc.
  *  Copyright (C) 2005  Anthony Liguori <anthony@codemonkey.ws>
  *
  *  Network Block Device
@@ -25,52 +26,155 @@
 #include "io/channel-socket.h"
 #include "crypto/tlscreds.h"
 
-/* Note: these are _NOT_ the same as the network representation of an NBD
+/* Handshake phase structs - this struct is passed on the wire */
+
+struct nbd_option {
+    uint64_t magic; /* NBD_OPTS_MAGIC */
+    uint32_t option; /* NBD_OPT_* */
+    uint32_t length;
+} QEMU_PACKED;
+typedef struct nbd_option nbd_option;
+
+struct nbd_opt_reply {
+    uint64_t magic; /* NBD_REP_MAGIC */
+    uint32_t option; /* NBD_OPT_* */
+    uint32_t type; /* NBD_REP_* */
+    uint32_t length;
+} QEMU_PACKED;
+typedef struct nbd_opt_reply nbd_opt_reply;
+
+/* Transmission phase structs
+ *
+ * Note: these are _NOT_ the same as the network representation of an NBD
  * request and reply!
  */
-struct nbd_request {
+struct NBDRequest {
     uint64_t handle;
     uint64_t from;
     uint32_t len;
-    uint32_t type;
+    uint16_t flags; /* NBD_CMD_FLAG_* */
+    uint16_t type; /* NBD_CMD_* */
 };
+typedef struct NBDRequest NBDRequest;
 
-struct nbd_reply {
-    uint64_t handle;
+typedef struct NBDSimpleReply {
+    uint32_t magic;  /* NBD_SIMPLE_REPLY_MAGIC */
     uint32_t error;
-};
+    uint64_t handle;
+} QEMU_PACKED NBDSimpleReply;
 
-#define NBD_FLAG_HAS_FLAGS      (1 << 0)        /* Flags are there */
-#define NBD_FLAG_READ_ONLY      (1 << 1)        /* Device is read-only */
-#define NBD_FLAG_SEND_FLUSH     (1 << 2)        /* Send FLUSH */
-#define NBD_FLAG_SEND_FUA       (1 << 3)        /* Send FUA (Force Unit Access) */
-#define NBD_FLAG_ROTATIONAL     (1 << 4)        /* Use elevator algorithm - rotational media */
-#define NBD_FLAG_SEND_TRIM      (1 << 5)        /* Send TRIM (discard) */
+/* Header of all structured replies */
+typedef struct NBDStructuredReplyChunk {
+    uint32_t magic;  /* NBD_STRUCTURED_REPLY_MAGIC */
+    uint16_t flags;  /* combination of NBD_REPLY_FLAG_* */
+    uint16_t type;   /* NBD_REPLY_TYPE_* */
+    uint64_t handle; /* request handle */
+    uint32_t length; /* length of payload */
+} QEMU_PACKED NBDStructuredReplyChunk;
 
-/* New-style global flags. */
-#define NBD_FLAG_FIXED_NEWSTYLE     (1 << 0)    /* Fixed newstyle protocol. */
+typedef union NBDReply {
+    NBDSimpleReply simple;
+    NBDStructuredReplyChunk structured;
+    struct {
+        /* @magic and @handle fields have the same offset and size both in
+         * simple reply and structured reply chunk, so let them be accessible
+         * without ".simple." or ".structured." specification
+         */
+        uint32_t magic;
+        uint32_t _skip;
+        uint64_t handle;
+    } QEMU_PACKED;
+} NBDReply;
 
-/* New-style client flags. */
-#define NBD_FLAG_C_FIXED_NEWSTYLE   (1 << 0)    /* Fixed newstyle protocol. */
+/* Header of chunk for NBD_REPLY_TYPE_OFFSET_DATA */
+typedef struct NBDStructuredReadData {
+    NBDStructuredReplyChunk h; /* h.length >= 9 */
+    uint64_t offset;
+    /* At least one byte of data payload follows, calculated from h.length */
+} QEMU_PACKED NBDStructuredReadData;
 
-/* Reply types. */
+/* Complete chunk for NBD_REPLY_TYPE_OFFSET_HOLE */
+typedef struct NBDStructuredReadHole {
+    NBDStructuredReplyChunk h; /* h.length == 12 */
+    uint64_t offset;
+    uint32_t length;
+} QEMU_PACKED NBDStructuredReadHole;
+
+/* Header of all NBD_REPLY_TYPE_ERROR* errors */
+typedef struct NBDStructuredError {
+    NBDStructuredReplyChunk h; /* h.length >= 6 */
+    uint32_t error;
+    uint16_t message_length;
+} QEMU_PACKED NBDStructuredError;
+
+/* Transmission (export) flags: sent from server to client during handshake,
+   but describe what will happen during transmission */
+#define NBD_FLAG_HAS_FLAGS         (1 << 0) /* Flags are there */
+#define NBD_FLAG_READ_ONLY         (1 << 1) /* Device is read-only */
+#define NBD_FLAG_SEND_FLUSH        (1 << 2) /* Send FLUSH */
+#define NBD_FLAG_SEND_FUA          (1 << 3) /* Send FUA (Force Unit Access) */
+#define NBD_FLAG_ROTATIONAL        (1 << 4) /* Use elevator algorithm -
+                                               rotational media */
+#define NBD_FLAG_SEND_TRIM         (1 << 5) /* Send TRIM (discard) */
+#define NBD_FLAG_SEND_WRITE_ZEROES (1 << 6) /* Send WRITE_ZEROES */
+#define NBD_FLAG_SEND_DF           (1 << 7) /* Send DF (Do not Fragment) */
+
+/* New-style handshake (global) flags, sent from server to client, and
+   control what will happen during handshake phase. */
+#define NBD_FLAG_FIXED_NEWSTYLE   (1 << 0) /* Fixed newstyle protocol. */
+#define NBD_FLAG_NO_ZEROES        (1 << 1) /* End handshake without zeroes. */
+
+/* New-style client flags, sent from client to server to control what happens
+   during handshake phase. */
+#define NBD_FLAG_C_FIXED_NEWSTYLE (1 << 0) /* Fixed newstyle protocol. */
+#define NBD_FLAG_C_NO_ZEROES      (1 << 1) /* End handshake without zeroes. */
+
+/* Option requests. */
+#define NBD_OPT_EXPORT_NAME      (1)
+#define NBD_OPT_ABORT            (2)
+#define NBD_OPT_LIST             (3)
+/* #define NBD_OPT_PEEK_EXPORT   (4) not in use */
+#define NBD_OPT_STARTTLS         (5)
+#define NBD_OPT_INFO             (6)
+#define NBD_OPT_GO               (7)
+#define NBD_OPT_STRUCTURED_REPLY (8)
+
+/* Option reply types. */
+#define NBD_REP_ERR(value) ((UINT32_C(1) << 31) | (value))
+
 #define NBD_REP_ACK             (1)             /* Data sending finished. */
 #define NBD_REP_SERVER          (2)             /* Export description. */
-#define NBD_REP_ERR_UNSUP       ((UINT32_C(1) << 31) | 1) /* Unknown option. */
-#define NBD_REP_ERR_POLICY      ((UINT32_C(1) << 31) | 2) /* Server denied */
-#define NBD_REP_ERR_INVALID     ((UINT32_C(1) << 31) | 3) /* Invalid length. */
-#define NBD_REP_ERR_TLS_REQD    ((UINT32_C(1) << 31) | 5) /* TLS required */
+#define NBD_REP_INFO            (3)             /* NBD_OPT_INFO/GO. */
 
+#define NBD_REP_ERR_UNSUP           NBD_REP_ERR(1)  /* Unknown option */
+#define NBD_REP_ERR_POLICY          NBD_REP_ERR(2)  /* Server denied */
+#define NBD_REP_ERR_INVALID         NBD_REP_ERR(3)  /* Invalid length */
+#define NBD_REP_ERR_PLATFORM        NBD_REP_ERR(4)  /* Not compiled in */
+#define NBD_REP_ERR_TLS_REQD        NBD_REP_ERR(5)  /* TLS required */
+#define NBD_REP_ERR_UNKNOWN         NBD_REP_ERR(6)  /* Export unknown */
+#define NBD_REP_ERR_SHUTDOWN        NBD_REP_ERR(7)  /* Server shutting down */
+#define NBD_REP_ERR_BLOCK_SIZE_REQD NBD_REP_ERR(8)  /* Need INFO_BLOCK_SIZE */
 
-#define NBD_CMD_MASK_COMMAND	0x0000ffff
-#define NBD_CMD_FLAG_FUA	(1 << 16)
+/* Info types, used during NBD_REP_INFO */
+#define NBD_INFO_EXPORT         0
+#define NBD_INFO_NAME           1
+#define NBD_INFO_DESCRIPTION    2
+#define NBD_INFO_BLOCK_SIZE     3
 
+/* Request flags, sent from client to server during transmission phase */
+#define NBD_CMD_FLAG_FUA        (1 << 0) /* 'force unit access' during write */
+#define NBD_CMD_FLAG_NO_HOLE    (1 << 1) /* don't punch hole on zero run */
+#define NBD_CMD_FLAG_DF         (1 << 2) /* don't fragment structured read */
+
+/* Supported request types */
 enum {
     NBD_CMD_READ = 0,
     NBD_CMD_WRITE = 1,
     NBD_CMD_DISC = 2,
     NBD_CMD_FLUSH = 3,
-    NBD_CMD_TRIM = 4
+    NBD_CMD_TRIM = 4,
+    /* 5 reserved for failed experiment NBD_CMD_CACHE */
+    NBD_CMD_WRITE_ZEROES = 6,
 };
 
 #define NBD_DEFAULT_PORT	10809
@@ -85,26 +189,76 @@ enum {
  * aren't overflowing some other buffer. */
 #define NBD_MAX_NAME_SIZE 256
 
-ssize_t nbd_wr_syncv(QIOChannel *ioc,
-                     struct iovec *iov,
-                     size_t niov,
-                     size_t length,
-                     bool do_read);
-int nbd_receive_negotiate(QIOChannel *ioc, const char *name, uint16_t *flags,
+/* Two types of reply structures */
+#define NBD_SIMPLE_REPLY_MAGIC      0x67446698
+#define NBD_STRUCTURED_REPLY_MAGIC  0x668e33ef
+
+/* Structured reply flags */
+#define NBD_REPLY_FLAG_DONE          (1 << 0) /* This reply-chunk is last */
+
+/* Structured reply types */
+#define NBD_REPLY_ERR(value)         ((1 << 15) | (value))
+
+#define NBD_REPLY_TYPE_NONE          0
+#define NBD_REPLY_TYPE_OFFSET_DATA   1
+#define NBD_REPLY_TYPE_OFFSET_HOLE   2
+#define NBD_REPLY_TYPE_ERROR         NBD_REPLY_ERR(1)
+#define NBD_REPLY_TYPE_ERROR_OFFSET  NBD_REPLY_ERR(2)
+
+static inline bool nbd_reply_type_is_error(int type)
+{
+    return type & (1 << 15);
+}
+
+/* NBD errors are based on errno numbers, so there is a 1:1 mapping,
+ * but only a limited set of errno values is specified in the protocol.
+ * Everything else is squashed to EINVAL.
+ */
+#define NBD_SUCCESS    0
+#define NBD_EPERM      1
+#define NBD_EIO        5
+#define NBD_ENOMEM     12
+#define NBD_EINVAL     22
+#define NBD_ENOSPC     28
+#define NBD_EOVERFLOW  75
+#define NBD_ESHUTDOWN  108
+
+/* Details collected by NBD_OPT_EXPORT_NAME and NBD_OPT_GO */
+struct NBDExportInfo {
+    /* Set by client before nbd_receive_negotiate() */
+    bool request_sizes;
+
+    /* In-out fields, set by client before nbd_receive_negotiate() and
+     * updated by server results during nbd_receive_negotiate() */
+    bool structured_reply;
+
+    /* Set by server results during nbd_receive_negotiate() */
+    uint64_t size;
+    uint16_t flags;
+    uint32_t min_block;
+    uint32_t opt_block;
+    uint32_t max_block;
+};
+typedef struct NBDExportInfo NBDExportInfo;
+
+int nbd_receive_negotiate(QIOChannel *ioc, const char *name,
                           QCryptoTLSCreds *tlscreds, const char *hostname,
-                          QIOChannel **outioc,
-                          off_t *size, Error **errp);
-int nbd_init(int fd, QIOChannelSocket *sioc, uint16_t flags, off_t size);
-ssize_t nbd_send_request(QIOChannel *ioc, struct nbd_request *request);
-ssize_t nbd_receive_reply(QIOChannel *ioc, struct nbd_reply *reply);
+                          QIOChannel **outioc, NBDExportInfo *info,
+                          Error **errp);
+int nbd_init(int fd, QIOChannelSocket *sioc, NBDExportInfo *info,
+             Error **errp);
+int nbd_send_request(QIOChannel *ioc, NBDRequest *request);
+int nbd_receive_reply(QIOChannel *ioc, NBDReply *reply, Error **errp);
 int nbd_client(int fd);
 int nbd_disconnect(int fd);
+int nbd_errno_to_system_errno(int err);
 
 typedef struct NBDExport NBDExport;
 typedef struct NBDClient NBDClient;
 
-NBDExport *nbd_export_new(BlockBackend *blk, off_t dev_offset, off_t size,
+NBDExport *nbd_export_new(BlockDriverState *bs, off_t dev_offset, off_t size,
                           uint16_t nbdflags, void (*close)(NBDExport *),
+                          bool writethrough, BlockBackend *on_eject_blk,
                           Error **errp);
 void nbd_export_close(NBDExport *exp);
 void nbd_export_get(NBDExport *exp);
@@ -114,14 +268,40 @@ BlockBackend *nbd_export_get_blockdev(NBDExport *exp);
 
 NBDExport *nbd_export_find(const char *name);
 void nbd_export_set_name(NBDExport *exp, const char *name);
+void nbd_export_set_description(NBDExport *exp, const char *description);
 void nbd_export_close_all(void);
 
 void nbd_client_new(NBDExport *exp,
                     QIOChannelSocket *sioc,
                     QCryptoTLSCreds *tlscreds,
                     const char *tlsaclname,
-                    void (*close)(NBDClient *));
+                    void (*close_fn)(NBDClient *, bool));
 void nbd_client_get(NBDClient *client);
 void nbd_client_put(NBDClient *client);
+
+void nbd_server_start(SocketAddress *addr, const char *tls_creds,
+                      Error **errp);
+
+
+/* nbd_read
+ * Reads @size bytes from @ioc. Returns 0 on success.
+ */
+static inline int nbd_read(QIOChannel *ioc, void *buffer, size_t size,
+                           Error **errp)
+{
+    return qio_channel_read_all(ioc, buffer, size, errp) < 0 ? -EIO : 0;
+}
+
+static inline bool nbd_reply_is_simple(NBDReply *reply)
+{
+    return reply->magic == NBD_SIMPLE_REPLY_MAGIC;
+}
+
+static inline bool nbd_reply_is_structured(NBDReply *reply)
+{
+    return reply->magic == NBD_STRUCTURED_REPLY_MAGIC;
+}
+
+const char *nbd_reply_type_lookup(uint16_t type);
 
 #endif

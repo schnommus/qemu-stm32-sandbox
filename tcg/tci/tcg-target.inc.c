@@ -22,8 +22,6 @@
  * THE SOFTWARE.
  */
 
-#include "tcg-be-null.h"
-
 /* TODO list:
  * - See TODO comments in code.
  */
@@ -255,8 +253,21 @@ static const TCGTargetOpDef tcg_target_op_defs[] = {
     { INDEX_op_bswap32_i32, { R, R } },
 #endif
 
+    { INDEX_op_mb, { } },
     { -1 },
 };
+
+static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
+{
+    int i, n = ARRAY_SIZE(tcg_target_op_defs);
+
+    for (i = 0; i < n; ++i) {
+        if (tcg_target_op_defs[i].op == op) {
+            return &tcg_target_op_defs[i];
+        }
+    }
+    return NULL;
+}
 
 static const int tcg_target_reg_alloc_order[] = {
     TCG_REG_R0,
@@ -371,22 +382,20 @@ static void patch_reloc(tcg_insn_unit *code_ptr, int type,
 }
 
 /* Parse target specific constraints. */
-static int target_parse_constraint(TCGArgConstraint *ct, const char **pct_str)
+static const char *target_parse_constraint(TCGArgConstraint *ct,
+                                           const char *ct_str, TCGType type)
 {
-    const char *ct_str = *pct_str;
-    switch (ct_str[0]) {
+    switch (*ct_str++) {
     case 'r':
     case 'L':                   /* qemu_ld constraint */
     case 'S':                   /* qemu_st constraint */
         ct->ct |= TCG_CT_REG;
-        tcg_regset_set32(ct->u.regs, 0, BIT(TCG_TARGET_NB_REGS) - 1);
+        ct->u.regs = BIT(TCG_TARGET_NB_REGS) - 1;
         break;
     default:
-        return -1;
+        return NULL;
     }
-    ct_str++;
-    *pct_str = ct_str;
-    return 0;
+    return ct_str;
 }
 
 #if defined(CONFIG_DEBUG_TCG_INTERPRETER)
@@ -555,7 +564,6 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
     case INDEX_op_goto_tb:
         if (s->tb_jmp_insn_offset) {
             /* Direct jump method. */
-            tcg_debug_assert(args[0] < ARRAY_SIZE(s->tb_jmp_insn_offset));
             /* Align for atomic patching and thread safety */
             s->code_ptr = QEMU_ALIGN_PTR_UP(s->code_ptr, 4);
             s->tb_jmp_insn_offset[args[0]] = tcg_current_code_size(s);
@@ -564,7 +572,6 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
             /* Indirect jump method. */
             TODO();
         }
-        tcg_debug_assert(args[0] < ARRAY_SIZE(s->tb_jmp_reset_offset));
         s->tb_jmp_reset_offset[args[0]] = tcg_current_code_size(s);
         break;
     case INDEX_op_br:
@@ -800,6 +807,8 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
         }
         tcg_out_i(s, *args++);
         break;
+    case INDEX_op_mb:
+        break;
     case INDEX_op_mov_i32:  /* Always emitted via tcg_out_mov.  */
     case INDEX_op_mov_i64:
     case INDEX_op_movi_i32: /* Always emitted via tcg_out_movi.  */
@@ -861,18 +870,14 @@ static void tcg_target_init(TCGContext *s)
     tcg_debug_assert(tcg_op_defs_max <= UINT8_MAX);
 
     /* Registers available for 32 bit operations. */
-    tcg_regset_set32(tcg_target_available_regs[TCG_TYPE_I32], 0,
-                     BIT(TCG_TARGET_NB_REGS) - 1);
+    tcg_target_available_regs[TCG_TYPE_I32] = BIT(TCG_TARGET_NB_REGS) - 1;
     /* Registers available for 64 bit operations. */
-    tcg_regset_set32(tcg_target_available_regs[TCG_TYPE_I64], 0,
-                     BIT(TCG_TARGET_NB_REGS) - 1);
+    tcg_target_available_regs[TCG_TYPE_I64] = BIT(TCG_TARGET_NB_REGS) - 1;
     /* TODO: Which registers should be set here? */
-    tcg_regset_set32(tcg_target_call_clobber_regs, 0,
-                     BIT(TCG_TARGET_NB_REGS) - 1);
+    tcg_target_call_clobber_regs = BIT(TCG_TARGET_NB_REGS) - 1;
 
-    tcg_regset_clear(s->reserved_regs);
+    s->reserved_regs = 0;
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_CALL_STACK);
-    tcg_add_target_add_op_defs(tcg_target_op_defs);
 
     /* We use negative offsets from "sp" so that we can distinguish
        stores that might pretend to be call arguments.  */

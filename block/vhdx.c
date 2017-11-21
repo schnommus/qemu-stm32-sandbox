@@ -24,9 +24,8 @@
 #include "qemu/crc32c.h"
 #include "qemu/bswap.h"
 #include "block/vhdx.h"
-#include "migration/migration.h"
-
-#include <uuid/uuid.h>
+#include "migration/blocker.h"
+#include "qemu/uuid.h"
 
 /* Options for VHDX creation */
 
@@ -213,11 +212,11 @@ bool vhdx_checksum_is_valid(uint8_t *buf, size_t size, int crc_offset)
  */
 void vhdx_guid_generate(MSGUID *guid)
 {
-    uuid_t uuid;
+    QemuUUID uuid;
     assert(guid != NULL);
 
-    uuid_generate(uuid);
-    memcpy(guid, uuid, sizeof(MSGUID));
+    qemu_uuid_generate(&uuid);
+    memcpy(guid, &uuid, sizeof(MSGUID));
 }
 
 /* Check for region overlaps inside the VHDX image */
@@ -899,6 +898,12 @@ static int vhdx_open(BlockDriverState *bs, QDict *options, int flags,
     uint64_t signature;
     Error *local_err = NULL;
 
+    bs->file = bdrv_open_child(NULL, options, "file", bs, &child_file,
+                               false, errp);
+    if (!bs->file) {
+        return -EINVAL;
+    }
+
     s->bat = NULL;
     s->first_visible_write = true;
 
@@ -992,20 +997,18 @@ static int vhdx_open(BlockDriverState *bs, QDict *options, int flags,
         }
     }
 
-    if (flags & BDRV_O_RDWR) {
-        ret = vhdx_update_headers(bs, s, false, NULL);
-        if (ret < 0) {
-            goto fail;
-        }
-    }
-
-    /* TODO: differencing files */
-
     /* Disable migration when VHDX images are used */
     error_setg(&s->migration_blocker, "The vhdx format used by node '%s' "
                "does not support live migration",
                bdrv_get_device_or_node_name(bs));
-    migrate_add_blocker(s->migration_blocker);
+    ret = migrate_add_blocker(s->migration_blocker, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        error_free(s->migration_blocker);
+        goto fail;
+    }
+
+    /* TODO: differencing files */
 
     return 0;
 fail:
@@ -1156,12 +1159,23 @@ exit:
 static int vhdx_allocate_block(BlockDriverState *bs, BDRVVHDXState *s,
                                     uint64_t *new_offset)
 {
-    *new_offset = bdrv_getlength(bs->file->bs);
+    int64_t current_len;
+
+    current_len = bdrv_getlength(bs->file->bs);
+    if (current_len < 0) {
+        return current_len;
+    }
+
+    *new_offset = current_len;
 
     /* per the spec, the address for a block is in units of 1MB */
     *new_offset = ROUND_UP(*new_offset, 1024 * 1024);
+    if (*new_offset > INT64_MAX) {
+        return -EINVAL;
+    }
 
-    return bdrv_truncate(bs->file->bs, *new_offset + s->block_size);
+    return bdrv_truncate(bs->file, *new_offset + s->block_size,
+                         PREALLOC_MODE_OFF, NULL);
 }
 
 /*
@@ -1576,7 +1590,7 @@ exit:
 static int vhdx_create_bat(BlockBackend *blk, BDRVVHDXState *s,
                            uint64_t image_size, VHDXImageType type,
                            bool use_zero_blocks, uint64_t file_offset,
-                           uint32_t length)
+                           uint32_t length, Error **errp)
 {
     int ret = 0;
     uint64_t data_file_offset;
@@ -1597,16 +1611,18 @@ static int vhdx_create_bat(BlockBackend *blk, BDRVVHDXState *s,
     if (type == VHDX_TYPE_DYNAMIC) {
         /* All zeroes, so we can just extend the file - the end of the BAT
          * is the furthest thing we have written yet */
-        ret = blk_truncate(blk, data_file_offset);
+        ret = blk_truncate(blk, data_file_offset, PREALLOC_MODE_OFF, errp);
         if (ret < 0) {
             goto exit;
         }
     } else if (type == VHDX_TYPE_FIXED) {
-        ret = blk_truncate(blk, data_file_offset + image_size);
+        ret = blk_truncate(blk, data_file_offset + image_size,
+                           PREALLOC_MODE_OFF, errp);
         if (ret < 0) {
             goto exit;
         }
     } else {
+        error_setg(errp, "Unsupported image type");
         ret = -ENOTSUP;
         goto exit;
     }
@@ -1617,6 +1633,7 @@ static int vhdx_create_bat(BlockBackend *blk, BDRVVHDXState *s,
         /* for a fixed file, the default BAT entry is not zero */
         s->bat = g_try_malloc0(length);
         if (length && s->bat == NULL) {
+            error_setg(errp, "Failed to allocate memory for the BAT");
             ret = -ENOMEM;
             goto exit;
         }
@@ -1636,6 +1653,7 @@ static int vhdx_create_bat(BlockBackend *blk, BDRVVHDXState *s,
         }
         ret = blk_pwrite(blk, file_offset, s->bat, length, 0);
         if (ret < 0) {
+            error_setg_errno(errp, -ret, "Failed to write the BAT");
             goto exit;
         }
     }
@@ -1661,7 +1679,8 @@ static int vhdx_create_new_region_table(BlockBackend *blk,
                                         uint32_t log_size,
                                         bool use_zero_blocks,
                                         VHDXImageType type,
-                                        uint64_t *metadata_offset)
+                                        uint64_t *metadata_offset,
+                                        Error **errp)
 {
     int ret = 0;
     uint32_t offset = 0;
@@ -1730,7 +1749,7 @@ static int vhdx_create_new_region_table(BlockBackend *blk,
     /* The region table gives us the data we need to create the BAT,
      * so do that now */
     ret = vhdx_create_bat(blk, s, image_size, type, use_zero_blocks,
-                          bat_file_offset, bat_length);
+                          bat_file_offset, bat_length, errp);
     if (ret < 0) {
         goto exit;
     }
@@ -1739,12 +1758,14 @@ static int vhdx_create_new_region_table(BlockBackend *blk,
     ret = blk_pwrite(blk, VHDX_REGION_TABLE_OFFSET, buffer,
                      VHDX_HEADER_BLOCK_SIZE, 0);
     if (ret < 0) {
+        error_setg_errno(errp, -ret, "Failed to write first region table");
         goto exit;
     }
 
     ret = blk_pwrite(blk, VHDX_REGION_TABLE2_OFFSET, buffer,
                      VHDX_HEADER_BLOCK_SIZE, 0);
     if (ret < 0) {
+        error_setg_errno(errp, -ret, "Failed to write second region table");
         goto exit;
     }
 
@@ -1815,6 +1836,7 @@ static int vhdx_create(const char *filename, QemuOpts *opts, Error **errp)
         ret = -ENOTSUP;
         goto exit;
     } else {
+        error_setg(errp, "Invalid subformat '%s'", type);
         ret = -EINVAL;
         goto exit;
     }
@@ -1849,7 +1871,8 @@ static int vhdx_create(const char *filename, QemuOpts *opts, Error **errp)
     }
 
     blk = blk_new_open(filename, NULL, NULL,
-                       BDRV_O_RDWR | BDRV_O_PROTOCOL, &local_err);
+                       BDRV_O_RDWR | BDRV_O_RESIZE | BDRV_O_PROTOCOL,
+                       &local_err);
     if (blk == NULL) {
         error_propagate(errp, local_err);
         ret = -EIO;
@@ -1868,12 +1891,14 @@ static int vhdx_create(const char *filename, QemuOpts *opts, Error **errp)
     ret = blk_pwrite(blk, VHDX_FILE_ID_OFFSET, &signature, sizeof(signature),
                      0);
     if (ret < 0) {
+        error_setg_errno(errp, -ret, "Failed to write file signature");
         goto delete_and_exit;
     }
     if (creator) {
         ret = blk_pwrite(blk, VHDX_FILE_ID_OFFSET + sizeof(signature),
                          creator, creator_items * sizeof(gunichar2), 0);
         if (ret < 0) {
+            error_setg_errno(errp, -ret, "Failed to write creator field");
             goto delete_and_exit;
         }
     }
@@ -1882,13 +1907,14 @@ static int vhdx_create(const char *filename, QemuOpts *opts, Error **errp)
     /* Creates (B),(C) */
     ret = vhdx_create_new_headers(blk, image_size, log_size);
     if (ret < 0) {
+        error_setg_errno(errp, -ret, "Failed to write image headers");
         goto delete_and_exit;
     }
 
     /* Creates (D),(E),(G) explicitly. (F) created as by-product */
     ret = vhdx_create_new_region_table(blk, image_size, block_size, 512,
                                        log_size, use_zero_blocks, image_type,
-                                       &metadata_offset);
+                                       &metadata_offset, errp);
     if (ret < 0) {
         goto delete_and_exit;
     }
@@ -1897,6 +1923,7 @@ static int vhdx_create(const char *filename, QemuOpts *opts, Error **errp)
     ret = vhdx_create_new_metadata(blk, image_size, block_size, 512,
                                    metadata_offset, image_type);
     if (ret < 0) {
+        error_setg_errno(errp, -ret, "Failed to initialize metadata");
         goto delete_and_exit;
     }
 
@@ -1973,6 +2000,7 @@ static BlockDriver bdrv_vhdx = {
     .bdrv_open              = vhdx_open,
     .bdrv_close             = vhdx_close,
     .bdrv_reopen_prepare    = vhdx_reopen_prepare,
+    .bdrv_child_perm        = bdrv_format_default_perms,
     .bdrv_co_readv          = vhdx_co_readv,
     .bdrv_co_writev         = vhdx_co_writev,
     .bdrv_create            = vhdx_create,

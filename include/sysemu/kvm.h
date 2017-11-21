@@ -19,25 +19,17 @@
 #include "exec/memattrs.h"
 #include "hw/irq.h"
 
-#ifdef CONFIG_KVM
-#include <linux/kvm.h>
-#include <linux/kvm_para.h>
+#ifdef NEED_CPU_H
+# ifdef CONFIG_KVM
+#  include <linux/kvm.h>
+#  include <linux/kvm_para.h>
+#  define CONFIG_KVM_IS_POSSIBLE
+# endif
 #else
-/* These constants must never be used at runtime if kvm_enabled() is false.
- * They exist so we don't need #ifdefs around KVM-specific code that already
- * checks kvm_enabled() properly.
- */
-#define KVM_CPUID_SIGNATURE      0
-#define KVM_CPUID_FEATURES       0
-#define KVM_FEATURE_CLOCKSOURCE  0
-#define KVM_FEATURE_NOP_IO_DELAY 0
-#define KVM_FEATURE_MMU_OP       0
-#define KVM_FEATURE_CLOCKSOURCE2 0
-#define KVM_FEATURE_ASYNC_PF     0
-#define KVM_FEATURE_STEAL_TIME   0
-#define KVM_FEATURE_PV_EOI       0
-#define KVM_FEATURE_CLOCKSOURCE_STABLE_BIT 0
+# define CONFIG_KVM_IS_POSSIBLE
 #endif
+
+#ifdef CONFIG_KVM_IS_POSSIBLE
 
 extern bool kvm_allowed;
 extern bool kvm_kernel_irqchip;
@@ -53,8 +45,8 @@ extern bool kvm_gsi_direct_mapping;
 extern bool kvm_readonly_mem_allowed;
 extern bool kvm_direct_msi_allowed;
 extern bool kvm_ioeventfd_any_length_allowed;
+extern bool kvm_msi_use_devid;
 
-#if defined CONFIG_KVM || !defined NEED_CPU_H
 #define kvm_enabled()           (kvm_allowed)
 /**
  * kvm_irqchip_in_kernel:
@@ -169,7 +161,15 @@ extern bool kvm_ioeventfd_any_length_allowed;
  */
 #define kvm_ioeventfd_any_length_enabled() (kvm_ioeventfd_any_length_allowed)
 
+/**
+ * kvm_msi_devid_required:
+ * Returns: true if KVM requires a device id to be provided while
+ * defining an MSI routing entry.
+ */
+#define kvm_msi_devid_required() (kvm_msi_use_devid)
+
 #else
+
 #define kvm_enabled()           (0)
 #define kvm_irqchip_in_kernel() (false)
 #define kvm_irqchip_is_split() (false)
@@ -184,7 +184,9 @@ extern bool kvm_ioeventfd_any_length_allowed;
 #define kvm_readonly_mem_enabled() (false)
 #define kvm_direct_msi_enabled() (false)
 #define kvm_ioeventfd_any_length_enabled() (false)
-#endif
+#define kvm_msi_devid_required() (false)
+
+#endif  /* CONFIG_KVM_IS_POSSIBLE */
 
 struct kvm_run;
 struct kvm_lapic_state;
@@ -205,7 +207,7 @@ extern KVMState *kvm_state;
 /* external API */
 
 bool kvm_has_free_slot(MachineState *ms);
-int kvm_has_sync_mmu(void);
+bool kvm_has_sync_mmu(void);
 int kvm_has_vcpu_events(void);
 int kvm_has_robust_singlestep(void);
 int kvm_has_debugregs(void);
@@ -218,10 +220,20 @@ int kvm_init_vcpu(CPUState *cpu);
 int kvm_cpu_exec(CPUState *cpu);
 int kvm_destroy_vcpu(CPUState *cpu);
 
+/**
+ * kvm_arm_supports_user_irq
+ *
+ * Not all KVM implementations support notifications for kernel generated
+ * interrupt events to user space. This function indicates whether the current
+ * KVM implementation does support them.
+ *
+ * Returns: true if KVM supports using kernel generated IRQs from user space
+ */
+bool kvm_arm_supports_user_irq(void);
+
 #ifdef NEED_CPU_H
 #include "cpu.h"
 
-void kvm_setup_guest_memory(void *start, size_t size);
 void kvm_flush_coalesced_mmio_buffer(void);
 
 int kvm_insert_breakpoint(CPUState *cpu, target_ulong addr,
@@ -230,9 +242,6 @@ int kvm_remove_breakpoint(CPUState *cpu, target_ulong addr,
                           target_ulong len, int type);
 void kvm_remove_all_breakpoints(CPUState *cpu);
 int kvm_update_guest_debug(CPUState *cpu, unsigned long reinject_trap);
-#ifndef _WIN32
-int kvm_set_signal_mask(CPUState *cpu, const sigset_t *sigset);
-#endif
 
 int kvm_on_sigbus_vcpu(CPUState *cpu, int code, void *addr);
 int kvm_on_sigbus(int code, void *addr);
@@ -289,12 +298,15 @@ int kvm_device_check_attr(int fd, uint32_t group, uint64_t attr);
  * @attr: the attribute of that group to set or get
  * @val: pointer to a storage area for the value
  * @write: true for set and false for get operation
+ * @errp: error object handle
  *
- * This function is not allowed to fail. Use kvm_device_check_attr()
- * in order to check for the availability of optional attributes.
+ * Returns: 0 on success
+ *          < 0 on error
+ * Use kvm_device_check_attr() in order to check for the availability
+ * of optional attributes.
  */
-void kvm_device_access(int fd, int group, uint64_t attr,
-                       void *val, bool write);
+int kvm_device_access(int fd, int group, uint64_t attr,
+                      void *val, bool write, Error **errp);
 
 /**
  * kvm_create_device - create a KVM device for the device control API
@@ -327,8 +339,6 @@ MemTxAttrs kvm_arch_post_run(CPUState *cpu, struct kvm_run *run);
 
 int kvm_arch_handle_exit(CPUState *cpu, struct kvm_run *run);
 
-int kvm_arch_handle_ioapic_eoi(CPUState *cpu, struct kvm_run *run);
-
 int kvm_arch_process_async_events(CPUState *cpu);
 
 int kvm_arch_get_registers(CPUState *cpu);
@@ -351,8 +361,10 @@ bool kvm_vcpu_id_is_valid(int vcpu_id);
 /* Returns VCPU ID to be used on KVM_CREATE_VCPU ioctl() */
 unsigned long kvm_arch_vcpu_id(CPUState *cpu);
 
-int kvm_arch_on_sigbus_vcpu(CPUState *cpu, int code, void *addr);
-int kvm_arch_on_sigbus(int code, void *addr);
+#ifdef TARGET_I386
+#define KVM_HAVE_MCE_INJECTION 1
+void kvm_arch_on_sigbus_vcpu(CPUState *cpu, int code, void *addr);
+#endif
 
 void kvm_arch_init_irq_routing(KVMState *s);
 
@@ -372,7 +384,6 @@ int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg);
 
 void kvm_irqchip_add_irq_route(KVMState *s, int gsi, int irqchip, int pin);
 
-void kvm_put_apic_state(DeviceState *d, struct kvm_lapic_state *kapic);
 void kvm_get_apic_state(DeviceState *d, struct kvm_lapic_state *kapic);
 
 struct kvm_guest_debug;
@@ -417,11 +428,8 @@ int kvm_vm_check_extension(KVMState *s, unsigned int extension);
             .flags = cap_flags,                                      \
         };                                                           \
         uint64_t args_tmp[] = { __VA_ARGS__ };                       \
-        int i;                                                       \
-        for (i = 0; i < (int)ARRAY_SIZE(args_tmp) &&                 \
-                     i < ARRAY_SIZE(cap.args); i++) {                \
-            cap.args[i] = args_tmp[i];                               \
-        }                                                            \
+        size_t n = MIN(ARRAY_SIZE(args_tmp), ARRAY_SIZE(cap.args));  \
+        memcpy(cap.args, args_tmp, n * sizeof(cap.args[0]));         \
         kvm_vm_ioctl(s, KVM_ENABLE_CAP, &cap);                       \
     })
 
@@ -432,11 +440,8 @@ int kvm_vm_check_extension(KVMState *s, unsigned int extension);
             .flags = cap_flags,                                      \
         };                                                           \
         uint64_t args_tmp[] = { __VA_ARGS__ };                       \
-        int i;                                                       \
-        for (i = 0; i < (int)ARRAY_SIZE(args_tmp) &&                 \
-                     i < ARRAY_SIZE(cap.args); i++) {                \
-            cap.args[i] = args_tmp[i];                               \
-        }                                                            \
+        size_t n = MIN(ARRAY_SIZE(args_tmp), ARRAY_SIZE(cap.args));  \
+        memcpy(cap.args, args_tmp, n * sizeof(cap.args[0]));         \
         kvm_vcpu_ioctl(cpu, KVM_ENABLE_CAP, &cap);                   \
     })
 
@@ -455,29 +460,9 @@ int kvm_physical_memory_addr_from_host(KVMState *s, void *ram_addr,
 void kvm_cpu_synchronize_state(CPUState *cpu);
 void kvm_cpu_synchronize_post_reset(CPUState *cpu);
 void kvm_cpu_synchronize_post_init(CPUState *cpu);
+void kvm_cpu_synchronize_pre_loadvm(CPUState *cpu);
 
-/* generic hooks - to be moved/refactored once there are more users */
-
-static inline void cpu_synchronize_state(CPUState *cpu)
-{
-    if (kvm_enabled()) {
-        kvm_cpu_synchronize_state(cpu);
-    }
-}
-
-static inline void cpu_synchronize_post_reset(CPUState *cpu)
-{
-    if (kvm_enabled()) {
-        kvm_cpu_synchronize_post_reset(cpu);
-    }
-}
-
-static inline void cpu_synchronize_post_init(CPUState *cpu)
-{
-    if (kvm_enabled()) {
-        kvm_cpu_synchronize_post_init(cpu);
-    }
-}
+void kvm_init_cpu_signals(CPUState *cpu);
 
 /**
  * kvm_irqchip_add_msi_route - Add MSI route for specific vector
@@ -544,5 +529,6 @@ int kvm_set_one_reg(CPUState *cs, uint64_t id, void *source);
  * Returns: 0 on success, or a negative errno on failure.
  */
 int kvm_get_one_reg(CPUState *cs, uint64_t id, void *target);
+struct ppc_radix_page_info *kvm_get_radix_page_info(void);
 int kvm_get_max_memslots(void);
 #endif

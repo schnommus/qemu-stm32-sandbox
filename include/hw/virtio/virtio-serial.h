@@ -58,6 +58,9 @@ typedef struct VirtIOSerialPortClass {
         /* Guest opened/closed device. */
     void (*set_guest_connected)(VirtIOSerialPort *port, int guest_connected);
 
+    /* Enable/disable backend for virtio serial port */
+    void (*enable_backend)(VirtIOSerialPort *port, bool enable);
+
         /* Guest is now ready to accept data (virtqueues set up). */
     void (*guest_ready)(VirtIOSerialPort *port);
 
@@ -184,6 +187,8 @@ struct VirtIOSerial {
     struct VirtIOSerialPostLoad *post_load;
 
     virtio_serial_conf serial;
+
+    uint64_t host_features;
 };
 
 /* Interface to the virtio-serial bus */

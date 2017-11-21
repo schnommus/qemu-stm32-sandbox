@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include "crypto/xts.h"
+#include "cipherpriv.h"
 
 #include <nettle/nettle-types.h>
 #include <nettle/aes.h>
@@ -28,6 +29,7 @@
 #include <nettle/cast128.h>
 #include <nettle/serpent.h>
 #include <nettle/twofish.h>
+#include <nettle/ctr.h>
 
 typedef void (*QCryptoCipherNettleFuncWrapper)(const void *ctx,
                                                size_t length,
@@ -75,6 +77,18 @@ static void des_decrypt_native(cipher_ctx_t ctx, cipher_length_t length,
                                uint8_t *dst, const uint8_t *src)
 {
     des_decrypt(ctx, length, dst, src);
+}
+
+static void des3_encrypt_native(cipher_ctx_t ctx, cipher_length_t length,
+                                uint8_t *dst, const uint8_t *src)
+{
+    des3_encrypt(ctx, length, dst, src);
+}
+
+static void des3_decrypt_native(cipher_ctx_t ctx, cipher_length_t length,
+                                uint8_t *dst, const uint8_t *src)
+{
+    des3_decrypt(ctx, length, dst, src);
 }
 
 static void cast128_encrypt_native(cipher_ctx_t ctx, cipher_length_t length,
@@ -139,6 +153,18 @@ static void des_decrypt_wrapper(const void *ctx, size_t length,
     des_decrypt(ctx, length, dst, src);
 }
 
+static void des3_encrypt_wrapper(const void *ctx, size_t length,
+                                uint8_t *dst, const uint8_t *src)
+{
+    des3_encrypt(ctx, length, dst, src);
+}
+
+static void des3_decrypt_wrapper(const void *ctx, size_t length,
+                                uint8_t *dst, const uint8_t *src)
+{
+    des3_decrypt(ctx, length, dst, src);
+}
+
 static void cast128_encrypt_wrapper(const void *ctx, size_t length,
                                     uint8_t *dst, const uint8_t *src)
 {
@@ -186,15 +212,17 @@ struct QCryptoCipherNettle {
     QCryptoCipherNettleFuncNative alg_decrypt_native;
     QCryptoCipherNettleFuncWrapper alg_encrypt_wrapper;
     QCryptoCipherNettleFuncWrapper alg_decrypt_wrapper;
-
+    /* Initialization vector or Counter */
     uint8_t *iv;
     size_t blocksize;
 };
 
-bool qcrypto_cipher_supports(QCryptoCipherAlgorithm alg)
+bool qcrypto_cipher_supports(QCryptoCipherAlgorithm alg,
+                             QCryptoCipherMode mode)
 {
     switch (alg) {
     case QCRYPTO_CIPHER_ALG_DES_RFB:
+    case QCRYPTO_CIPHER_ALG_3DES:
     case QCRYPTO_CIPHER_ALG_AES_128:
     case QCRYPTO_CIPHER_ALG_AES_192:
     case QCRYPTO_CIPHER_ALG_AES_256:
@@ -205,6 +233,16 @@ bool qcrypto_cipher_supports(QCryptoCipherAlgorithm alg)
     case QCRYPTO_CIPHER_ALG_TWOFISH_128:
     case QCRYPTO_CIPHER_ALG_TWOFISH_192:
     case QCRYPTO_CIPHER_ALG_TWOFISH_256:
+        break;
+    default:
+        return false;
+    }
+
+    switch (mode) {
+    case QCRYPTO_CIPHER_MODE_ECB:
+    case QCRYPTO_CIPHER_MODE_CBC:
+    case QCRYPTO_CIPHER_MODE_XTS:
+    case QCRYPTO_CIPHER_MODE_CTR:
         return true;
     default:
         return false;
@@ -212,12 +250,26 @@ bool qcrypto_cipher_supports(QCryptoCipherAlgorithm alg)
 }
 
 
-QCryptoCipher *qcrypto_cipher_new(QCryptoCipherAlgorithm alg,
-                                  QCryptoCipherMode mode,
-                                  const uint8_t *key, size_t nkey,
-                                  Error **errp)
+static void
+qcrypto_nettle_cipher_free_ctx(QCryptoCipherNettle *ctx)
 {
-    QCryptoCipher *cipher;
+    if (!ctx) {
+        return;
+    }
+
+    g_free(ctx->iv);
+    g_free(ctx->ctx);
+    g_free(ctx->ctx_tweak);
+    g_free(ctx);
+}
+
+
+static QCryptoCipherNettle *qcrypto_cipher_ctx_new(QCryptoCipherAlgorithm alg,
+                                                   QCryptoCipherMode mode,
+                                                   const uint8_t *key,
+                                                   size_t nkey,
+                                                   Error **errp)
+{
     QCryptoCipherNettle *ctx;
     uint8_t *rfbkey;
 
@@ -225,19 +277,17 @@ QCryptoCipher *qcrypto_cipher_new(QCryptoCipherAlgorithm alg,
     case QCRYPTO_CIPHER_MODE_ECB:
     case QCRYPTO_CIPHER_MODE_CBC:
     case QCRYPTO_CIPHER_MODE_XTS:
+    case QCRYPTO_CIPHER_MODE_CTR:
         break;
     default:
-        error_setg(errp, "Unsupported cipher mode %d", mode);
+        error_setg(errp, "Unsupported cipher mode %s",
+                   QCryptoCipherMode_str(mode));
         return NULL;
     }
 
     if (!qcrypto_cipher_validate_key_length(alg, mode, nkey, errp)) {
         return NULL;
     }
-
-    cipher = g_new0(QCryptoCipher, 1);
-    cipher->alg = alg;
-    cipher->mode = mode;
 
     ctx = g_new0(QCryptoCipherNettle, 1);
 
@@ -254,6 +304,18 @@ QCryptoCipher *qcrypto_cipher_new(QCryptoCipherAlgorithm alg,
         ctx->alg_decrypt_wrapper = des_decrypt_wrapper;
 
         ctx->blocksize = DES_BLOCK_SIZE;
+        break;
+
+    case QCRYPTO_CIPHER_ALG_3DES:
+        ctx->ctx = g_new0(struct des3_ctx, 1);
+        des3_set_key(ctx->ctx, key);
+
+        ctx->alg_encrypt_native = des3_encrypt_native;
+        ctx->alg_decrypt_native = des3_decrypt_native;
+        ctx->alg_encrypt_wrapper = des3_encrypt_wrapper;
+        ctx->alg_decrypt_wrapper = des3_decrypt_wrapper;
+
+        ctx->blocksize = DES3_BLOCK_SIZE;
         break;
 
     case QCRYPTO_CIPHER_ALG_AES_128:
@@ -357,7 +419,15 @@ QCryptoCipher *qcrypto_cipher_new(QCryptoCipherAlgorithm alg,
         break;
 
     default:
-        error_setg(errp, "Unsupported cipher algorithm %d", alg);
+        error_setg(errp, "Unsupported cipher algorithm %s",
+                   QCryptoCipherAlgorithm_str(alg));
+        goto error;
+    }
+
+    if (mode == QCRYPTO_CIPHER_MODE_XTS &&
+        ctx->blocksize != XTS_BLOCK_SIZE) {
+        error_setg(errp, "Cipher block size %zu must equal XTS block size %d",
+                   ctx->blocksize, XTS_BLOCK_SIZE);
         goto error;
     }
 
@@ -369,39 +439,31 @@ QCryptoCipher *qcrypto_cipher_new(QCryptoCipherAlgorithm alg,
     }
 
     ctx->iv = g_new0(uint8_t, ctx->blocksize);
-    cipher->opaque = ctx;
 
-    return cipher;
+    return ctx;
 
  error:
-    g_free(cipher);
-    g_free(ctx);
+    qcrypto_nettle_cipher_free_ctx(ctx);
     return NULL;
 }
 
 
-void qcrypto_cipher_free(QCryptoCipher *cipher)
+static void
+qcrypto_nettle_cipher_ctx_free(QCryptoCipher *cipher)
 {
     QCryptoCipherNettle *ctx;
 
-    if (!cipher) {
-        return;
-    }
-
     ctx = cipher->opaque;
-    g_free(ctx->iv);
-    g_free(ctx->ctx);
-    g_free(ctx->ctx_tweak);
-    g_free(ctx);
-    g_free(cipher);
+    qcrypto_nettle_cipher_free_ctx(ctx);
 }
 
 
-int qcrypto_cipher_encrypt(QCryptoCipher *cipher,
-                           const void *in,
-                           void *out,
-                           size_t len,
-                           Error **errp)
+static int
+qcrypto_nettle_cipher_encrypt(QCryptoCipher *cipher,
+                              const void *in,
+                              void *out,
+                              size_t len,
+                              Error **errp)
 {
     QCryptoCipherNettle *ctx = cipher->opaque;
 
@@ -428,20 +490,27 @@ int qcrypto_cipher_encrypt(QCryptoCipher *cipher,
                     ctx->iv, len, out, in);
         break;
 
+    case QCRYPTO_CIPHER_MODE_CTR:
+        ctr_crypt(ctx->ctx, ctx->alg_encrypt_native,
+                    ctx->blocksize, ctx->iv,
+                    len, out, in);
+        break;
+
     default:
-        error_setg(errp, "Unsupported cipher algorithm %d",
-                   cipher->alg);
+        error_setg(errp, "Unsupported cipher mode %s",
+                   QCryptoCipherMode_str(cipher->mode));
         return -1;
     }
     return 0;
 }
 
 
-int qcrypto_cipher_decrypt(QCryptoCipher *cipher,
-                           const void *in,
-                           void *out,
-                           size_t len,
-                           Error **errp)
+static int
+qcrypto_nettle_cipher_decrypt(QCryptoCipher *cipher,
+                              const void *in,
+                              void *out,
+                              size_t len,
+                              Error **errp)
 {
     QCryptoCipherNettle *ctx = cipher->opaque;
 
@@ -467,18 +536,24 @@ int qcrypto_cipher_decrypt(QCryptoCipher *cipher,
                     ctx->alg_encrypt_wrapper, ctx->alg_decrypt_wrapper,
                     ctx->iv, len, out, in);
         break;
+    case QCRYPTO_CIPHER_MODE_CTR:
+        ctr_crypt(ctx->ctx, ctx->alg_encrypt_native,
+                    ctx->blocksize, ctx->iv,
+                    len, out, in);
+        break;
 
     default:
-        error_setg(errp, "Unsupported cipher algorithm %d",
-                   cipher->alg);
+        error_setg(errp, "Unsupported cipher mode %s",
+                   QCryptoCipherMode_str(cipher->mode));
         return -1;
     }
     return 0;
 }
 
-int qcrypto_cipher_setiv(QCryptoCipher *cipher,
-                         const uint8_t *iv, size_t niv,
-                         Error **errp)
+static int
+qcrypto_nettle_cipher_setiv(QCryptoCipher *cipher,
+                            const uint8_t *iv, size_t niv,
+                            Error **errp)
 {
     QCryptoCipherNettle *ctx = cipher->opaque;
     if (niv != ctx->blocksize) {
@@ -489,3 +564,11 @@ int qcrypto_cipher_setiv(QCryptoCipher *cipher,
     memcpy(ctx->iv, iv, niv);
     return 0;
 }
+
+
+static struct QCryptoCipherDriver qcrypto_cipher_lib_driver = {
+    .cipher_encrypt = qcrypto_nettle_cipher_encrypt,
+    .cipher_decrypt = qcrypto_nettle_cipher_decrypt,
+    .cipher_setiv = qcrypto_nettle_cipher_setiv,
+    .cipher_free = qcrypto_nettle_cipher_ctx_free,
+};
