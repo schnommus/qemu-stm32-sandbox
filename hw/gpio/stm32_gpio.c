@@ -169,7 +169,7 @@ static void stm32_gpio_GPIOx_ODR_write(Stm32Gpio *s, uint32_t new_value)
                            use our local s->out_irq array) in order for
                            the unit tests to work. This is something of a hack,
                            but I don't have a solution yet. */
-                        s->busdev.parent_obj.gpios.lh_first->out[pin],
+                        s->out_irq[pin],
                         (s->GPIOx_ODR & BIT(pin)) ? 1 : 0);
             }
         }

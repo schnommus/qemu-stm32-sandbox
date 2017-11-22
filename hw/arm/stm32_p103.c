@@ -102,8 +102,8 @@ static void stm32_p103_init(MachineState *machine)
     s = (Stm32P103 *)g_malloc0(sizeof(Stm32P103));
 
     stm32_init(machine,
-               /*flash_size*/0x0001ffff,
-               /*ram_size*/0x00004fff,
+               /*flash_size*/0x00020000,
+               /*ram_size*/0x00005000,
                8000000,
                32768);
     

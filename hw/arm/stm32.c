@@ -25,6 +25,7 @@
 #include "hw/boards.h"
 #include "exec/address-spaces.h"
 #include "exec/gdbstub.h"
+#include "hw/misc/unimp.h"
 
 /* DEFINITIONS */
 
@@ -361,4 +362,6 @@ void stm32_init(
     DeviceState *iwdg_dev = qdev_create(NULL, "stm32_iwdg");
     qdev_prop_set_ptr(iwdg_dev, "stm32_rcc", rcc_dev);
     stm32_init_periph(iwdg_dev, STM32_IWDG, 0x40003000, NULL);
+
+    create_unimplemented_device("flash-intf", 0x40022000, 0x1000);
 }
